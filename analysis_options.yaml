@@ -1,0 +1,17 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+  
+    unused_element: warning
+    unused_local_variable: warning
+    unused_import: warning
+    dead_code: warning
+
+linter:
+  rules:
+   
+    - avoid_print
+    - prefer_interpolation_to_compose_strings
+    - use_super_parameters
+    - unreachable_from_main
