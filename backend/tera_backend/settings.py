@@ -39,7 +39,10 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
+    "rest_framework.authtoken",
     "desktop_api",
+    "pharmacy_data",
 ]
 
 MIDDLEWARE = [
@@ -94,3 +97,38 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
 RATELIMIT_IP_META_KEY = "HTTP_CF_CONNECTING_IP"
+
+# ---------------------------------------------------------------------------
+# Django REST Framework
+# ---------------------------------------------------------------------------
+# المصادقة: Token فقط (تطبيق سطح المكتب native، لا كوكيز ولا جلسات).
+# الافتراضي: كل endpoint مغلق ما لم يُصرّح بغير ذلك صراحة داخل الـ View.
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ],
+    "DEFAULT_PARSER_CLASSES": [
+        "rest_framework.parsers.JSONParser",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 100,
+    "UNAUTHENTICATED_USER": None,
+}
+
+# واجهة DRF التصفحية تُفعَّل محلياً فقط للاختبار اليدوي، وتبقى مغلقة على الإنتاج.
+if DEBUG:
+    REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"].append(
+        "rest_framework.renderers.BrowsableAPIRenderer"
+    )
+    REST_FRAMEWORK["DEFAULT_PARSER_CLASSES"].append(
+        "rest_framework.parsers.FormParser"
+    )
+    REST_FRAMEWORK["DEFAULT_PARSER_CLASSES"].append(
+        "rest_framework.parsers.MultiPartParser"
+    )

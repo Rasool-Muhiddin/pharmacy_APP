@@ -7,6 +7,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 from django_ratelimit.decorators import ratelimit
+from rest_framework.authtoken.models import Token
 
 from .models import DesktopAppVersion, DesktopLicense, DeviceActivation, PharmacyMembership
 
@@ -97,6 +98,9 @@ def desktop_login(request):
     if not membership.pharmacy.is_active or not device.is_active or not license.is_valid:
         return error("الحساب أو الجهاز أو الترخيص غير فعال.", 403)
     device.save(update_fields=["last_seen_at"])
+    # Token واحد ثابت لكل مستخدم (get_or_create) — يُستخدم لاحقاً كـ Authorization: Token <key>
+    # في كل طلبات API بيانات الصيدلية (المخزون، الفواتير...)، منفصل تماماً عن جلسة desktop_login نفسها.
+    token, _ = Token.objects.get_or_create(user=user)
     return JsonResponse({
         "ok": True,
         "message": "تم تسجيل الدخول بنجاح.",
@@ -105,6 +109,7 @@ def desktop_login(request):
         "user": {"id": user.id, "username": user.username, "full_name": user.get_full_name().strip() or user.username, "is_owner": membership.is_owner},
         "pharmacy": {"id": membership.pharmacy_id, "name": membership.pharmacy.name},
         "license": license_payload(license),
+        "api_token": token.key,
     })
 
 
