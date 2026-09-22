@@ -2,13 +2,21 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../database/db_helper.dart';
+import '../repository/medicine_repository.dart';
+import '../services/medicine_api_service.dart';
 import 'package:sqflite/sqflite.dart';
 
 class InventoryScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner;
+  final bool isOnlineMode;
 
-  const InventoryScreen({super.key, required this.pharmacyId, this.isOwner = true});
+  const InventoryScreen({
+    super.key,
+    required this.pharmacyId,
+    this.isOwner = true,
+    this.isOnlineMode = false,
+  });
 
   @override
   State<InventoryScreen> createState() => _InventoryScreenState();
@@ -100,6 +108,16 @@ class _InventoryScreenState extends State<InventoryScreen> {
     return 'حدث خطأ غير متوقع، يرجى المحاولة مرة أخرى.';
   }
 
+  // رسائل MedicineRepositoryException/MedicineApiException جاهزة بالعربية
+  // أصلاً من مصدرها (انظر medicine_repository.dart وmedicine_api_service.dart)
+  // فتُعرض كما هي، بعكس أخطاء sqflite الخام التي تحتاج _friendlyDbErrorMessage.
+  String _friendlyWriteErrorMessage(Object error) {
+    if (error is MedicineRepositoryException || error is MedicineApiException) {
+      return error.toString();
+    }
+    return _friendlyDbErrorMessage(error);
+  }
+
   // --- تحميل أدوية المخزن الحالية من قاعدة البيانات ---
   Future<void> _loadMedicines() async {
     setState(() => _isLoading = true);
@@ -108,8 +126,13 @@ class _InventoryScreenState extends State<InventoryScreen> {
       List<Map<String, dynamic>> data;
 
       if (query.isEmpty) {
-        data = await DatabaseHelper.instance.getMedicines(widget.pharmacyId);
+        data = await MedicineRepository.instance.getMedicines(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: widget.isOnlineMode,
+        );
       } else {
+        // البحث يبقى محلياً دائماً (على الكاش المتزامن آخر مرة)، بلا فرق
+        // بين الوضعين — أونلاين أو أوفلاين.
         data = await DatabaseHelper.instance.searchMedicines(widget.pharmacyId, query);
       }
 
@@ -117,7 +140,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
         _medicines = data;
       });
     } catch (e) {
-      _showSnackBar('حدث خطأ أثناء تحميل البيانات', Colors.red);
+      _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
     } finally {
       setState(() => _isLoading = false);
     }
@@ -466,19 +489,22 @@ void _openAddMedicineDialog() {
                     },
                     conflictAlgorithm: ConflictAlgorithm.ignore);
 
-                    // محاولة الحفظ في قاعدة البيانات
-                    await DatabaseHelper.instance.insertMedicine({
-                      'pharmacy_id': widget.pharmacyId,
-                      'barcode': barcodeCtrl.text.trim().isEmpty ? null : barcodeCtrl.text.trim(),
-                      'trade_name': tradeName,
-                      'scientific_name': scientificCtrl.text.trim(),
-                      'category': selectedCategory,
-                      'quantity': int.tryParse(qtyCtrl.text) ?? 0,
-                      'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
-                      'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
-                      'expiry_date': expiryDate,
-                      'shelf_location': shelfCtrl.text.trim(),
-                    });
+                    // محاولة الحفظ (أونلاين عبر السيرفر، أوفلاين محلياً)
+                    await MedicineRepository.instance.addMedicine(
+                      pharmacyId: widget.pharmacyId,
+                      isOnlineMode: widget.isOnlineMode,
+                      data: {
+                        'barcode': barcodeCtrl.text.trim().isEmpty ? null : barcodeCtrl.text.trim(),
+                        'trade_name': tradeName,
+                        'scientific_name': scientificCtrl.text.trim(),
+                        'category': selectedCategory,
+                        'quantity': int.tryParse(qtyCtrl.text) ?? 0,
+                        'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
+                        'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
+                        'expiry_date': expiryDate,
+                        'shelf_location': shelfCtrl.text.trim(),
+                      },
+                    );
 
                     // إغلاق النافذة أولاً
                     if (Navigator.canPop(ctx)) {
@@ -494,7 +520,7 @@ void _openAddMedicineDialog() {
                   } catch (e) {
                     // رسالة واضحة تشرح السبب المباشر بدل نص الخطأ التقني الخام
                     if (!mounted) return;
-                    _showSnackBar(_friendlyDbErrorMessage(e), Colors.red);
+                    _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
                   }
                 },
                 child: const Text('حفظ الصنف', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
@@ -718,7 +744,9 @@ void _openSupplyDialog() {
                 }
 
                 try {
-                  await DatabaseHelper.instance.supplyMedicine(
+                  await MedicineRepository.instance.supplyMedicine(
+                    pharmacyId: widget.pharmacyId,
+                    isOnlineMode: widget.isOnlineMode,
                     medicineId: selectedMedicine!['id'],
                     addedQuantity: qtyToAdd,
                     newExpiryDate: newExpiryCtrl.text.trim().isEmpty ? null : newExpiryCtrl.text.trim(),
@@ -731,7 +759,7 @@ void _openSupplyDialog() {
                   }
                 } catch (e) {
                   if (!mounted) return;
-                  _showSnackBar(_friendlyDbErrorMessage(e), Colors.red);
+                  _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
                 }
               },
               child: const Text('إضافة الشحنة', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
@@ -863,16 +891,21 @@ void _openSupplyDialog() {
                 style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF3182CE)),
                 onPressed: () async {
                   try {
-                    await DatabaseHelper.instance.updateMedicine(med['id'], {
-                      'barcode': barcodeCtrl.text.trim().isEmpty ? null : barcodeCtrl.text.trim(),
-                      'trade_name': tradeCtrl.text.trim(),
-                      'scientific_name': scientificCtrl.text.trim(),
-                      'category': selectedCategory,
-                      'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
-                      'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
-                      'expiry_date': expiryCtrl.text.trim(),
-                      'shelf_location': shelfCtrl.text.trim(),
-                    });
+                    await MedicineRepository.instance.updateMedicine(
+                      pharmacyId: widget.pharmacyId,
+                      isOnlineMode: widget.isOnlineMode,
+                      id: med['id'],
+                      data: {
+                        'barcode': barcodeCtrl.text.trim().isEmpty ? null : barcodeCtrl.text.trim(),
+                        'trade_name': tradeCtrl.text.trim(),
+                        'scientific_name': scientificCtrl.text.trim(),
+                        'category': selectedCategory,
+                        'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
+                        'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
+                        'expiry_date': expiryCtrl.text.trim(),
+                        'shelf_location': shelfCtrl.text.trim(),
+                      },
+                    );
                     if (Navigator.canPop(ctx)) Navigator.pop(ctx);
                     if (mounted) {
                       _loadMedicines();
@@ -880,7 +913,7 @@ void _openSupplyDialog() {
                     }
                   } catch (e) {
                     if (!mounted) return;
-                    _showSnackBar(_friendlyDbErrorMessage(e), Colors.red);
+                    _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
                   }
                 },
                 child: const Text('حفظ التعديلات', style: TextStyle(color: Colors.white)),
@@ -954,9 +987,10 @@ void _openSupplyDialog() {
                   }
 
                   try {
-                    await DatabaseHelper.instance.processDamageMedicine(
-                      medicineId: med['id'],
+                    await MedicineRepository.instance.damageMedicine(
                       pharmacyId: widget.pharmacyId,
+                      isOnlineMode: widget.isOnlineMode,
+                      medicineId: med['id'],
                       quantityToDamage: qtyToDamage,
                       reason: selectedReason,
                       notes: notesCtrl.text.trim(),
@@ -968,7 +1002,7 @@ void _openSupplyDialog() {
                     }
                   } catch (e) {
                     if (!mounted) return;
-                    _showSnackBar(_friendlyDbErrorMessage(e), Colors.red);
+                    _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
                   }
                 },
                 child: const Text('تأكيد الإتلاف', style: TextStyle(color: Colors.white)),
@@ -999,7 +1033,10 @@ void _openSupplyDialog() {
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE53E3E)),
             onPressed: () async {
               try {
-                await DatabaseHelper.instance.deleteMedicine(med['id']);
+                await MedicineRepository.instance.deleteMedicine(
+                  isOnlineMode: widget.isOnlineMode,
+                  id: med['id'],
+                );
                 if (Navigator.canPop(ctx)) Navigator.pop(ctx);
                 if (mounted) {
                   _loadMedicines();
@@ -1007,6 +1044,10 @@ void _openSupplyDialog() {
                 }
               } catch (e) {
                 if (!mounted) return;
+                if (e is MedicineRepositoryException || e is MedicineApiException) {
+                  _showSnackBar(e.toString(), Colors.red);
+                  return;
+                }
                 final errorText = e.toString();
                 if (errorText.contains('FOREIGN KEY constraint failed')) {
                   _showSnackBar(

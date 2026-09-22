@@ -31,7 +31,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 2,
+    version: 3,
     onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON');
     },
@@ -90,6 +90,7 @@ Future<void> _onCreate(Database db, int version) async {
       shelf_location TEXT,
       is_damaged INTEGER DEFAULT 0,
       barcode TEXT UNIQUE,
+      last_synced_at TEXT,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id)
     )
   ''');
@@ -279,6 +280,13 @@ Future<void> _onUpgrade(
     ''');
     await db.execute('CREATE INDEX idx_expense_pharmacy_date ON expense(pharmacy_id, expense_date);');
   }
+
+  if (oldVersion < 3) {
+    // عمود جديد فقط، بلا قيمة افتراضية غير NULL — الصفوف الموجودة مسبقاً
+    // (كل بيانات الأوفلاين الحالية) تبقى NULL فيه، وهذا صحيح تماماً:
+    // معناه "لم تُزامن مع السيرفر بعد"، لا خطأ.
+    await db.execute('ALTER TABLE medicine ADD COLUMN last_synced_at TEXT;');
+  }
 }
 
   //==========================================
@@ -360,6 +368,92 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  //====================================================
+  // كاش القراءة فقط لوضع الأونلاين — يُستدعى بعد كل قراءة/كتابة ناجحة
+  // من السيرفر فقط (MedicineRepository)، ولا يُستدعى أبداً كإدخال مباشر
+  // من واجهة المستخدم أثناء العمل أونلاين، وفق القرار المتفق عليه:
+  // "السيرفر مصدر البيانات الوحيد، والكاش المحلي read-only".
+  //====================================================
+
+  /// يحفظ/يحدّث دواءً واحداً قادماً من استجابة السيرفر، مفتاحه id (وهو معرّف
+  /// السيرفر نفسه هنا، لا معرّف محلي مستقل). يتعمّد استخدام
+  /// INSERT OR IGNORE ثم UPDATE بدل REPLACE: REPLACE ينفّذ DELETE+INSERT
+  /// داخلياً، وبما أن invoice_item.medicine_id وdamaged_medicine.medicine_id
+  /// يشيران لهذا الجدول بقيد FOREIGN KEY بلا ON DELETE CASCADE، فسيفشل أي
+  /// REPLACE لدواء له فواتير أو سجلات تلف سابقة.
+  ///
+  /// ⚠️ يفترض هذا حالياً أن الصيدلية بدأت أونلاين من الصفر (بلا بيانات
+  /// أوفلاين قديمة لها معرّفات محلية قد تتصادم مع معرّفات السيرفر). انتقال
+  /// صيدلية من أوفلاين لأونلاين لاحقاً يحتاج خطوة توفيق (reconciliation)
+  /// منفصلة قبل تفعيل هذا الكاش عليها.
+  Future<void> upsertMedicineFromServer({
+    required int pharmacyId,
+    required Map<String, dynamic> serverData,
+  }) async {
+    final db = await database;
+
+    final row = <String, dynamic>{
+      'id': serverData['id'] as int,
+      'pharmacy_id': pharmacyId,
+      'trade_name': serverData['trade_name'] as String,
+      'scientific_name': (serverData['scientific_name'] as String?) ?? '',
+      'category': (serverData['category'] as String?) ?? '',
+      'quantity': (serverData['quantity'] as num?)?.toInt() ?? 0,
+      'buy_price': _parseServerDecimal(serverData['buy_price']),
+      'sell_price': _parseServerDecimal(serverData['sell_price']),
+      'expiry_date': serverData['expiry_date'] as String?,
+      'shelf_location': (serverData['shelf_location'] as String?) ?? '',
+      'is_damaged': serverData['is_damaged'] == true ? 1 : 0,
+      'barcode': serverData['barcode'] as String?,
+      'last_synced_at': DateTime.now().toIso8601String(),
+    };
+
+    await db.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+  }
+
+  /// يستبدل كامل كاش المخزون المحلي بقائمة كاملة قادمة من السيرفر (بعد
+  /// جلب medicine_api_service.fetchMedicines() لكل الصفحات)، داخل معاملة
+  /// واحدة لضمان عدم رؤية الشاشات لحالة كاش منتصفة أثناء التحديث.
+  Future<void> replaceMedicinesCache({
+    required int pharmacyId,
+    required List<Map<String, dynamic>> serverItems,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      for (final item in serverItems) {
+        final row = <String, dynamic>{
+          'id': item['id'] as int,
+          'pharmacy_id': pharmacyId,
+          'trade_name': item['trade_name'] as String,
+          'scientific_name': (item['scientific_name'] as String?) ?? '',
+          'category': (item['category'] as String?) ?? '',
+          'quantity': (item['quantity'] as num?)?.toInt() ?? 0,
+          'buy_price': _parseServerDecimal(item['buy_price']),
+          'sell_price': _parseServerDecimal(item['sell_price']),
+          'expiry_date': item['expiry_date'] as String?,
+          'shelf_location': (item['shelf_location'] as String?) ?? '',
+          'is_damaged': item['is_damaged'] == true ? 1 : 0,
+          'barcode': item['barcode'] as String?,
+          'last_synced_at': now,
+        };
+
+        await txn.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+        await txn.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+      }
+    });
+  }
+
+  /// أسعار DRF (DecimalField) تصل كنص "500.00" غالباً، أحياناً كرقم — تُقبل
+  /// الحالتان هنا بأمان بدل افتراض نوع واحد فقط.
+  double _parseServerDecimal(dynamic value) {
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value) ?? 0;
+    return 0;
   }
 
   // البحث بالاسم التجاري أو العلمي أو الباركود

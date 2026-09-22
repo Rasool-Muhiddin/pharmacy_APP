@@ -164,6 +164,10 @@ class DesktopAuthStorage {
       'last_validated_at': response['validated_at'] ??
           DateTime.now().toUtc().toIso8601String(),
       'offline_grace_days': response['offline_grace_days'] ?? 30,
+      // يُحفظ ليبقى متاحاً حتى لو سجّل المستخدم لاحقاً دخولاً أوفلاين
+      // (verifyOfflineLogin)، فتستمر عمليات المخزون الأونلاين بالعمل فور
+      // عودة الاتصال دون طلب تسجيل دخول أونلاين جديد.
+      'api_token': response['api_token'],
     };
 
     state['accounts'] = accounts;
@@ -259,6 +263,8 @@ class DesktopAuthStorage {
       'user': Map<String, dynamic>.from(account['user'] as Map),
       'pharmacy': Map<String, dynamic>.from(account['pharmacy'] as Map),
       'license': license,
+      // قد يكون null لو لم يسجّل هذا الحساب دخولاً أونلاين ولو مرة واحدة بعد.
+      'api_token': account['api_token'] as String?,
     };
   }
 

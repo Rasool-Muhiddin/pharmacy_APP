@@ -3,6 +3,7 @@ import 'package:sqflite/sqflite.dart';
 
 import '../services/desktop_api_service.dart';
 import '../services/desktop_auth_storage.dart';
+import '../services/medicine_api_service.dart';
 import 'main_layout.dart';
 import '../database/db_helper.dart';
 import '../models/subscription_plan.dart';
@@ -138,6 +139,14 @@ class _AuthScreenState extends State<AuthScreen> {
     final isOwner = user['is_owner'] == true || user['is_owner'] == 1;
     final license = Map<String, dynamic>.from(response['license'] as Map);
     final entitlements = SubscriptionEntitlements.fromLicense(license);
+
+    // api_token يصل فقط عند تسجيل دخول أونلاين فعلي عبر السيرفر (desktop_login).
+    // دخول الأوفلاين (verifyOfflineLogin) لا يمرّ بالسيرفر، فلا يحمل توكن صالحاً؛
+    // في تلك الحالة نُفرغه صراحة بدل ترك قيمة قديمة قد تكون منتهية.
+    final apiToken = response['api_token'];
+    MedicineApiService.instance.setAuthToken(
+      apiToken is String && apiToken.isNotEmpty ? apiToken : null,
+    );
 
     if (pharmacyId == 0 || userId == 0) {
       _showMessage(

@@ -9,6 +9,7 @@ import 'screens/activation_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/main_layout.dart';
 import 'services/desktop_auth_storage.dart';
+import 'services/medicine_api_service.dart';
 import 'services/backup_service.dart';
 import 'services/update_service.dart';
 import 'models/subscription_plan.dart';
@@ -81,6 +82,16 @@ class _StartupGateState extends State<_StartupGate> {
       Map<String, dynamic>? savedSession;
       if (isActivated) {
         savedSession = await DesktopAuthStorage.instance.getSavedSession();
+      }
+
+      // تسجيل الدخول التلقائي (جلسة محفوظة) يتخطى AuthScreen بالكامل، لذا لا
+      // بد من تفعيل api_token هنا يدوياً وإلا بقيت طلبات المخزون الأونلاين
+      // بلا توكن رغم أن المستخدم "مسجّل دخول" فعلياً من وجهة نظره.
+      if (savedSession != null) {
+        final cachedToken = savedSession['api_token'];
+        MedicineApiService.instance.setAuthToken(
+          cachedToken is String ? cachedToken : null,
+        );
       }
 
       // النسخ الاحتياطي: يشتغل بكل فتح تطبيق فيه جلسة صالحة (محفوظة)،
