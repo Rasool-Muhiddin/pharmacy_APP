@@ -13,6 +13,7 @@ class AuthScreen extends StatefulWidget {
     int pharmacyId,
     int userId,
     bool isOwner,
+    bool isOnlineMode,
     SubscriptionEntitlements entitlements,
   )? onLoginSuccess;
 
@@ -139,6 +140,10 @@ class _AuthScreenState extends State<AuthScreen> {
     final isOwner = user['is_owner'] == true || user['is_owner'] == 1;
     final license = Map<String, dynamic>.from(response['license'] as Map);
     final entitlements = SubscriptionEntitlements.fromLicense(license);
+    // license.mode قادم من DesktopLicense.mode على الخادم ("online"/"offline")؛
+    // متوفر سواء جاء الرد من دخول أونلاين فعلي أو من verifyOfflineLogin
+    // (لأنه يُحفظ ويُعاد من الترخيص المخزَّن محلياً في كلتا الحالتين).
+    final isOnlineMode = license['mode'] == 'online';
 
     // api_token يصل فقط عند تسجيل دخول أونلاين فعلي عبر السيرفر (desktop_login).
     // دخول الأوفلاين (verifyOfflineLogin) لا يمرّ بالسيرفر، فلا يحمل توكن صالحاً؛
@@ -227,7 +232,7 @@ class _AuthScreenState extends State<AuthScreen> {
     );
 
     if (widget.onLoginSuccess != null) {
-      widget.onLoginSuccess!(pharmacyId, userId, isOwner, entitlements);
+      widget.onLoginSuccess!(pharmacyId, userId, isOwner, isOnlineMode, entitlements);
       return;
     }
 
@@ -237,6 +242,7 @@ class _AuthScreenState extends State<AuthScreen> {
           pharmacyId: pharmacyId,
           userId: userId,
           isOwner: isOwner,
+          isOnlineMode: isOnlineMode,
           entitlements: entitlements,
         ),
       ),

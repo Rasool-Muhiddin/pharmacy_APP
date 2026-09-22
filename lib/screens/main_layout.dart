@@ -23,6 +23,7 @@ class MainLayout extends StatefulWidget {
   final int pharmacyId; // رقم الفرع الحالي
   final int userId;     // رقم الصيدلي / الكاشير الحالي
   final bool isOwner;   // صلاحية المالك/المدير
+  final bool isOnlineMode; // من license.mode القادم من التفعيل/تسجيل الدخول
   final SubscriptionEntitlements entitlements;
 
   MainLayout({
@@ -30,6 +31,7 @@ class MainLayout extends StatefulWidget {
     required this.pharmacyId,
     this.userId = 1, // قيمة افتراضية في حال عدم التمرير
     this.isOwner = true, // قيمة افتراضية
+    this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين) قبل ربط الاستدعاءات القديمة
     SubscriptionEntitlements? entitlements,
   }) : entitlements = entitlements ?? SubscriptionEntitlements.basic();
 
@@ -95,7 +97,11 @@ class _MainLayoutState extends State<MainLayout> {
       case "الرئيسية":
         return DashboardScreen(pharmacyId: widget.pharmacyId);
       case "المخزن والأدوية":
-        return InventoryScreen(pharmacyId: widget.pharmacyId, isOwner: widget.isOwner); 
+        return InventoryScreen(
+          pharmacyId: widget.pharmacyId,
+          isOwner: widget.isOwner,
+          isOnlineMode: widget.isOnlineMode,
+        );
       case "نقطة البيع POS":
         return PosScreen(
           pharmacyId: widget.pharmacyId,

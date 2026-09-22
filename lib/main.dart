@@ -149,17 +149,19 @@ class _StartupGateState extends State<_StartupGate> {
       final userId = (user['id'] as num?)?.toInt() ?? 0;
       final isOwner = user['is_owner'] == true || user['is_owner'] == 1;
       final license = Map<String, dynamic>.from(_savedSession!['license'] as Map);
+      final isOnlineMode = license['mode'] == 'online';
 
       return MainLayout(
         pharmacyId: pharmacyId,
         userId: userId,
         isOwner: isOwner,
+        isOnlineMode: isOnlineMode,
         entitlements: SubscriptionEntitlements.fromLicense(license),
       );
     }
 
     return AuthScreen(
-      onLoginSuccess: (pharmacyId, userId, isOwner, entitlements) {
+      onLoginSuccess: (pharmacyId, userId, isOwner, isOnlineMode, entitlements) {
         // طبقة أمان إضافية: تغطي أول تسجيل دخول قبل وجود أي جلسة محفوظة،
         // ولا تكرر النسخة لو كانت _checkActivation أخذتها أصلاً بنفس اليوم.
         BackupService.runDailyBackupIfNeeded();
@@ -170,6 +172,7 @@ class _StartupGateState extends State<_StartupGate> {
               pharmacyId: pharmacyId,
               userId: userId,
               isOwner: isOwner,
+              isOnlineMode: isOnlineMode,
               entitlements: entitlements,
             ),
           ),
