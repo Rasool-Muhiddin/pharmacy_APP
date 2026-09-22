@@ -4,6 +4,7 @@ import 'package:sqflite/sqflite.dart';
 import '../services/desktop_api_service.dart';
 import '../services/desktop_auth_storage.dart';
 import '../services/medicine_api_service.dart';
+import '../services/invoice_api_service.dart';
 import 'main_layout.dart';
 import '../database/db_helper.dart';
 import '../models/subscription_plan.dart';
@@ -150,6 +151,9 @@ class _AuthScreenState extends State<AuthScreen> {
     // في تلك الحالة نُفرغه صراحة بدل ترك قيمة قديمة قد تكون منتهية.
     final apiToken = response['api_token'];
     MedicineApiService.instance.setAuthToken(
+      apiToken is String && apiToken.isNotEmpty ? apiToken : null,
+    );
+    InvoiceApiService.instance.setAuthToken(
       apiToken is String && apiToken.isNotEmpty ? apiToken : null,
     );
 

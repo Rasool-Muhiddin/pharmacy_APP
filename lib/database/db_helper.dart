@@ -31,7 +31,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 3,
+    version: 4,
     onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON');
     },
@@ -119,6 +119,7 @@ Future<void> _onCreate(Database db, int version) async {
       final_amount REAL NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       is_refunded INTEGER NOT NULL DEFAULT 0,
+      last_synced_at TEXT,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
       FOREIGN KEY(cashier_id) REFERENCES user_profile(id)
     )
@@ -287,6 +288,12 @@ Future<void> _onUpgrade(
     // معناه "لم تُزامن مع السيرفر بعد"، لا خطأ.
     await db.execute('ALTER TABLE medicine ADD COLUMN last_synced_at TEXT;');
   }
+
+  if (oldVersion < 4) {
+    // نفس منطق عمود medicine.last_synced_at أعلاه، لكن لجدول الفواتير هذه
+    // المرة — يبقى NULL لكل الفواتير الأوفلاين الحالية (لم تُزامن بعد).
+    await db.execute('ALTER TABLE invoice ADD COLUMN last_synced_at TEXT;');
+  }
 }
 
   //==========================================
@@ -454,6 +461,92 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     if (value is num) return value.toDouble();
     if (value is String) return double.tryParse(value) ?? 0;
     return 0;
+  }
+
+  /// يحفظ فاتورة واحدة قادمة من السيرفر (نتيجة checkout أو refund مباشرة)
+  /// في الكاش المحلي، بنفس نمط upsertMedicineFromServer تماماً.
+  Future<void> upsertInvoiceFromServer({
+    required int pharmacyId,
+    required Map<String, dynamic> serverData,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      await _upsertInvoiceRow(txn, pharmacyId: pharmacyId, serverData: serverData, syncedAt: now);
+    });
+  }
+
+  /// يستبدل كامل كاش الفواتير المحلي بقائمة كاملة قادمة من السيرفر (بعد
+  /// جلب invoice_api_service.fetchInvoices() لكل الصفحات)، بنفس نمط
+  /// replaceMedicinesCache تماماً — معاملة واحدة لكل الدفعة.
+  Future<void> replaceInvoicesCache({
+    required int pharmacyId,
+    required List<Map<String, dynamic>> serverItems,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      for (final item in serverItems) {
+        await _upsertInvoiceRow(txn, pharmacyId: pharmacyId, serverData: item, syncedAt: now);
+      }
+    });
+  }
+
+  /// المنطق المشترك بين upsertInvoiceFromServer وreplaceInvoicesCache.
+  ///
+  /// cashier_id يُترك NULL دائماً هنا عمداً: مُعرّف الكاشير القادم من
+  /// السيرفر هو user.id في Django (مساحة أرقام مختلفة تماماً عن
+  /// user_profile.id المحلي الذي يشير إليه القيد
+  /// FOREIGN KEY(cashier_id) REFERENCES user_profile(id))، فتخزينه كما هو
+  /// قد يخالف القيد أو يشير خطأً لصف محلي مختلف تماماً. لا تعرض شاشات
+  /// الفواتير الحالية اسم الكاشير للفواتير المتزامنة من السيرفر بسبب هذا
+  /// (تظهر "غير محدد" في سجل المبيعات)، وهذا قيد معروف يستحق حقل اسم كاشير
+  /// نصياً منفصلاً على الفاتورة مستقبلاً بدل الاعتماد على cashier_id فقط.
+  Future<void> _upsertInvoiceRow(
+    DatabaseExecutor txn, {
+    required int pharmacyId,
+    required Map<String, dynamic> serverData,
+    required String syncedAt,
+  }) async {
+    final invoiceId = serverData['id'] as int;
+
+    final row = <String, dynamic>{
+      'id': invoiceId,
+      'pharmacy_id': pharmacyId,
+      'invoice_number': serverData['invoice_number'] as String,
+      'cashier_id': null,
+      'total_amount': _parseServerDecimal(serverData['total_amount']),
+      'discount': _parseServerDecimal(serverData['discount']),
+      'final_amount': _parseServerDecimal(serverData['final_amount']),
+      'created_at': serverData['created_at'] as String,
+      'is_refunded': serverData['is_refunded'] == true ? 1 : 0,
+      'last_synced_at': syncedAt,
+    };
+
+    await txn.insert('invoice', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+    await txn.update('invoice', row, where: 'id = ?', whereArgs: [invoiceId]);
+
+    // نعيد كتابة أصناف هذه الفاتورة بالكامل من نسخة السيرفر في كل مرة —
+    // أبسط وأضمن من مطابقة كل صنف على حدة، ولا مشكلة في حذفها وإعادة
+    // إدراجها لأنها بيانات قراءة فقط قادمة من السيرفر أصلاً (لا تعديل
+    // محلي عليها يُفقَد).
+    final items = serverData['items'];
+    if (items is List) {
+      await txn.delete('invoice_item', where: 'invoice_id = ?', whereArgs: [invoiceId]);
+      for (final rawItem in items) {
+        if (rawItem is! Map<String, dynamic>) continue;
+        await txn.insert('invoice_item', {
+          'invoice_id': invoiceId,
+          'trade_name': rawItem['trade_name'] as String,
+          'medicine_id': rawItem['medicine'] as int,
+          'quantity': (rawItem['quantity'] as num).toInt(),
+          'unit_price': _parseServerDecimal(rawItem['unit_price']),
+          'total_price': _parseServerDecimal(rawItem['total_price']),
+        });
+      }
+    }
   }
 
   // البحث بالاسم التجاري أو العلمي أو الباركود

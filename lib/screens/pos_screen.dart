@@ -1,15 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart'; // تأكد من صحة مسار الملف لديك
+import '../repository/invoice_repository.dart';
 
 class PosScreen extends StatefulWidget {
   final int pharmacyId;
   final int userId; // رقم المستخدم الحالى (Cashier)
+  final bool isOnlineMode; // من license.mode القادم من التفعيل/تسجيل الدخول
 
   const PosScreen({
     super.key,
     required this.pharmacyId,
     required this.userId,
+    this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين)
   });
 
   @override
@@ -44,8 +47,13 @@ class _PosScreenState extends State<PosScreen> {
     setState(() => _isLoading = true);
 
     try {
+      // المخزون هنا لا يزال يُقرأ من الكاش المحلي مباشرة (يُحدَّثه فتح شاشة
+      // المخزون، أو أي checkout/refund أونلاين ناجح هنا نفسه — انظر أسفل).
       final meds = await DatabaseHelper.instance.getMedicines(widget.pharmacyId);
-      final invoices = await DatabaseHelper.instance.getInvoices(widget.pharmacyId);
+      final invoices = await InvoiceRepository.instance.getInvoices(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
       final DateTime now = DateTime.now();
       final DateTime today = DateTime(now.year, now.month, now.day);
 
@@ -254,22 +262,9 @@ class _PosScreenState extends State<PosScreen> {
     setState(() => _isCheckingOut = true);  
 
     try {
-      // أ) توليد رقم الفاتورة المنسق
-      String invoiceNum = await DatabaseHelper.instance.generateInvoiceNumber();
-
-      // ب) إعداد خريطة بيانات الفاتورة الرئيسية
-      final invoiceData = {
-        'pharmacy_id': widget.pharmacyId,
-        'invoice_number': invoiceNum,
-        'cashier_id': widget.userId,
-        'total_amount': _subtotal,
-        'discount': _appliedDiscount,
-        'final_amount': _grandTotal,
-        'created_at': DateTime.now().toIso8601String(),
-        'is_refunded': 0,
-      };
-
-      // جـ) إعداد قائمة عناصر الفاتورة
+      // إعداد قائمة عناصر الفاتورة — نفس الشكل يُستخدم محلياً وأونلاين؛
+      // InvoiceRepository يستخرج medicine_id/quantity منها عند الأونلاين
+      // ويتجاهل الباقي (السعر والاسم يأتيان من السيرفر وقت البيع).
       final itemsData = _cartItems.map((item) {
         return {
           'trade_name': item['trade_name'],
@@ -280,11 +275,43 @@ class _PosScreenState extends State<PosScreen> {
         };
       }).toList();
 
-      // د) تنفيذ الشراء التكاملي عبر دالة completeSale
-      await DatabaseHelper.instance.completeSale(
-        invoice: invoiceData,
-        items: itemsData,
-      );
+      String invoiceNum;
+
+      if (widget.isOnlineMode) {
+        // أونلاين: رقم الفاتورة وسعر كل صنف يُحدَّدان من السيرفر دائماً،
+        // لا نولّدهما أو نفترضهما محلياً هنا.
+        final created = await InvoiceRepository.instance.checkout(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: true,
+          invoice: {'discount': _appliedDiscount},
+          items: itemsData,
+        );
+        invoiceNum = created['invoice_number'] as String;
+      } else {
+        // أ) توليد رقم الفاتورة المنسق محلياً
+        invoiceNum = await DatabaseHelper.instance.generateInvoiceNumber();
+
+        // ب) إعداد خريطة بيانات الفاتورة الرئيسية
+        final invoiceData = {
+          'pharmacy_id': widget.pharmacyId,
+          'invoice_number': invoiceNum,
+          'cashier_id': widget.userId,
+          'total_amount': _subtotal,
+          'discount': _appliedDiscount,
+          'final_amount': _grandTotal,
+          'created_at': DateTime.now().toIso8601String(),
+          'is_refunded': 0,
+        };
+
+        // جـ) تنفيذ الشراء التكاملي عبر completeSale (نفس السلوك السابق
+        // تماماً، فقط مُمرَّر الآن عبر InvoiceRepository)
+        await InvoiceRepository.instance.checkout(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: false,
+          invoice: invoiceData,
+          items: itemsData,
+        );
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -334,7 +361,11 @@ class _PosScreenState extends State<PosScreen> {
 
     if (confirm == true) {
       try {
-        await DatabaseHelper.instance.refundInvoice(invoice['id']);
+        await InvoiceRepository.instance.refund(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: widget.isOnlineMode,
+          invoiceId: invoice['id'],
+        );
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('🔄 تم إرجاع الفاتورة وإعادة كمياتها للمخزن بنجاح'), backgroundColor: Colors.orange),

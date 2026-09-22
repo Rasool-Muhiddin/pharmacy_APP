@@ -10,6 +10,7 @@ import 'screens/login_screen.dart';
 import 'screens/main_layout.dart';
 import 'services/desktop_auth_storage.dart';
 import 'services/medicine_api_service.dart';
+import 'services/invoice_api_service.dart';
 import 'services/backup_service.dart';
 import 'services/update_service.dart';
 import 'models/subscription_plan.dart';
@@ -90,6 +91,9 @@ class _StartupGateState extends State<_StartupGate> {
       if (savedSession != null) {
         final cachedToken = savedSession['api_token'];
         MedicineApiService.instance.setAuthToken(
+          cachedToken is String ? cachedToken : null,
+        );
+        InvoiceApiService.instance.setAuthToken(
           cachedToken is String ? cachedToken : null,
         );
       }

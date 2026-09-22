@@ -106,11 +106,13 @@ class _MainLayoutState extends State<MainLayout> {
         return PosScreen(
           pharmacyId: widget.pharmacyId,
           userId: widget.userId,
+          isOnlineMode: widget.isOnlineMode,
         );
       case "سجل المبيعات":
         return SalesHistoryScreen(
           pharmacyId: widget.pharmacyId,
           isOwner: widget.isOwner,
+          isOnlineMode: widget.isOnlineMode,
         );
       case "المذاخر والمشتريات":
         return MissingSuppliersScreen(

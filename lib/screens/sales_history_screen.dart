@@ -1,15 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart';
+import '../repository/invoice_repository.dart';
 
 class SalesHistoryScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner;
+  final bool isOnlineMode; // من license.mode القادم من التفعيل/تسجيل الدخول
 
   const SalesHistoryScreen({
     super.key,
     required this.pharmacyId,
     this.isOwner = true,
+    this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين)
   });
 
   @override
@@ -39,6 +42,18 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     setState(() => _isLoading = true);
 
     try {
+      // أونلاين: نُحدّث الكاش المحلي من السيرفر أولاً (قراءة فقط)، ثم
+      // نعرضه بنفس استعلام JOIN المحلي أدناه دون أي تغيير عليه. ملاحظة:
+      // فواتير أونلاين مُخزَّنة عبر cashier_id = NULL دائماً (انظر
+      // db_helper._upsertInvoiceRow)، فستظهر باسم "غير محدد" هنا مؤقتاً
+      // حتى يُضاف حقل اسم كاشير نصي منفصل على الفاتورة مستقبلاً.
+      if (widget.isOnlineMode) {
+        await InvoiceRepository.instance.getInvoices(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: true,
+        );
+      }
+
       // الحصول على كائن قاعدة البيانات بدون التعديل على ملف db_helper.dart
       final db = await DatabaseHelper.instance.database;
 
@@ -109,7 +124,11 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     if (confirm != true) return;
 
     try {
-      await DatabaseHelper.instance.refundInvoice(invoiceId);
+      await InvoiceRepository.instance.refund(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+        invoiceId: invoiceId,
+      );
       _showSnackBar('تم استرجاع الفاتورة بنجاح وإعادة الكميات للمخزن', Colors.green);
       _loadInvoices();
     } catch (e) {
