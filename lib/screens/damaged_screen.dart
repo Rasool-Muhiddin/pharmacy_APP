@@ -1,14 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../database/db_helper.dart';
+import '../repository/medicine_repository.dart';
 
 class DamagedScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner; // التأكد من صلاحية المالك
 
+  /// وضع الأونلاين الحالي للصيدلية — يُمرَّر من نفس المكان الذي يحدّد به بقية
+  /// التطبيق (inventory_screen، pos_screen...) الوضع الحالي، وليس افتراضاً
+  /// محلياً هنا. عند true تمر كل عمليات الإتلاف عبر MedicineRepository بدل
+  /// الكتابة المباشرة في db_helper، فتُطبَّق عليها نفس قواعد "لا كتابة بلا
+  /// اتصال فعلي بالسيرفر" المطبَّقة على المخزون والمبيعات.
+  final bool isOnlineMode;
+
   const DamagedScreen({
     Key? key,
     required this.pharmacyId,
+    required this.isOnlineMode,
     this.isOwner = true,
   }) : super(key: key);
 
@@ -51,9 +60,13 @@ class _DamagedScreenState extends State<DamagedScreen> {
         ORDER BY dm.id DESC
       ''', [widget.pharmacyId]);
 
-      // جلب قائمة الأدوية المتاحة لإسقاطها في نافذة الإضافة
-      final medicines =
-          await DatabaseHelper.instance.getMedicines(widget.pharmacyId);
+      // جلب قائمة الأدوية المتاحة لإسقاطها في نافذة الإضافة، عبر نفس طبقة
+      // MedicineRepository المستخدمة في بقية الشاشات — كي تُحدَّث من السيرفر
+      // في وضع الأونلاين بدل قراءة كاش قد يكون قديماً.
+      final medicines = await MedicineRepository.instance.getMedicines(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
 
       // حساب إجمالي الخسائر المادية بسعر الشراء
       // 🟢 سجلات "تصحيح إدخال" لا تُعتبر خسارة فعلية (الكمية لم تُفقد، فقط خطأ كتابة
@@ -288,9 +301,16 @@ class _DamagedScreenState extends State<DamagedScreen> {
                       final medName = selectedMedicine['trade_name'];
 
                       try {
-                        await DatabaseHelper.instance.processDamageMedicine(
-                          medicineId: medId,
+                        // ⚠️ الكمية فقط تُزامَن مع السيرفر عبر هذا المسار
+                        // (نفس قيد MedicineRepository.damageMedicine الموثّق
+                        // في تعريفها)؛ سبب/ملاحظات الإتلاف تبقى مسجّلة محلياً
+                        // فقط حتى يُبنى لها جدول ونقطة نهاية على الخادم ضمن
+                        // خطة الأونلاين — فلن تظهر تفاصيل السبب على جهاز آخر
+                        // لنفس الصيدلية بعد، رغم أن الكمية ستتزامن فعلياً.
+                        await MedicineRepository.instance.damageMedicine(
                           pharmacyId: widget.pharmacyId,
+                          isOnlineMode: widget.isOnlineMode,
+                          medicineId: medId,
                           quantityToDamage: qty,
                           reason: selectedReason,
                           notes: notesController.text.trim(),
@@ -301,6 +321,11 @@ class _DamagedScreenState extends State<DamagedScreen> {
                         _loadData();
                         _showSnackBar(
                             "تم نقل ($qty قطعة) من دواء ($medName) إلى التوالف بنجاح.");
+                      } on MedicineRepositoryException catch (e) {
+                        // رسائل هذا النوع مفهومة للمستخدم مباشرة (مثلاً: لا
+                        // يوجد اتصال بالخادم حالياً في وضع الأونلاين) — تُعرض
+                        // كما هي بلا لف إضافي.
+                        _showSnackBar(e.message, isError: true);
                       } catch (e) {
                         _showSnackBar("حدث خطأ أثناء معالجة الطلب: $e", isError: true);
                       }

@@ -1,12 +1,14 @@
 import 'package:flutter/material.dart';
-import '../database/db_helper.dart';
+import '../repository/suppliers_repository.dart';
 
 class MissingSuppliersScreen extends StatefulWidget {
   final int pharmacyId;
+  final bool isOnlineMode; // من license.mode القادم من main_layout.dart
 
   const MissingSuppliersScreen({
     super.key,
     this.pharmacyId = 1, // معرف الفرع الافتراضي
+    this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين)
   });
 
   @override
@@ -19,6 +21,7 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
   late Future<Map<String, dynamic>?> _topSupplierFuture;
   final Set<int> _expandedSupplierIds = <int>{};
   String _searchQuery = '';
+  final SuppliersRepository _repository = SuppliersRepository.instance;
 
   // الهوية البصرية وتناسق الألوان
   static const Color primary = Color(0xFF1ABC9C);
@@ -40,9 +43,18 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
 
   void _refreshData() {
     setState(() {
-      _suppliersFuture = DatabaseHelper.instance.getSuppliersWithFinancials(widget.pharmacyId);
-      _totalDebtFuture = DatabaseHelper.instance.getTotalSuppliersDebt(widget.pharmacyId);
-      _topSupplierFuture = DatabaseHelper.instance.getTopSupplier(widget.pharmacyId);
+      _suppliersFuture = _repository.getSuppliersWithFinancials(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+      _totalDebtFuture = _repository.getTotalSuppliersDebt(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+      _topSupplierFuture = _repository.getTopSupplier(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
     });
   }
 
@@ -395,7 +407,10 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
   return Padding(
     padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
     child: FutureBuilder<List<Map<String, dynamic>>>(
-      future: DatabaseHelper.instance.getPurchaseInvoicesBySupplier(supplierId),
+      future: _repository.getPurchaseInvoicesBySupplier(
+        supplierId: supplierId,
+        isOnlineMode: widget.isOnlineMode,
+      ),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Padding(
@@ -566,8 +581,10 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                                     color: primaryDark,
                                   ),
                                   onPressed: () async {
-                                    await DatabaseHelper.instance
-                                        .settlePurchaseInvoiceCredit(id);
+                                    await _repository.settlePurchaseInvoiceCredit(
+                                      isOnlineMode: widget.isOnlineMode,
+                                      purchaseInvoiceId: id,
+                                    );
                                     _refreshData();
                                     if (context.mounted) {
                                       ScaffoldMessenger.of(context).showSnackBar(
@@ -733,12 +750,15 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
               if (name.isEmpty) return;
 
               try {
-                final supplierId = await DatabaseHelper.instance.insertSupplier({
-                  'pharmacy_id': widget.pharmacyId,
-                  'name': name,
-                  'phone': phoneController.text.trim(),
-                  'created_at': DateTime.now().toIso8601String(),
-                });
+                final supplierId = await _repository.insertSupplier(
+                  pharmacyId: widget.pharmacyId,
+                  isOnlineMode: widget.isOnlineMode,
+                  data: {
+                    'name': name,
+                    'phone': phoneController.text.trim(),
+                    'created_at': DateTime.now().toIso8601String(),
+                  },
+                );
 
                 debugPrint(
                   'تمت إضافة المذخر: id=$supplierId, '
@@ -847,13 +867,16 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
 
               if (total > 0) {
                 try {
-                  await DatabaseHelper.instance.insertPurchaseInvoice({
-                    'pharmacy_id': widget.pharmacyId,
-                    'supplier_id': supplierId,
-                    'invoice_number': invoiceNumController.text.trim().isEmpty ? null : invoiceNumController.text.trim(),
-                    'total_amount': total,
-                    'paid_amount': paid,
-                  });
+                  await _repository.insertPurchaseInvoice(
+                    pharmacyId: widget.pharmacyId,
+                    isOnlineMode: widget.isOnlineMode,
+                    data: {
+                      'supplier_id': supplierId,
+                      'invoice_number': invoiceNumController.text.trim().isEmpty ? null : invoiceNumController.text.trim(),
+                      'total_amount': total,
+                      'paid_amount': paid,
+                    },
+                  );
 
 
                   if (ctx.mounted) Navigator.pop(ctx);
@@ -946,8 +969,9 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
               final double amount = double.tryParse(amountController.text) ?? 0.0;
               if (amount > 0) {
                 try {
-                  await DatabaseHelper.instance.addPurchaseInvoicePayment(
+                  await _repository.addPurchaseInvoicePayment(
                     pharmacyId: widget.pharmacyId,
+                    isOnlineMode: widget.isOnlineMode,
                     supplierId: supplierId,
                     purchaseInvoiceId: invoiceId,
                     amount: amount,
@@ -1039,8 +1063,9 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
               final amount = double.tryParse(amountController.text) ?? 0;
               if (amount <= 0) return;
               try {
-                await DatabaseHelper.instance.addPurchaseInvoiceReturn(
+                await _repository.addPurchaseInvoiceReturn(
                   pharmacyId: widget.pharmacyId,
+                  isOnlineMode: widget.isOnlineMode,
                   supplierId: supplierId,
                   purchaseInvoiceId: invoiceId,
                   amount: amount,
@@ -1114,8 +1139,10 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                       _statementTopBar(dialogContext, supplierName),
                       Flexible(
                         child: FutureBuilder<List<Map<String, dynamic>>>(
-                          future: DatabaseHelper.instance
-                              .getSupplierStatementOfAccount(supplierId),
+                          future: _repository.getSupplierStatementOfAccount(
+                            supplierId: supplierId,
+                            isOnlineMode: widget.isOnlineMode,
+                          ),
                           builder: (futureCtx, snapshot) {
                             if (snapshot.connectionState ==
                                 ConnectionState.waiting) {
@@ -1524,7 +1551,10 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
             ),
             onPressed: () async {
               try {
-                await DatabaseHelper.instance.deleteSupplier(id);
+                await _repository.deleteSupplier(
+                  isOnlineMode: widget.isOnlineMode,
+                  id: id,
+                );
                 if (ctx.mounted) Navigator.pop(ctx);
                 _refreshData();
 

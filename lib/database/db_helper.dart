@@ -31,7 +31,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 4,
+    version: 5,
     onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON');
     },
@@ -221,6 +221,7 @@ Future<void> _onCreate(Database db, int version) async {
       expense_date TEXT NOT NULL,
       amount REAL NOT NULL CHECK(amount > 0),
       notes TEXT NOT NULL DEFAULT '',
+      last_synced_at TEXT,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id) ON DELETE CASCADE
     )
   ''');
@@ -293,6 +294,12 @@ Future<void> _onUpgrade(
     // نفس منطق عمود medicine.last_synced_at أعلاه، لكن لجدول الفواتير هذه
     // المرة — يبقى NULL لكل الفواتير الأوفلاين الحالية (لم تُزامن بعد).
     await db.execute('ALTER TABLE invoice ADD COLUMN last_synced_at TEXT;');
+  }
+
+  if (oldVersion < 5) {
+    // نفس المنطق تماماً، لكن لجدول المصروفات — يبقى NULL لكل المصروفات
+    // الأوفلاين الحالية (لم تُزامن بعد).
+    await db.execute('ALTER TABLE expense ADD COLUMN last_synced_at TEXT;');
   }
 }
 
@@ -684,6 +691,64 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
 
   Future<void> deleteExpense(int id, int pharmacyId) async {
     await (await database).delete('expense', where: 'id = ? AND pharmacy_id = ?', whereArgs: [id, pharmacyId]);
+  }
+
+  //====================================================
+  // كاش القراءة فقط لوضع الأونلاين — يُستدعى بعد كل قراءة/كتابة ناجحة
+  // من السيرفر فقط (ExpenseRepository)، بنفس نمط upsertMedicineFromServer/
+  // replaceMedicinesCache تماماً.
+  //====================================================
+
+  /// يحفظ/يحدّث مصروفاً واحداً قادماً من استجابة السيرفر، مفتاحه id (معرّف
+  /// السيرفر نفسه). INSERT OR IGNORE ثم UPDATE بدل REPLACE، بنفس سبب تفادي
+  /// REPLACE المذكور في upsertMedicineFromServer (DELETE+INSERT داخلي قد
+  /// يصطدم بقيود FOREIGN KEY لاحقاً لو أُضيفت).
+  Future<void> upsertExpenseFromServer({
+    required int pharmacyId,
+    required Map<String, dynamic> serverData,
+  }) async {
+    final db = await database;
+
+    final row = <String, dynamic>{
+      'id': serverData['id'] as int,
+      'pharmacy_id': pharmacyId,
+      'expense_type': serverData['expense_type'] as String,
+      'expense_date': serverData['expense_date'] as String,
+      'amount': _parseServerDecimal(serverData['amount']),
+      'notes': (serverData['notes'] as String?) ?? '',
+      'last_synced_at': DateTime.now().toIso8601String(),
+    };
+
+    await db.insert('expense', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.update('expense', row, where: 'id = ?', whereArgs: [row['id']]);
+  }
+
+  /// يستبدل كامل كاش المصروفات المحلي بقائمة كاملة قادمة من السيرفر (بعد
+  /// جلب expense_api_service.fetchExpenses() لكل الصفحات)، بنفس نمط
+  /// replaceMedicinesCache تماماً — معاملة واحدة لكل الدفعة.
+  Future<void> replaceExpensesCache({
+    required int pharmacyId,
+    required List<Map<String, dynamic>> serverItems,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      for (final item in serverItems) {
+        final row = <String, dynamic>{
+          'id': item['id'] as int,
+          'pharmacy_id': pharmacyId,
+          'expense_type': item['expense_type'] as String,
+          'expense_date': item['expense_date'] as String,
+          'amount': _parseServerDecimal(item['amount']),
+          'notes': (item['notes'] as String?) ?? '',
+          'last_synced_at': now,
+        };
+
+        await txn.insert('expense', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+        await txn.update('expense', row, where: 'id = ?', whereArgs: [row['id']]);
+      }
+    });
   }
 
   //=========================================

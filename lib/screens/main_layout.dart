@@ -117,18 +117,25 @@ class _MainLayoutState extends State<MainLayout> {
       case "المذاخر والمشتريات":
         return MissingSuppliersScreen(
           pharmacyId: widget.pharmacyId,
+          isOnlineMode: widget.isOnlineMode,
         );
       case "الأدوية التالفة":
         return DamagedScreen(
           pharmacyId: widget.pharmacyId,
           isOwner: widget.isOwner,
+          isOnlineMode: widget.isOnlineMode,
         );
       case "المصروفات":
-        return ExpensesScreen(pharmacyId: widget.pharmacyId, isOwner: widget.isOwner);
+        return ExpensesScreen(
+          pharmacyId: widget.pharmacyId,
+          isOwner: widget.isOwner,
+          isOnlineMode: widget.isOnlineMode,
+        );
       case "التقارير والتحليلات":
         return ReportsScreen(
           pharmacyId: widget.pharmacyId,
           isOwner: widget.isOwner,
+          isOnlineMode: widget.isOnlineMode,
         );
       default:
         return DashboardScreen(pharmacyId: widget.pharmacyId);

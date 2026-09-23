@@ -4,15 +4,22 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import '../database/db_helper.dart';
+import '../repository/expense_repository.dart';
 
 class ExpensesScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner;
 
+  /// وضع الأونلاين الحالي للصيدلية — نفس المعامل المُمرَّر لبقية الشاشات من
+  /// MainLayout. عند true تمر كل عمليات القراءة/الإضافة/التعديل/الحذف عبر
+  /// ExpenseRepository بدل db_helper مباشرة، فتُطبَّق عليها نفس قواعد "لا
+  /// كتابة بلا اتصال فعلي بالسيرفر" المطبَّقة على المخزون والمبيعات.
+  final bool isOnlineMode;
+
   const ExpensesScreen({
     super.key,
     required this.pharmacyId,
+    required this.isOnlineMode,
     this.isOwner = true,
   });
 
@@ -54,8 +61,9 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
   Future<void> _loadExpenses() async {
     setState(() => _loading = true);
     try {
-      final rows = await DatabaseHelper.instance.getExpenses(
+      final rows = await ExpenseRepository.instance.getExpenses(
         pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
         startDate: _dateFormat.format(_startDate),
         endDate: _dateFormat.format(_endDate),
         expenseType: _selectedType,
@@ -181,19 +189,41 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                 onPressed: () async {
                   if (!formKey.currentState!.validate()) return;
                   final data = <String, dynamic>{
-                    'pharmacy_id': widget.pharmacyId,
                     'expense_type': selectedType,
                     'expense_date': _dateFormat.format(selectedDate),
                     'amount': double.parse(amountController.text.replaceAll(',', '')),
                     'notes': notesController.text.trim(),
                   };
-                  if (isEditing) {
-                    await DatabaseHelper.instance.updateExpense(expense['id'] as int, data);
-                  } else {
-                    await DatabaseHelper.instance.addExpense(data);
+                  try {
+                    if (isEditing) {
+                      await ExpenseRepository.instance.updateExpense(
+                        pharmacyId: widget.pharmacyId,
+                        isOnlineMode: widget.isOnlineMode,
+                        id: expense['id'] as int,
+                        data: data,
+                      );
+                    } else {
+                      await ExpenseRepository.instance.addExpense(
+                        pharmacyId: widget.pharmacyId,
+                        isOnlineMode: widget.isOnlineMode,
+                        data: data,
+                      );
+                    }
+                    if (dialogContext.mounted) Navigator.pop(dialogContext);
+                    await _loadExpenses();
+                  } on ExpenseRepositoryException catch (e) {
+                    if (dialogContext.mounted) {
+                      ScaffoldMessenger.of(dialogContext).showSnackBar(
+                        SnackBar(content: Text(e.message)),
+                      );
+                    }
+                  } catch (e) {
+                    if (dialogContext.mounted) {
+                      ScaffoldMessenger.of(dialogContext).showSnackBar(
+                        SnackBar(content: Text('تعذر حفظ المصروف: $e')),
+                      );
+                    }
                   }
-                  if (dialogContext.mounted) Navigator.pop(dialogContext);
-                  await _loadExpenses();
                 },
                 child: const Text('حفظ'),
               ),
@@ -222,9 +252,24 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
       ),
     );
     if (approved != true) return;
-    await DatabaseHelper.instance
-        .deleteExpense(expense['id'] as int, widget.pharmacyId);
-    await _loadExpenses();
+    try {
+      await ExpenseRepository.instance.deleteExpense(
+        isOnlineMode: widget.isOnlineMode,
+        id: expense['id'] as int,
+        pharmacyId: widget.pharmacyId,
+      );
+      await _loadExpenses();
+    } on ExpenseRepositoryException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر حذف المصروف: $e')),
+        );
+      }
+    }
   }
 
   @override

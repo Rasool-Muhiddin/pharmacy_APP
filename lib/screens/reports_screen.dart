@@ -2,15 +2,31 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import 'package:intl/intl.dart';
-import '../database/db_helper.dart'; 
+import '../database/db_helper.dart';
+import '../repository/medicine_repository.dart';
+import '../repository/Invoice_repository.dart';
+import '../repository/expense_repository.dart';
 
 class ReportsScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner;
 
+  /// وضع الأونلاين الحالي للصيدلية. كل استعلامات هذه الشاشة تبقى SQL محلي
+  /// مباشر على جداول medicine/invoice/invoice_item/expense — لكن في وضع
+  /// الأونلاين نُحدّث هذه الجداول أولاً من السيرفر عبر MedicineRepository/
+  /// InvoiceRepository/ExpenseRepository (نفس الكاش الذي تعتمده شاشات
+  /// المخزون والمبيعات والمصروفات) قبل تنفيذ أي استعلام تقرير، لتعكس
+  /// التقارير بيانات محدّثة بدل الاكتفاء بآخر نسخة محلية قديمة.
+  ///
+  /// ⚠️ التوالف/المذاخر (جداول damaged_medicine, purchase_invoice) لا تزال
+  /// بلا كاش أونلاين حتى الآن — تبقى بيانات هذا الجهاز فقط في كلا الوضعين
+  /// حتى تُبنى لها طبقة API/Repository مماثلة ضمن الخطة.
+  final bool isOnlineMode;
+
   const ReportsScreen({
     super.key,
     required this.pharmacyId,
+    required this.isOnlineMode,
     this.isOwner = true,
   });
 
@@ -62,6 +78,32 @@ Future<void> _loadReportData() async {
   setState(() => _isLoading = true);
 
   try {
+    // في وضع الأونلاين: نجلب أحدث نسخة من المخزون والفواتير من السيرفر
+    // أولاً (نفس مسار medicine/invoice المستخدم في شاشتي المخزون ونقطة
+    // البيع)، كي تُبنى استعلامات التقرير أدناه على بيانات مُزامَنة بدل كاش
+    // قديم. الدالتان تتعاملان داخلياً مع انعدام الاتصال (تعودان لآخر كاش
+    // محلي محفوظ بصمت)، فاستدعاؤهما آمن حتى لو تعذّر الوصول للسيرفر فعلياً
+    // الآن — لا حاجة لفحص اتصال منفصل هنا.
+    if (widget.isOnlineMode) {
+      try {
+        await MedicineRepository.instance.getMedicines(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: true,
+        );
+        await InvoiceRepository.instance.getInvoices(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: true,
+        );
+        await ExpenseRepository.instance.getExpenses(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: true,
+        );
+      } catch (_) {
+        // فشل التحديث من السيرفر لا يجب أن يمنع عرض التقرير بآخر بيانات
+        // متوفرة محلياً — الاستعلامات أدناه تتابع على الكاش كما هو.
+      }
+    }
+
     final db = await DatabaseHelper.instance.database;
 
     // استخراج التاريخ بصيغة YYYY-MM-DD

@@ -1,6 +1,7 @@
+from django.db.models import Sum
 from rest_framework import serializers
 
-from .models import Invoice, InvoiceItem, Medicine
+from .models import Invoice, InvoiceItem, Medicine, PurchaseInvoice, Supplier
 
 
 class MedicineSerializer(serializers.ModelSerializer):
@@ -74,3 +75,75 @@ class CheckoutInputSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("لا يمكن إتمام فاتورة بلا أصناف.")
         return value
+
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Supplier
+        fields = ["id", "name", "phone", "created_at", "updated_at"]
+        # pharmacy يُحدَّد تلقائياً من صيدلية المستخدم — نفس نمط MedicineSerializer.
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class SupplierSummarySerializer(serializers.Serializer):
+    """
+    للقراءة فقط — شكل نتيجة SupplierViewSet.summary (قائمة مذاخر مع
+    إحصاءاتها المالية المحسوبة)، وليست مرتبطة بموديل مباشرة.
+    """
+
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    phone = serializers.CharField(allow_blank=True)
+    invoice_count = serializers.IntegerField()
+    total_purchases = serializers.DecimalField(max_digits=14, decimal_places=2)
+    remaining_debt = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class PurchaseInvoiceSerializer(serializers.ModelSerializer):
+    """
+    returned_amount/net_amount/remaining_amount محسوبة ديناميكياً من
+    الاسترجاعات المرتبطة (وليست أعمدة مخزَّنة)، لتبقى متسقة دائماً مع
+    آخر حالة فعلية للفاتورة.
+    """
+
+    returned_amount = serializers.SerializerMethodField()
+    net_amount = serializers.SerializerMethodField()
+    remaining_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PurchaseInvoice
+        fields = [
+            "id",
+            "supplier",
+            "invoice_number",
+            "total_amount",
+            "paid_amount",
+            "returned_amount",
+            "net_amount",
+            "remaining_amount",
+            "created_at",
+            "updated_at",
+        ]
+        # supplier يُحدَّد يدوياً في PurchaseInvoiceViewSet.perform_create بعد
+        # التحقق من ملكيته لصيدلية المستخدم — لا PrimaryKeyRelatedField عام
+        # كان سيسمح نظرياً بأي معرّف مذخر من صيدلية أخرى. total_amount/
+        # paid_amount قابلان للكتابة فقط عند الإنشاء؛ بعد ذلك يتغيران حصراً
+        # عبر add_payment/add_return/settle_credit (انظر views.py).
+        read_only_fields = [
+            "id",
+            "supplier",
+            "returned_amount",
+            "net_amount",
+            "remaining_amount",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_returned_amount(self, obj):
+        return obj.returns.aggregate(s=Sum("amount_returned"))["s"] or 0
+
+    def get_net_amount(self, obj):
+        return obj.total_amount - self.get_returned_amount(obj)
+
+    def get_remaining_amount(self, obj):
+        return self.get_net_amount(obj) - obj.paid_amount

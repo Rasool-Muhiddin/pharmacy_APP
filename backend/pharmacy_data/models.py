@@ -104,3 +104,81 @@ class InvoiceItem(models.Model):
 
     def __str__(self):
         return f"{self.trade_name} x{self.quantity}"
+
+class Supplier(models.Model):
+    """يقابل جدول pharmacy_supplier المحلي."""
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="suppliers")
+    name = models.CharField(max_length=200)
+    phone = models.CharField(max_length=50, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["pharmacy", "name"])]
+
+    def __str__(self):
+        return self.name
+
+
+class PurchaseInvoice(models.Model):
+    """
+    يقابل جدول purchase_invoice المحلي. total_amount وpaid_amount حقلان
+    مباشران يُحدَّثان فقط عبر add_payment/add_return/settle_credit
+    (انظر PurchaseInvoiceViewSet) — لا تعديل مباشر عليهما بأي طريقة أخرى.
+    الاسترجاعات محسوبة من PurchaseInvoiceReturn المرتبطة وليست عموداً
+    مخزَّناً، تفادياً لازدواج مصدر الحقيقة.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="purchase_invoices")
+    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name="purchase_invoices")
+    invoice_number = models.CharField(max_length=60, blank=True, default="")
+    total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    paid_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["pharmacy", "supplier"])]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(total_amount__gte=0), name="purchase_invoice_total_gte_0"),
+            models.CheckConstraint(condition=models.Q(paid_amount__gte=0), name="purchase_invoice_paid_gte_0"),
+        ]
+
+    def __str__(self):
+        return self.invoice_number or f"PI-{self.pk}"
+
+
+class SupplierPayment(models.Model):
+    """يقابل جدول supplier_payment المحلي."""
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="supplier_payments")
+    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name="payments")
+    purchase_invoice = models.ForeignKey(
+        PurchaseInvoice, on_delete=models.CASCADE, null=True, blank=True, related_name="payments"
+    )
+    amount_paid = models.DecimalField(max_digits=14, decimal_places=2)
+    notes = models.CharField(max_length=255, blank=True, default="")
+    paid_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount_paid__gt=0), name="supplier_payment_amount_gt_0"),
+        ]
+
+
+class PurchaseInvoiceReturn(models.Model):
+    """يقابل جدول purchase_invoice_return المحلي."""
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="purchase_invoice_returns")
+    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name="returns")
+    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name="returns")
+    amount_returned = models.DecimalField(max_digits=14, decimal_places=2)
+    notes = models.CharField(max_length=255, blank=True, default="")
+    returned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount_returned__gt=0), name="purchase_invoice_return_amount_gt_0"),
+        ]    
