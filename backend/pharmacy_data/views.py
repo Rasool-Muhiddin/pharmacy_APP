@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.db import transaction
@@ -577,3 +578,215 @@ class DamagedMedicineViewSet(
         return Response(
             self.get_serializer(record).data, status=status.HTTP_201_CREATED
         )
+
+
+class ReportsViewSet(viewsets.ViewSet):
+    """
+    كل التجميع يحدث على السيرفر عبر ORM aggregate/annotate — لا استعلام يجلب
+    صفوفاً خاماً للعميل ليُجمِّعها هو، خلافاً لما كانت تفعله reports_screen.dart
+    محلياً على SQLite. المخرجات مُسمّاة بنفس أسماء الحقول التي تستخدمها
+    الشاشة حالياً (total_sales, total_invoices_count, ...) لتبقى شاشة
+    Flutter قابلة للتحديث بأقل قدر من التغيير.
+
+    لا queryset/basename تلقائي هنا (ViewSet عادية وليست ModelViewSet):
+    كل التقرير أفعال إضافية (`summary`, `shifts`) لا CRUD قياسي على نموذج
+    واحد.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _membership(self, request):
+        membership = getattr(request.user, "pharmacymembership", None)
+        if membership is None:
+            raise PermissionDenied("هذا الحساب غير مرتبط بأي صيدلية.")
+        return membership
+
+    def _date_range(self, request):
+        """
+        نفس الافتراضي المستخدم في reports_screen.dart (آخر 30 يوماً) إن لم
+        يُمرَّر start/end. صيغة الإدخال ISO: YYYY-MM-DD.
+        """
+        today = date.today()
+        start_raw = request.query_params.get("start")
+        end_raw = request.query_params.get("end")
+
+        try:
+            start = date.fromisoformat(start_raw) if start_raw else today - timedelta(days=30)
+            end = date.fromisoformat(end_raw) if end_raw else today
+        except ValueError:
+            raise ValidationError("صيغة التاريخ غير صحيحة، استخدم YYYY-MM-DD.")
+
+        if start > end:
+            raise ValidationError("تاريخ البداية يجب أن يسبق تاريخ النهاية.")
+
+        return start, end
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        membership = self._membership(request)
+        pharmacy = membership.pharmacy
+        start, end = self._date_range(request)
+        today = date.today()
+
+        non_refunded_invoices = Invoice.objects.filter(
+            pharmacy=pharmacy,
+            is_refunded=False,
+            created_at__date__gte=start,
+            created_at__date__lte=end,
+        )
+
+        sales_summary = non_refunded_invoices.aggregate(
+            total_cash_in_drawer=Coalesce(Sum("final_amount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)),
+            total_count=Coalesce(Count("id"), 0),
+            total_discounts=Coalesce(Sum("discount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)),
+        )
+
+        refunded_invoices_count = Invoice.objects.filter(
+            pharmacy=pharmacy,
+            is_refunded=True,
+            created_at__date__gte=start,
+            created_at__date__lte=end,
+        ).count()
+
+        total_expenses = Expense.objects.filter(
+            pharmacy=pharmacy, expense_date__gte=start, expense_date__lte=end
+        ).aggregate(total=Coalesce(Sum("amount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)))["total"]
+
+        # ديون المذاخر: رصيد قائم حالياً (غير مقيّد بالفترة)، نفس ما تفعله
+        # الشاشة الحالية (استعلام remaining_debt بلا فلتر تاريخ).
+        purchase_totals = PurchaseInvoice.objects.filter(pharmacy=pharmacy).aggregate(
+            total_amount=Coalesce(Sum("total_amount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)),
+            total_paid=Coalesce(Sum("paid_amount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)),
+        )
+        total_returned = PurchaseInvoiceReturn.objects.filter(
+            purchase_invoice__pharmacy=pharmacy
+        ).aggregate(total=Coalesce(Sum("amount_returned"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)))["total"]
+        total_supplier_debt = (
+            purchase_totals["total_amount"] - total_returned - purchase_totals["total_paid"]
+        )
+
+        # خسائر الأدوية المنتهية: نفس معيار الشاشة الحالية بالضبط — منتهية
+        # فعلياً (قبل اليوم الحالي)، لا مجرد الوصول لتاريخ الانتهاء نفسه.
+        expired_losses = Medicine.objects.filter(
+            pharmacy=pharmacy,
+            is_damaged=False,
+            quantity__gt=0,
+            expiry_date__gte=start,
+            expiry_date__lte=end,
+            expiry_date__lt=today,
+        ).aggregate(
+            total=Coalesce(
+                Sum(F("quantity") * F("buy_price")), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)
+            )
+        )["total"]
+
+        # خسائر التوالف: سجلات 'correction' مستبعدة لأنها تصحيح إدخال، لا خسارة فعلية.
+        damaged_losses = (
+            DamagedMedicine.objects.filter(pharmacy=pharmacy, damaged_at__gte=start, damaged_at__lte=end)
+            .exclude(reason="correction")
+            .aggregate(
+                total=Coalesce(
+                    Sum(F("quantity_damaged") * F("medicine__buy_price")),
+                    Value(0),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                )
+            )["total"]
+        )
+
+        top_selling_items = list(
+            InvoiceItem.objects.filter(
+                invoice__pharmacy=pharmacy,
+                invoice__is_refunded=False,
+                invoice__created_at__date__gte=start,
+                invoice__created_at__date__lte=end,
+            )
+            .values("medicine_id", "medicine__trade_name", "medicine__scientific_name")
+            .annotate(total_qty=Sum("quantity"), total_revenue=Sum("total_price"))
+            .order_by("-total_qty")[:5]
+        )
+        top_selling_items = [
+            {
+                "trade_name": item["medicine__trade_name"],
+                "scientific_name": item["medicine__scientific_name"],
+                "total_qty": item["total_qty"],
+                "total_revenue": item["total_revenue"],
+            }
+            for item in top_selling_items
+        ]
+
+        sold_medicine_ids = InvoiceItem.objects.filter(
+            invoice__pharmacy=pharmacy,
+            invoice__is_refunded=False,
+            invoice__created_at__date__gte=start,
+            invoice__created_at__date__lte=end,
+        ).values("medicine_id")
+
+        stagnant_medicines = list(
+            Medicine.objects.filter(pharmacy=pharmacy, is_damaged=False, quantity__gt=0)
+            .exclude(id__in=sold_medicine_ids)
+            .values("id", "trade_name", "scientific_name", "quantity", "category")[:10]
+        )
+
+        invoices = list(
+            non_refunded_invoices.order_by("-created_at").values(
+                "id", "invoice_number", "created_at", "total_amount", "discount", "final_amount"
+            )
+        )
+
+        return Response(
+            {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "total_sales": sales_summary["total_cash_in_drawer"],
+                "total_invoices_count": sales_summary["total_count"],
+                "total_discounts_given": sales_summary["total_discounts"],
+                "refunded_invoices_count": refunded_invoices_count,
+                "total_expenses": total_expenses,
+                "total_supplier_debt": total_supplier_debt,
+                "total_damage_losses": expired_losses + damaged_losses,
+                "top_selling_items": top_selling_items,
+                "stagnant_medicines": stagnant_medicines,
+                "invoices": invoices,
+            }
+        )
+
+    @action(detail=False, methods=["get"])
+    def shifts(self, request):
+        """تقرير شفتات/حسابات البائعين — حكر على المالك (تُفرَض من Flutter كما هي الآن)."""
+        membership = self._membership(request)
+        pharmacy = membership.pharmacy
+        start, end = self._date_range(request)
+
+        base_qs = Invoice.objects.filter(
+            pharmacy=pharmacy,
+            is_refunded=False,
+            created_at__date__gte=start,
+            created_at__date__lte=end,
+        ).select_related("cashier")
+
+        sellers = {}
+        for invoice in base_qs.order_by("-created_at"):
+            cashier = invoice.cashier
+            if cashier is not None:
+                seller_name = cashier.get_full_name() or cashier.username
+            else:
+                seller_name = "بائع غير محدد"
+
+            bucket = sellers.setdefault(
+                seller_name, {"seller_name": seller_name, "invoices_count": 0, "total_amount": Decimal("0"), "invoices": []}
+            )
+            bucket["invoices_count"] += 1
+            bucket["total_amount"] += invoice.final_amount
+            bucket["invoices"].append(
+                {
+                    "id": invoice.id,
+                    "invoice_number": invoice.invoice_number,
+                    "created_at": invoice.created_at,
+                    "total_amount": invoice.total_amount,
+                    "discount": invoice.discount,
+                    "final_amount": invoice.final_amount,
+                }
+            )
+
+        sellers_list = sorted(sellers.values(), key=lambda s: s["total_amount"], reverse=True)
+        return Response({"start": start.isoformat(), "end": end.isoformat(), "sellers": sellers_list})

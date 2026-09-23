@@ -5,22 +5,21 @@ import 'package:intl/intl.dart';
 import '../database/db_helper.dart';
 import '../repository/medicine_repository.dart';
 import '../repository/Invoice_repository.dart';
-import '../repository/expense_repository.dart';
+import '../services/reports_api_service.dart';
 
 class ReportsScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner;
 
-  /// وضع الأونلاين الحالي للصيدلية. كل استعلامات هذه الشاشة تبقى SQL محلي
-  /// مباشر على جداول medicine/invoice/invoice_item/expense — لكن في وضع
-  /// الأونلاين نُحدّث هذه الجداول أولاً من السيرفر عبر MedicineRepository/
-  /// InvoiceRepository/ExpenseRepository (نفس الكاش الذي تعتمده شاشات
-  /// المخزون والمبيعات والمصروفات) قبل تنفيذ أي استعلام تقرير، لتعكس
-  /// التقارير بيانات محدّثة بدل الاكتفاء بآخر نسخة محلية قديمة.
+  /// وضع الأونلاين الحالي للصيدلية.
   ///
-  /// ⚠️ التوالف/المذاخر (جداول damaged_medicine, purchase_invoice) لا تزال
-  /// بلا كاش أونلاين حتى الآن — تبقى بيانات هذا الجهاز فقط في كلا الوضعين
-  /// حتى تُبنى لها طبقة API/Repository مماثلة ضمن الخطة.
+  /// أونلاين: التجميع (SUM/COUNT/GROUP BY) يحدث بالكامل على السيرفر عبر
+  /// /api/reports/summary/ و/api/reports/shifts/ (ReportsViewSet) — لا
+  /// استعلامات SQL محلية إطلاقاً في هذا الوضع، فتُبنى التقارير من بيانات كل
+  /// أجهزة الصيدلية مجتمعة لا هذا الجهاز فقط. عند فشل الاتصال نعرض رسالة
+  /// خطأ بدل تقرير قديم مضلِّل (خلافاً لبقية الشاشات التي تعود لكاش محلي).
+  ///
+  /// أوفلاين: نفس الاستعلامات المحلية القديمة على SQLite كما هي.
   final bool isOnlineMode;
 
   const ReportsScreen({
@@ -78,32 +77,68 @@ Future<void> _loadReportData() async {
   setState(() => _isLoading = true);
 
   try {
-    // في وضع الأونلاين: نجلب أحدث نسخة من المخزون والفواتير من السيرفر
-    // أولاً (نفس مسار medicine/invoice المستخدم في شاشتي المخزون ونقطة
-    // البيع)، كي تُبنى استعلامات التقرير أدناه على بيانات مُزامَنة بدل كاش
-    // قديم. الدالتان تتعاملان داخلياً مع انعدام الاتصال (تعودان لآخر كاش
-    // محلي محفوظ بصمت)، فاستدعاؤهما آمن حتى لو تعذّر الوصول للسيرفر فعلياً
-    // الآن — لا حاجة لفحص اتصال منفصل هنا.
     if (widget.isOnlineMode) {
-      try {
-        await MedicineRepository.instance.getMedicines(
-          pharmacyId: widget.pharmacyId,
-          isOnlineMode: true,
-        );
-        await InvoiceRepository.instance.getInvoices(
-          pharmacyId: widget.pharmacyId,
-          isOnlineMode: true,
-        );
-        await ExpenseRepository.instance.getExpenses(
-          pharmacyId: widget.pharmacyId,
-          isOnlineMode: true,
-        );
-      } catch (_) {
-        // فشل التحديث من السيرفر لا يجب أن يمنع عرض التقرير بآخر بيانات
-        // متوفرة محلياً — الاستعلامات أدناه تتابع على الكاش كما هو.
-      }
+      await _loadReportDataOnline();
+    } else {
+      await _loadReportDataOffline();
     }
+  } catch (e) {
+    if (!mounted) return;
+    setState(() => _isLoading = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("حدث خطأ أثناء تحميل البيانات: $e")),
+    );
+  }
+}
 
+/// أونلاين: كل التجميع (SUM/COUNT/GROUP BY) يحدث على السيرفر عبر
+/// /api/reports/summary/ — لا استعلامات SQL محلية للأرقام/القوائم هنا
+/// إطلاقاً، خلافاً للوضع الأوفلاين أدناه.
+///
+/// نُبقي مزامنة MedicineRepository/InvoiceRepository محلياً بالتوازي (لا
+/// لحساب الأرقام، بل فقط لتعبئة كاش invoice_item محلياً) لأن نافذة تفاصيل
+/// الفاتورة (_openInvoiceModal) تقرأ أصنافها من الجدول المحلي مباشرة؛
+/// فشل هذه المزامنة لا يمنع عرض التقرير نفسه لأن أرقامه مصدرها السيرفر لا
+/// هذا الكاش.
+Future<void> _loadReportDataOnline() async {
+  try {
+    await MedicineRepository.instance.getMedicines(
+      pharmacyId: widget.pharmacyId,
+      isOnlineMode: true,
+    );
+    await InvoiceRepository.instance.getInvoices(
+      pharmacyId: widget.pharmacyId,
+      isOnlineMode: true,
+    );
+  } catch (_) {
+    // فشل مزامنة كاش تفاصيل الفواتير لا يمنع عرض أرقام التقرير القادمة من
+    // السيرفر مباشرة أدناه.
+  }
+
+  final data = await ReportsApiService.instance.fetchSummary(
+    start: _startDate,
+    end: _endDate,
+  );
+
+  if (!mounted) return;
+
+  setState(() {
+    _totalSales = (data['total_sales'] as num).toDouble();
+    _totalInvoicesCount = (data['total_invoices_count'] as num).toInt();
+    _totalDiscountsGiven = (data['total_discounts_given'] as num).toDouble();
+    _totalExpenses = (data['total_expenses'] as num).toDouble();
+    _totalSupplierDebt = (data['total_supplier_debt'] as num).toDouble();
+    _refundedInvoicesCount = (data['refunded_invoices_count'] as num).toInt();
+    _totalDamageLosses = (data['total_damage_losses'] as num).toDouble();
+    _topSellingItems = List<Map<String, dynamic>>.from(data['top_selling_items'] as List);
+    _stagnantMedicines = List<Map<String, dynamic>>.from(data['stagnant_medicines'] as List);
+    _invoices = List<Map<String, dynamic>>.from(data['invoices'] as List);
+    _isLoading = false;
+  });
+}
+
+/// أوفلاين: نفس الاستعلامات المحلية القديمة على SQLite كما هي بلا أي تغيير.
+Future<void> _loadReportDataOffline() async {
     final db = await DatabaseHelper.instance.database;
 
     // استخراج التاريخ بصيغة YYYY-MM-DD
@@ -235,13 +270,6 @@ Future<void> _loadReportData() async {
       _invoices = invoicesList;
       _isLoading = false;
     });
-  } catch (e) {
-    if (!mounted) return;
-    setState(() => _isLoading = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("حدث خطأ أثناء تحميل البيانات: $e")),
-    );
-  }
 }
   String _formatDateTime(String rawDate) {
     if (rawDate.isEmpty) return '-';
@@ -261,12 +289,47 @@ Future<void> _loadReportData() async {
   Future<void> _openShiftsModal() async {
     if (!widget.isOwner) return;
 
-    final db = await DatabaseHelper.instance.database;
-
     final String startStr = DateFormat('yyyy-MM-dd').format(_startDate);
     final String endStr = DateFormat('yyyy-MM-dd').format(_endDate);
 
-    final sellersSummary = await db.rawQuery('''
+    List<Map<String, dynamic>> sellersSummary;
+    List<Map<String, dynamic>> allSellersInvoices;
+
+    if (widget.isOnlineMode) {
+      // أونلاين: التجميع حسب البائع (cashier) يحدث على السيرفر عبر
+      // /api/reports/shifts/ مباشرة على حساب User الفعلي في Django — لا على
+      // الجدولين المحليين user_profile/users المستخدَمين أدناه في الأوفلاين
+      // واللذين لا يعكسان بيانات بقية الأجهزة أصلاً.
+      Map<String, dynamic> data;
+      try {
+        data = await ReportsApiService.instance.fetchShifts(start: _startDate, end: _endDate);
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("تعذر جلب تقرير الشفتات: $e")),
+        );
+        return;
+      }
+
+      final sellers = List<Map<String, dynamic>>.from(data['sellers'] as List);
+      sellersSummary = sellers
+          .map((s) => {
+                'seller_name': s['seller_name'],
+                'invoices_count': s['invoices_count'],
+                'total_amount': s['total_amount'],
+              })
+          .toList();
+      allSellersInvoices = sellers.expand((s) {
+        final sellerName = s['seller_name'];
+        return List<Map<String, dynamic>>.from(s['invoices'] as List).map((inv) => {
+              ...inv,
+              'seller_name': sellerName,
+            });
+      }).toList();
+    } else {
+      final db = await DatabaseHelper.instance.database;
+
+      sellersSummary = await db.rawQuery('''
     SELECT 
       COALESCE(u.full_name, u.username, 'بائع غير محدد') AS seller_name,
       COUNT(i.id) AS invoices_count,
@@ -281,7 +344,7 @@ Future<void> _loadReportData() async {
     GROUP BY COALESCE(u.full_name, u.username, 'بائع غير محدد')
     ORDER BY total_amount DESC
   ''', [widget.pharmacyId, startStr, endStr]);
-    final allSellersInvoices = await db.rawQuery('''
+      allSellersInvoices = await db.rawQuery('''
     SELECT i.id, i.invoice_number, i.created_at, i.total_amount, i.discount, i.final_amount,
            COALESCE(u.full_name, u.username, 'بائع غير محدد') AS seller_name
     FROM invoice i
@@ -293,6 +356,7 @@ Future<void> _loadReportData() async {
       AND date(i.created_at) <= date(?)
     ORDER BY i.created_at DESC
   ''', [widget.pharmacyId, startStr, endStr]);
+    }
 
     if (!mounted) return;
 
