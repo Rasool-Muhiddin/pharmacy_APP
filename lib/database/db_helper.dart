@@ -751,6 +751,59 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     });
   }
 
+  //====================================================
+  // كاش القراءة فقط لجدول damaged_medicine — نفس نمط upsertExpenseFromServer/
+  // replaceExpensesCache تماماً. لا دالة تحديث/حذف هنا لأن الإتلاف عملية
+  // نهائية على السيرفر أيضاً (DamagedMedicineViewSet لا تدعم update/destroy).
+  //====================================================
+
+  /// يحفظ سجل إتلاف واحد قادماً من استجابة create على السيرفر، مفتاحه id.
+  Future<void> upsertDamagedMedicineFromServer({
+    required int pharmacyId,
+    required Map<String, dynamic> serverData,
+  }) async {
+    final db = await database;
+
+    final row = <String, dynamic>{
+      'id': serverData['id'] as int,
+      'pharmacy_id': pharmacyId,
+      'medicine_id': serverData['medicine'] as int,
+      'quantity_damaged': serverData['quantity_damaged'] as int,
+      'reason': (serverData['reason'] as String?) ?? '',
+      'notes': (serverData['notes'] as String?) ?? '',
+      'damaged_at': serverData['damaged_at'] as String,
+    };
+
+    await db.insert('damaged_medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.update('damaged_medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+  }
+
+  /// يستبدل كامل كاش سجلات الإتلاف المحلي بقائمة كاملة قادمة من السيرفر
+  /// (بعد جلب damaged_api_service.fetchDamagedMedicines() لكل الصفحات).
+  Future<void> replaceDamagedMedicinesCache({
+    required int pharmacyId,
+    required List<Map<String, dynamic>> serverItems,
+  }) async {
+    final db = await database;
+
+    await db.transaction((txn) async {
+      for (final item in serverItems) {
+        final row = <String, dynamic>{
+          'id': item['id'] as int,
+          'pharmacy_id': pharmacyId,
+          'medicine_id': item['medicine'] as int,
+          'quantity_damaged': item['quantity_damaged'] as int,
+          'reason': (item['reason'] as String?) ?? '',
+          'notes': (item['notes'] as String?) ?? '',
+          'damaged_at': item['damaged_at'] as String,
+        };
+
+        await txn.insert('damaged_medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+        await txn.update('damaged_medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+      }
+    });
+  }
+
   //=========================================
   // INSERT INVOICE ITEM
   //=========================================

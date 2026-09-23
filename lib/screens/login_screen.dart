@@ -5,6 +5,9 @@ import '../services/desktop_api_service.dart';
 import '../services/desktop_auth_storage.dart';
 import '../services/medicine_api_service.dart';
 import '../services/invoice_api_service.dart';
+import '../services/suppliers_api_service.dart';
+import '../services/expense_api_service.dart';
+import '../services/damaged_api_service.dart';
 import 'main_layout.dart';
 import '../database/db_helper.dart';
 import '../models/subscription_plan.dart';
@@ -154,6 +157,15 @@ class _AuthScreenState extends State<AuthScreen> {
       apiToken is String && apiToken.isNotEmpty ? apiToken : null,
     );
     InvoiceApiService.instance.setAuthToken(
+      apiToken is String && apiToken.isNotEmpty ? apiToken : null,
+    );
+    SuppliersApiService.instance.setAuthToken(
+      apiToken is String && apiToken.isNotEmpty ? apiToken : null,
+    );
+    ExpenseApiService.instance.setAuthToken(
+      apiToken is String && apiToken.isNotEmpty ? apiToken : null,
+    );
+    DamagedApiService.instance.setAuthToken(
       apiToken is String && apiToken.isNotEmpty ? apiToken : null,
     );
 

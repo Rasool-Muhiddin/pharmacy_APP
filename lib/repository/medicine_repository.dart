@@ -1,5 +1,6 @@
 import '../database/db_helper.dart';
 import '../services/connectivity_service.dart';
+import '../services/damaged_api_service.dart';
 import '../services/medicine_api_service.dart';
 
 class MedicineRepositoryException implements Exception {
@@ -26,6 +27,7 @@ class MedicineRepository {
 
   final DatabaseHelper _db = DatabaseHelper.instance;
   final MedicineApiService _api = MedicineApiService.instance;
+  final DamagedApiService _damagedApi = DamagedApiService.instance;
   final ConnectivityService _connectivity = ConnectivityService.instance;
 
   Future<List<Map<String, dynamic>>> getMedicines({
@@ -136,10 +138,11 @@ class MedicineRepository {
 
   /// إتلاف جزء من كمية دواء (خصم من المخزن + تسجيل السبب).
   ///
-  /// ⚠️ أونلاين حالياً: الكمية الجديدة تُرسَل للسيرفر فتتزامن بين الأجهزة،
-  /// لكن سبب/ملاحظات الإتلاف نفسها تُحفظ في جدول damaged_medicine المحلي
-  /// فقط — لا يوجد له مقابل على السيرفر بعد (جدول لاحق ضمن الخطة)، فلن
-  /// يظهر هذا السجل التفصيلي على جهاز آخر لنفس الصيدلية حتى يُبنى.
+  /// أونلاين: طلب واحد ذرّي على الخادم (DamagedMedicineViewSet.create) يخصم
+  /// الكمية من Medicine وينشئ سجل الإتلاف بنفس المعاملة، فلا نحسب الكمية
+  /// الجديدة محلياً ثم نرسلها كما كان سابقاً (كان عرضة لتعارض حقيقي بين
+  /// جهازين يتلفان نفس الدواء في نفس اللحظة). سبب/ملاحظات الإتلاف تُزامَن
+  /// الآن أيضاً، وليست محلية فقط.
   Future<Map<String, dynamic>> damageMedicine({
     required int pharmacyId,
     required bool isOnlineMode,
@@ -161,30 +164,49 @@ class MedicineRepository {
 
     await _assertOnlineWritable();
 
-    final current = await _localRowById(medicineId);
-    final newQuantity = (current['quantity'] as int) - quantityToDamage;
-    if (newQuantity < 0) {
-      throw const MedicineRepositoryException('الكمية المراد إتلافها أكبر من المتاح فعلياً.');
-    }
-
-    final updated = await _api.updateMedicine(medicineId, {'quantity': newQuantity});
-    await _db.upsertMedicineFromServer(
-      pharmacyId: pharmacyId,
-      serverData: updated,
-    );
-
-    // السجل التفصيلي محلي فقط حالياً (انظر التنبيه أعلى الدالة).
-    final db = await _db.database;
-    await db.insert('damaged_medicine', {
-      'pharmacy_id': pharmacyId,
-      'medicine_id': medicineId,
+    final created = await _damagedApi.createDamagedMedicine({
+      'medicine': medicineId,
       'quantity_damaged': quantityToDamage,
       'reason': reason,
       'notes': notes ?? '',
-      'damaged_at': DateTime.now().toIso8601String().split('T').first,
     });
 
+    // الخادم يُعيد medicine_new_quantity ضمن نفس الاستجابة، فنحدّث كاش
+    // المخزون المحلي مباشرة بلا طلب إضافي لجلب الدواء نفسه.
+    final newQuantity = created['medicine_new_quantity'];
+    if (newQuantity is num) {
+      await _db.upsertMedicineFromServer(
+        pharmacyId: pharmacyId,
+        serverData: {..._localCacheRowRaw(await _localRowById(medicineId)), 'quantity': newQuantity},
+      );
+    }
+
+    await _db.upsertDamagedMedicineFromServer(
+      pharmacyId: pharmacyId,
+      serverData: created,
+    );
+
     return _localRowById(medicineId);
+  }
+
+  /// يحوّل صف الكاش المحلي (قد يحتوي حقولاً إضافية كـ last_synced_at) إلى
+  /// شكل مقبول لـ upsertMedicineFromServer، بنفس مفاتيح استجابة السيرفر —
+  /// نحتاجه هنا لأن استجابة damaged-medicines لا تعيد كامل صف الدواء، بل
+  /// الكمية الجديدة فقط.
+  Map<String, dynamic> _localCacheRowRaw(Map<String, dynamic> row) {
+    return {
+      'id': row['id'],
+      'trade_name': row['trade_name'],
+      'scientific_name': row['scientific_name'],
+      'category': row['category'],
+      'buy_price': row['buy_price'],
+      'sell_price': row['sell_price'],
+      'expiry_date': row['expiry_date'],
+      'shelf_location': row['shelf_location'],
+      'is_damaged': row['is_damaged'],
+      'barcode': row['barcode'],
+      'updated_at': DateTime.now().toIso8601String(),
+    };
   }
 
   Future<void> deleteMedicine({

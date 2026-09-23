@@ -11,6 +11,9 @@ import 'screens/main_layout.dart';
 import 'services/desktop_auth_storage.dart';
 import 'services/medicine_api_service.dart';
 import 'services/invoice_api_service.dart';
+import 'services/suppliers_api_service.dart';
+import 'services/expense_api_service.dart';
+import 'services/damaged_api_service.dart';
 import 'services/backup_service.dart';
 import 'services/update_service.dart';
 import 'models/subscription_plan.dart';
@@ -94,6 +97,15 @@ class _StartupGateState extends State<_StartupGate> {
           cachedToken is String ? cachedToken : null,
         );
         InvoiceApiService.instance.setAuthToken(
+          cachedToken is String ? cachedToken : null,
+        );
+        SuppliersApiService.instance.setAuthToken(
+          cachedToken is String ? cachedToken : null,
+        );
+        ExpenseApiService.instance.setAuthToken(
+          cachedToken is String ? cachedToken : null,
+        );
+        DamagedApiService.instance.setAuthToken(
           cachedToken is String ? cachedToken : null,
         );
       }
