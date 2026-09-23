@@ -168,6 +168,61 @@ class SupplierPayment(models.Model):
         ]
 
 
+class Expense(models.Model):
+    """
+    يقابل جدول expense المحلي في Flutter (db_helper.dart) حقلاً بحقل:
+    expense_type, expense_date, amount, notes — بنفس تسمية الأعمدة
+    المستخدمة في upsertExpenseFromServer/replaceExpensesCache، لتبقى
+    استجابة الـSerializer قابلة للاستهلاك مباشرة بلا أي تحويل أسماء.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="expenses")
+    expense_type = models.CharField(max_length=120)
+    expense_date = models.DateField()
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    notes = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-expense_date", "-id"]
+        indexes = [models.Index(fields=["pharmacy", "expense_date"])]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="expense_amount_gt_0"),
+        ]
+
+    def __str__(self):
+        return f"{self.expense_type} - {self.amount}"
+
+
+class DamagedMedicine(models.Model):
+    """
+    يقابل جدول damaged_medicine المحلي (medicine_id, quantity_damaged,
+    reason, notes, damaged_at). يُنشأ فقط عبر DamagedMedicineViewSet.create
+    التي تخصم الكمية من Medicine وتُنشئ هذا السجل ذرّياً في نفس المعاملة
+    (نفس نمط checkout) — لا تعديل/حذف مباشر بعد الإنشاء، فالإتلاف عملية
+    نهائية كما في النسخة المحلية.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="damaged_medicines")
+    # PROTECT: نفس منطق InvoiceItem.medicine — يمنع حذف دواء له سجل إتلاف.
+    medicine = models.ForeignKey(Medicine, on_delete=models.PROTECT, related_name="damaged_records")
+    quantity_damaged = models.PositiveIntegerField()
+    reason = models.CharField(max_length=32, blank=True, default="")
+    notes = models.CharField(max_length=255, blank=True, default="")
+    damaged_at = models.DateField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-id"]
+        indexes = [models.Index(fields=["pharmacy", "damaged_at"])]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(quantity_damaged__gt=0), name="damaged_medicine_quantity_gt_0"),
+        ]
+
+    def __str__(self):
+        return f"{self.medicine.trade_name} x{self.quantity_damaged}"
+
+
 class PurchaseInvoiceReturn(models.Model):
     """يقابل جدول purchase_invoice_return المحلي."""
 
@@ -181,4 +236,4 @@ class PurchaseInvoiceReturn(models.Model):
     class Meta:
         constraints = [
             models.CheckConstraint(condition=models.Q(amount_returned__gt=0), name="purchase_invoice_return_amount_gt_0"),
-        ]    
+        ]

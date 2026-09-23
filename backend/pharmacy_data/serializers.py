@@ -1,7 +1,7 @@
 from django.db.models import Sum
 from rest_framework import serializers
 
-from .models import Invoice, InvoiceItem, Medicine, PurchaseInvoice, Supplier
+from .models import DamagedMedicine, Expense, Invoice, InvoiceItem, Medicine, PurchaseInvoice, Supplier
 
 
 class MedicineSerializer(serializers.ModelSerializer):
@@ -147,3 +147,52 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
 
     def get_remaining_amount(self, obj):
         return self.get_net_amount(obj) - obj.paid_amount
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Expense
+        fields = [
+            "id",
+            "expense_type",
+            "expense_date",
+            "amount",
+            "notes",
+            "created_at",
+            "updated_at",
+        ]
+        # pharmacy يُحدَّد تلقائياً من صيدلية المستخدم — نفس نمط MedicineSerializer/SupplierSerializer.
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("يجب أن يكون مبلغ المصروف أكبر من صفر.")
+        return value
+
+
+class DamagedMedicineSerializer(serializers.ModelSerializer):
+    """
+    medicine مقبول ككتابة (معرّف الدواء)، لكن DamagedMedicineViewSet.create
+    هي من تتحقق من ملكيته لصيدلية المستخدم وتخصم الكمية ذرّياً — نفس نمط
+    PurchaseInvoiceViewSet.perform_create مع supplier. medicine_new_quantity
+    تُرجع الكمية المتبقية بعد الخصم مباشرة، ليحدّث تطبيق Flutter كاش الدواء
+    المحلي من نفس الاستجابة بلا طلب إضافي لجلب الدواء.
+    """
+
+    medicine_new_quantity = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DamagedMedicine
+        fields = [
+            "id",
+            "medicine",
+            "medicine_new_quantity",
+            "quantity_damaged",
+            "reason",
+            "notes",
+            "damaged_at",
+        ]
+        read_only_fields = ["id", "medicine_new_quantity", "damaged_at"]
+
+    def get_medicine_new_quantity(self, obj):
+        return obj.medicine.quantity

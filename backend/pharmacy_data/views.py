@@ -9,6 +9,8 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from rest_framework.response import Response
 
 from .models import (
+    DamagedMedicine,
+    Expense,
     Invoice,
     InvoiceItem,
     Medicine,
@@ -19,6 +21,8 @@ from .models import (
 )
 from .serializers import (
     CheckoutInputSerializer,
+    DamagedMedicineSerializer,
+    ExpenseSerializer,
     InvoiceSerializer,
     MedicineSerializer,
     PurchaseInvoiceSerializer,
@@ -483,3 +487,93 @@ class PurchaseInvoiceViewSet(
 
         invoice.refresh_from_db()
         return Response(PurchaseInvoiceSerializer(invoice).data)
+
+
+class ExpenseViewSet(viewsets.ModelViewSet):
+    """CRUD كامل للمصاريف، مقيَّد بصيدلية المستخدم فقط — نفس نمط SupplierViewSet/MedicineViewSet."""
+
+    serializer_class = ExpenseSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        membership = getattr(self.request.user, "pharmacymembership", None)
+        if membership is None:
+            return Expense.objects.none()
+        return Expense.objects.filter(pharmacy=membership.pharmacy)
+
+    def perform_create(self, serializer):
+        membership = self.request.user.pharmacymembership
+        serializer.save(pharmacy=membership.pharmacy)
+
+
+class DamagedMedicineViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    """
+    لا update/destroy: الإتلاف عملية نهائية كما في النسخة المحلية
+    (processDamageMedicine)، فلا تراجع عنها من هذا الـAPI.
+
+    create() مبنية يدوياً (لا perform_create بسيط) لأن إنشاء السجل هنا
+    عملية مركّبة تُخصم فيها كمية المخزون ذرّياً في نفس المعاملة — تماماً
+    كنمط InvoiceViewSet.checkout، وليست إدخال صف واحد بسيط.
+    """
+
+    serializer_class = DamagedMedicineSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        membership = getattr(self.request.user, "pharmacymembership", None)
+        if membership is None:
+            return DamagedMedicine.objects.none()
+        return (
+            DamagedMedicine.objects.filter(pharmacy=membership.pharmacy)
+            .select_related("medicine")
+            .order_by("-id")
+        )
+
+    def _membership(self):
+        membership = getattr(self.request.user, "pharmacymembership", None)
+        if membership is None:
+            raise PermissionDenied("هذا الحساب غير مرتبط بأي صيدلية.")
+        return membership
+
+    def create(self, request, *args, **kwargs):
+        membership = self._membership()
+        input_serializer = self.get_serializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        data = input_serializer.validated_data
+
+        medicine_id = data["medicine"].pk
+        quantity = data["quantity_damaged"]
+
+        with transaction.atomic():
+            try:
+                medicine = Medicine.objects.select_for_update().get(
+                    pk=medicine_id, pharmacy=membership.pharmacy
+                )
+            except Medicine.DoesNotExist:
+                raise ValidationError("الدواء غير موجود في هذه الصيدلية.")
+
+            if medicine.quantity < quantity:
+                raise ValidationError(
+                    f"الكمية المطلوب إتلافها ({quantity}) أكبر من المتوفر فعلياً ({medicine.quantity})."
+                )
+
+            Medicine.objects.filter(pk=medicine.pk).update(quantity=F("quantity") - quantity)
+
+            record = DamagedMedicine.objects.create(
+                pharmacy=membership.pharmacy,
+                medicine=medicine,
+                quantity_damaged=quantity,
+                reason=data.get("reason", ""),
+                notes=data.get("notes", ""),
+            )
+            medicine.refresh_from_db(fields=["quantity"])
+
+        record.refresh_from_db()
+        return Response(
+            self.get_serializer(record).data, status=status.HTTP_201_CREATED
+        )
