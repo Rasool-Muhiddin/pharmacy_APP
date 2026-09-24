@@ -3,15 +3,19 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart'; // مسار الداتابيس
 import '../models/medicine_model.dart';
+import '../repository/medicine_repository.dart';
+import '../repository/Invoice_repository.dart';
 import '../widgets/alert_box.dart';   // استيراد الـ AlertBox الخاص بك
 import '../widgets/custom_table.dart'; // استيراد الـ CustomTable الخاص بك
 
 class DashboardScreen extends StatefulWidget {
   final int pharmacyId;
+  final bool isOnlineMode;
 
   const DashboardScreen({
     super.key,
     this.pharmacyId = 1,
+    this.isOnlineMode = false,
   });
 
   @override
@@ -50,6 +54,31 @@ class _DashboardScreenState extends State<DashboardScreen> {
     setState(() => _isLoading = true);
 
     try {
+      // أونلاين: نُحدّث كاش المخزون والفواتير محلياً من السيرفر أولاً (نفس
+      // مسار MedicineRepository/InvoiceRepository المستخدم في شاشتي المخزون
+      // ونقطة البيع)، فتُبنى كل الأرقام والتنبيهات أدناه على بيانات كل
+      // أجهزة الصيدلية مجتمعة بدل كاش هذا الجهاز وحده. لا يوجد endpoint
+      // تجميع مخصص للداشبورد (خلافاً لـ/api/reports/) لأن كل مؤشراته
+      // مشتقة مباشرة من نفس جدولي medicine/invoice المتوفرين محلياً أصلاً
+      // بعد المزامنة، فلا داعي لتكرار نفس الاستعلامات على السيرفر أيضاً.
+      //
+      // فشل المزامنة (لا اتصال، إلخ) لا يمنع عرض الداشبورد بآخر كاش محلي
+      // متوفر — نفس نمط باقي الشاشات في وضع الأونلاين.
+      if (widget.isOnlineMode) {
+        try {
+          await MedicineRepository.instance.getMedicines(
+            pharmacyId: widget.pharmacyId,
+            isOnlineMode: true,
+          );
+          await InvoiceRepository.instance.getInvoices(
+            pharmacyId: widget.pharmacyId,
+            isOnlineMode: true,
+          );
+        } catch (_) {
+          // يتابع بآخر كاش محلي متوفر.
+        }
+      }
+
       final db = DatabaseHelper.instance;
 
       // 1. جلب البيانات الإحصائية

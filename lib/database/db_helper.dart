@@ -1518,4 +1518,160 @@ Future<void> settlePurchaseInvoiceCredit(int purchaseInvoiceId) async {
   ''', [purchaseInvoiceId]);
 }
 
+//====================================================
+// نقطة 5 (المواصفات الكاملة): تحويل صيدلية أوفلاين إلى أونلاين برفع أولي
+// شامل. راجع MigrationViewSet في الباك اند للترتيب الصارم وللتحقق من عدم
+// التكرار. ⚠️ لا حذف لأي بيانات محلية بعد النجاح — النسخة المحلية تبقى
+// كما هي وتُستخدم كقراءة/كاش لاحقاً مثل باقي الأجهزة، فلا حاجة لأي دالة
+// "تفريغ" هنا إطلاقاً (خلافاً لتصميم سابق أُلغي عمداً).
+//====================================================
+
+/// عدد صفوف المخزون/الموردين محلياً — يُستخدم فقط لتقرير ما إذا كان يستحق
+/// عرض اقتراح الرفع أصلاً (صيدلية أونلاين جديدة بلا بيانات سابقة لا تحتاج
+/// أي رفع، فلا داعي لإزعاج صاحبها بالسؤال).
+Future<bool> hasLocalDataWorthMigrating(int pharmacyId) async {
+  final db = await database;
+  final medCount = Sqflite.firstIntValue(await db.rawQuery(
+    'SELECT COUNT(*) FROM medicine WHERE pharmacy_id = ?', [pharmacyId],
+  )) ?? 0;
+  final supCount = Sqflite.firstIntValue(await db.rawQuery(
+    'SELECT COUNT(*) FROM pharmacy_supplier WHERE pharmacy_id = ?', [pharmacyId],
+  )) ?? 0;
+  return medCount > 0 || supCount > 0;
+}
+
+/// يبني حمولة الرفع الكاملة (النطاق الشامل بلا استثناء) من الجداول
+/// المحلية، بنفس مفاتيح MigrationViewSet.upload_offline_data المتوقَّعة
+/// تماماً — بما فيها القوائم المتداخلة (payments/returns داخل كل فاتورة
+/// شراء، items داخل كل فاتورة بيع) حتى لا يحتاج السيرفر جدول تحويل
+/// معرّفات منفصلاً لفواتير الشراء/البيع نفسها.
+Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
+  final db = await database;
+
+  // 1. الموردون
+  final suppliers = await db.query('pharmacy_supplier', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final suppliersPayload = suppliers
+      .map((s) => {
+            'local_id': s['id'],
+            'name': s['name'],
+            'phone': s['phone'],
+          })
+      .toList();
+
+  // 2. المخزون الكامل
+  final medicines = await db.query('medicine', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final medicinesPayload = medicines
+      .map((m) => {
+            'local_id': m['id'],
+            'trade_name': m['trade_name'],
+            'scientific_name': m['scientific_name'],
+            'category': m['category'],
+            'quantity': m['quantity'],
+            'buy_price': m['buy_price'],
+            'sell_price': m['sell_price'],
+            'expiry_date': m['expiry_date'],
+            'shelf_location': m['shelf_location'],
+            'is_damaged': (m['is_damaged'] as int?) == 1,
+            'barcode': m['barcode'],
+          })
+      .toList();
+
+  // 3. فواتير الشراء الكاملة + دفعاتها + مرتجعاتها (متداخلة داخل كل فاتورة)
+  final purchaseInvoices = await db.query('purchase_invoice', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final purchaseInvoicesPayload = <Map<String, dynamic>>[];
+  for (final pi in purchaseInvoices) {
+    final piId = pi['id'];
+    final payments = await db.query('supplier_payment', where: 'purchase_invoice_id = ?', whereArgs: [piId]);
+    final returns = await db.query('purchase_invoice_return', where: 'purchase_invoice_id = ?', whereArgs: [piId]);
+    purchaseInvoicesPayload.add({
+      'local_supplier_id': pi['supplier_id'],
+      'invoice_number': pi['invoice_number'],
+      'total_amount': pi['total_amount'],
+      'paid_amount': pi['paid_amount'],
+      'created_at': pi['created_at'],
+      'payments': payments
+          .map((p) => {
+                'amount_paid': p['amount_paid'],
+                'notes': p['notes'],
+                'paid_at': p['paid_at'],
+              })
+          .toList(),
+      'returns': returns
+          .map((r) => {
+                'amount_returned': r['amount_returned'],
+                'notes': r['notes'],
+                'returned_at': r['returned_at'],
+              })
+          .toList(),
+    });
+  }
+
+  // 4. فواتير البيع الكاملة (كل التاريخ) + عناصرها. اسم الكاشير يُجلب من
+  // user_profile/users المحليين (نفس JOIN المستخدم في تقرير الشفتات
+  // المحلي) لأنه لا حساب Django حقيقي وراء هذه الفواتير التاريخية —
+  // ستُحفَظ في Invoice.cashier_name على السيرفر بدل Invoice.cashier.
+  final invoices = await db.rawQuery('''
+    SELECT i.*, COALESCE(u.full_name, u.username, '') AS cashier_name
+    FROM invoice i
+    LEFT JOIN user_profile up ON i.cashier_id = up.id
+    LEFT JOIN users u ON up.user_id = u.id
+    WHERE i.pharmacy_id = ?
+  ''', [pharmacyId]);
+  final invoicesPayload = <Map<String, dynamic>>[];
+  for (final inv in invoices) {
+    final invId = inv['id'];
+    final items = await db.query('invoice_item', where: 'invoice_id = ?', whereArgs: [invId]);
+    invoicesPayload.add({
+      'invoice_number': inv['invoice_number'],
+      'cashier_name': inv['cashier_name'],
+      'total_amount': inv['total_amount'],
+      'discount': inv['discount'],
+      'final_amount': inv['final_amount'],
+      'created_at': inv['created_at'],
+      'is_refunded': (inv['is_refunded'] as int?) == 1,
+      'items': items
+          .map((it) => {
+                'local_medicine_id': it['medicine_id'],
+                'trade_name': it['trade_name'],
+                'quantity': it['quantity'],
+                'unit_price': it['unit_price'],
+                'total_price': it['total_price'],
+              })
+          .toList(),
+    });
+  }
+
+  // 5. كل سجلات الإتلاف
+  final damaged = await db.query('damaged_medicine', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final damagedPayload = damaged
+      .map((d) => {
+            'local_medicine_id': d['medicine_id'],
+            'quantity_damaged': d['quantity_damaged'],
+            'reason': d['reason'],
+            'notes': d['notes'],
+            'damaged_at': d['damaged_at'],
+          })
+      .toList();
+
+  // 6. كل المصاريف
+  final expenses = await db.query('expense', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final expensesPayload = expenses
+      .map((e) => {
+            'expense_type': e['expense_type'],
+            'expense_date': e['expense_date'],
+            'amount': e['amount'],
+            'notes': e['notes'],
+          })
+      .toList();
+
+  return {
+    'suppliers': suppliersPayload,
+    'medicines': medicinesPayload,
+    'purchase_invoices': purchaseInvoicesPayload,
+    'invoices': invoicesPayload,
+    'damaged_medicines': damagedPayload,
+    'expenses': expensesPayload,
+  };
+}
+
 } // <-- هذا القوس يغلق كلاس DatabaseHelper بالكامل

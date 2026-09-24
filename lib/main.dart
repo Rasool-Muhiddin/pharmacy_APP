@@ -15,6 +15,7 @@ import 'services/suppliers_api_service.dart';
 import 'services/expense_api_service.dart';
 import 'services/damaged_api_service.dart';
 import 'services/reports_api_service.dart';
+import 'services/migration_api_service.dart';
 import 'services/backup_service.dart';
 import 'services/update_service.dart';
 import 'models/subscription_plan.dart';
@@ -110,6 +111,9 @@ class _StartupGateState extends State<_StartupGate> {
           cachedToken is String ? cachedToken : null,
         );
         ReportsApiService.instance.setAuthToken(
+          cachedToken is String ? cachedToken : null,
+        );
+        MigrationApiService.instance.setAuthToken(
           cachedToken is String ? cachedToken : null,
         );
       }

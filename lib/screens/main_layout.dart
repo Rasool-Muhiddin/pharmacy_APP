@@ -17,6 +17,8 @@ import '../screens/damaged_screen.dart';
 import '../screens/reports_screen.dart';
 import '../screens/missing_suppliers.dart';
 import '../screens/expenses_screen.dart';
+import '../screens/offline_migration_screen.dart';
+import '../services/migration_api_service.dart';
 import '../models/subscription_plan.dart';
 
 class MainLayout extends StatefulWidget {
@@ -73,6 +75,54 @@ class _MainLayoutState extends State<MainLayout> {
   void initState() {
     super.initState();
     _loadPharmacyData(); // 👈 جلب بيانات الصيدلية عند فتح الشاشة
+    _maybeSuggestOfflineMigration();
+  }
+
+  /// نقطة 5: يُسأل المالك مرة كل دخول أونلاين (طالما لم يرفع بعد) عن رفع
+  /// بيانات كانت محلية بحتة قبل التحويل. لا يُزعج إن لم توجد بيانات محلية
+  /// أصلاً (صيدلية أونلاين جديدة من البداية)، ولا يكرر السؤال إن كانت
+  /// الصيدلية مرفوعة بالفعل (migrated=true من /api/migration/status/).
+  Future<void> _maybeSuggestOfflineMigration() async {
+    if (!widget.isOnlineMode || !widget.isOwner) return;
+
+    try {
+      final hasLocalData = await DatabaseHelper.instance.hasLocalDataWorthMigrating(widget.pharmacyId);
+      if (!hasLocalData) return;
+
+      final status = await MigrationApiService.instance.checkStatus();
+      if (status['migrated'] == true) return;
+      // بيانات أونلاين حقيقية موجودة مسبقاً لهذه الصيدلية (حالة استثنائية)
+      // — السيرفر سيرفض أي محاولة رفع فوقها، فلا داعي لعرض اقتراح مضمون
+      // الفشل على المالك.
+      if (status['has_existing_online_data'] == true) return;
+
+      if (!mounted) return;
+      final shouldOpen = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('لديك بيانات محلية لم تُرفع بعد'),
+          content: const Text(
+            'صيدليتك الآن أونلاين، لكن لديك مخزوناً وموردين مسجّلين محلياً من '
+            'قبل. هل تريد رفعها إلى السيرفر الآن؟',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('لاحقاً')),
+            FilledButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('رفع الآن')),
+          ],
+        ),
+      );
+
+      if (shouldOpen == true && mounted) {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => OfflineMigrationScreen(pharmacyId: widget.pharmacyId),
+          ),
+        );
+      }
+    } catch (_) {
+      // فشل فحص حالة الرفع (لا اتصال، إلخ) لا يجب أن يعطّل فتح الشاشة
+      // الرئيسية — سيُعاد السؤال في الدخول التالي.
+    }
   }
 
   // دالة جلب بيانات الصيدلية من قاعدة البيانات
@@ -95,7 +145,7 @@ class _MainLayoutState extends State<MainLayout> {
     }
     switch (_currentPage) {
       case "الرئيسية":
-        return DashboardScreen(pharmacyId: widget.pharmacyId);
+        return DashboardScreen(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);
       case "المخزن والأدوية":
         return InventoryScreen(
           pharmacyId: widget.pharmacyId,
@@ -138,7 +188,7 @@ class _MainLayoutState extends State<MainLayout> {
           isOnlineMode: widget.isOnlineMode,
         );
       default:
-        return DashboardScreen(pharmacyId: widget.pharmacyId);
+        return DashboardScreen(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);
     }
   }
 

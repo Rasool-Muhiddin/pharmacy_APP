@@ -9,6 +9,7 @@ import '../services/suppliers_api_service.dart';
 import '../services/expense_api_service.dart';
 import '../services/damaged_api_service.dart';
 import '../services/reports_api_service.dart';
+import '../services/migration_api_service.dart';
 import 'main_layout.dart';
 import '../database/db_helper.dart';
 import '../models/subscription_plan.dart';
@@ -170,6 +171,9 @@ class _AuthScreenState extends State<AuthScreen> {
       apiToken is String && apiToken.isNotEmpty ? apiToken : null,
     );
     ReportsApiService.instance.setAuthToken(
+      apiToken is String && apiToken.isNotEmpty ? apiToken : null,
+    );
+    MigrationApiService.instance.setAuthToken(
       apiToken is String && apiToken.isNotEmpty ? apiToken : null,
     );
 
