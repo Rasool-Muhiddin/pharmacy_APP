@@ -40,6 +40,10 @@ class InvoiceSerializer(serializers.ModelSerializer):
     """
 
     items = InvoiceItemSerializer(many=True, read_only=True)
+    # الفواتير الجديدة: cashier حقيقي فحساب المستخدم يُعطي الاسم. الفواتير
+    # المُرحَّلة من أوفلاين: cashier=None وcashier_name نص محفوظ من الجهاز
+    # المحلي وقت الترحيل. هذا الحقل يوحّد الاثنين لعرض واحد في الواجهة.
+    cashier_display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Invoice
@@ -47,6 +51,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "id",
             "invoice_number",
             "cashier",
+            "cashier_name",
+            "cashier_display_name",
             "total_amount",
             "discount",
             "final_amount",
@@ -56,6 +62,11 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "items",
         ]
         read_only_fields = fields
+
+    def get_cashier_display_name(self, obj):
+        if obj.cashier is not None:
+            return obj.cashier.get_full_name() or obj.cashier.username
+        return obj.cashier_name or "بائع غير محدد"
 
 
 class CheckoutItemInputSerializer(serializers.Serializer):

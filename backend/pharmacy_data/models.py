@@ -1,5 +1,8 @@
+from datetime import date
+
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 from desktop_api.models import Pharmacy
 
@@ -61,10 +64,15 @@ class Invoice(models.Model):
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     discount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     final_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    # وقت الخادم عند الإنشاء (auto_now_add) لا وقت العميل المُرسَل، لأن ساعة
-    # جهاز العميل قد تكون غير دقيقة ولأن ترتيب الفواتير بين الأجهزة يجب أن
-    # يعتمد على مرجع واحد موثوق.
-    created_at = models.DateTimeField(auto_now_add=True)
+    # اسم الكاشير كما كان محلياً وقت الترحيل، لفواتير مرحَّلة من أوفلاين لا
+    # حساب Django حقيقي وراءها (MigrationViewSet يملأه ويترك cashier=None).
+    # الفواتير الجديدة بعد الترحيل تُنشأ بـcashier حقيقي وتترك هذا فارغاً.
+    cashier_name = models.CharField(max_length=150, blank=True, default="")
+    # كان auto_now_add، فحُوِّل إلى default قابل للتجاوز صراحة: checkout()
+    # العادي لا يمرر created_at فيُطبَّق نفس وقت الخادم كالسابق تماماً، بينما
+    # MigrationViewSet وحدها تمرره صراحة لحفظ تاريخ الفاتورة التاريخي
+    # الحقيقي القادم من الجهاز المحلي بدل تاريخ يوم الترحيل.
+    created_at = models.DateTimeField(default=timezone.now)
     is_refunded = models.BooleanField(default=False)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -135,7 +143,9 @@ class PurchaseInvoice(models.Model):
     invoice_number = models.CharField(max_length=60, blank=True, default="")
     total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     paid_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
-    created_at = models.DateTimeField(auto_now_add=True)
+    # نفس منطق Invoice.created_at أعلاه: default بدل auto_now_add، لتتمكن
+    # MigrationViewSet من حفظ تاريخ فاتورة الشراء التاريخي الحقيقي.
+    created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -160,7 +170,7 @@ class SupplierPayment(models.Model):
     )
     amount_paid = models.DecimalField(max_digits=14, decimal_places=2)
     notes = models.CharField(max_length=255, blank=True, default="")
-    paid_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         constraints = [
@@ -210,7 +220,10 @@ class DamagedMedicine(models.Model):
     quantity_damaged = models.PositiveIntegerField()
     reason = models.CharField(max_length=32, blank=True, default="")
     notes = models.CharField(max_length=255, blank=True, default="")
-    damaged_at = models.DateField(auto_now_add=True)
+    # كان auto_now_add؛ حُوِّل إلى default قابل للتجاوز لنفس سبب Invoice.created_at:
+    # DamagedMedicineViewSet.create لا تمرره فتُطبَّق قيمة اليوم كالسابق، بينما
+    # MigrationViewSet تمرره صراحة لحفظ تاريخ الإتلاف التاريخي الحقيقي.
+    damaged_at = models.DateField(default=date.today)
 
     class Meta:
         ordering = ["-id"]
@@ -231,7 +244,7 @@ class PurchaseInvoiceReturn(models.Model):
     purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name="returns")
     amount_returned = models.DecimalField(max_digits=14, decimal_places=2)
     notes = models.CharField(max_length=255, blank=True, default="")
-    returned_at = models.DateTimeField(auto_now_add=True)
+    returned_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         constraints = [

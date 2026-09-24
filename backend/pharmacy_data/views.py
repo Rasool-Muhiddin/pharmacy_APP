@@ -1,9 +1,13 @@
-from datetime import date, timedelta
+import json
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Count, DecimalField, F, OuterRef, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
+from django.http import StreamingHttpResponse
+from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -770,7 +774,8 @@ class ReportsViewSet(viewsets.ViewSet):
             if cashier is not None:
                 seller_name = cashier.get_full_name() or cashier.username
             else:
-                seller_name = "بائع غير محدد"
+                # فاتورة مرحَّلة من أوفلاين (لا حساب حقيقي وراءها) أو كاشير محذوف.
+                seller_name = invoice.cashier_name or "بائع غير محدد"
 
             bucket = sellers.setdefault(
                 seller_name, {"seller_name": seller_name, "invoices_count": 0, "total_amount": Decimal("0"), "invoices": []}
@@ -790,3 +795,312 @@ class ReportsViewSet(viewsets.ViewSet):
 
         sellers_list = sorted(sellers.values(), key=lambda s: s["total_amount"], reverse=True)
         return Response({"start": start.isoformat(), "end": end.isoformat(), "sellers": sellers_list})
+
+
+class MigrationViewSet(viewsets.ViewSet):
+    """
+    نقطة 5 (المواصفات الكاملة): تحويل صيدلية أوفلاين إلى أونلاين عبر رفع
+    أولي شامل من جهاز المالك فقط، ضمن معاملة ذرّية واحدة، مع تقدّم حي عبر
+    استجابة متدفقة (NDJSON: سطر JSON واحد لكل حدث)، بلا حذف أي شيء محلياً
+    من جهة العميل بعد النجاح (النسخة المحلية تبقى كاشاً كباقي الأجهزة).
+
+    الترتيب صارم بسبب الاعتماديات: Suppliers → Medicines → PurchaseInvoices
+    (مع Payments/Returns متداخلة داخل كل فاتورة) → Invoices (مع Items
+    متداخلة) → DamagedMedicines → Expenses. القوائم المتداخلة (payments,
+    returns, items) تُرسَل ضمن كل عنصر أب مباشرة، لا كقوائم منفصلة على
+    المستوى الأعلى، فلا حاجة لجدول تحويل معرّفات لفواتير الشراء/البيع نفسها
+    — فقط لـsupplier/medicine اللذين تُشير إليهما سجلات أخرى بمعرّفها.
+
+    ⚠️ اعتبار تشغيلي مهم: الاستجابة المتدفقة تُبقي معاملة قاعدة البيانات
+    مفتوحة طوال مدة الرفع كاملة (قد تمتد لدقائق مع بيانات ضخمة)، لأن كل
+    yield يُعلّق تنفيذ المولّد دون إغلاق المعاملة. هذا مقصود ليحقق الشرطين
+    معاً (معاملة واحدة + تقدّم حي)، لكنه يعني حجز اتصال قاعدة بيانات واحد
+    لكل عملية ترحيل جارية — مقبول لعملية تُنفَّذ مرة واحدة لكل صيدلية، لكن
+    يستحق الانتباه إن جرت عدة عمليات ترحيل متزامنة على خادم بموارد محدودة.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _membership(self, request):
+        membership = getattr(request.user, "pharmacymembership", None)
+        if membership is None:
+            raise PermissionDenied("هذا الحساب غير مرتبط بأي صيدلية.")
+        return membership
+
+    @action(detail=False, methods=["get"])
+    def status(self, request):
+        """يفحصه Flutter عند كل دخول أونلاين للمالك ليقرر عرض اقتراح الرفع أو إخفاءه."""
+        pharmacy = self._membership(request).pharmacy
+        has_existing_online_data = self._has_existing_online_data(pharmacy)
+        return Response(
+            {
+                "migrated": pharmacy.migrated_from_offline_at is not None,
+                "migrated_at": (
+                    pharmacy.migrated_from_offline_at.isoformat()
+                    if pharmacy.migrated_from_offline_at
+                    else None
+                ),
+                # true تعني: لا يمكن بدء رفع أولي جديد حتى لو migrated=false،
+                # لوجود بيانات أونلاين حقيقية مسبقاً (راجع _has_existing_online_data).
+                "has_existing_online_data": has_existing_online_data,
+            }
+        )
+
+    def _has_existing_online_data(self, pharmacy):
+        return (
+            Medicine.objects.filter(pharmacy=pharmacy).exists()
+            or Supplier.objects.filter(pharmacy=pharmacy).exists()
+            or Invoice.objects.filter(pharmacy=pharmacy).exists()
+            or Expense.objects.filter(pharmacy=pharmacy).exists()
+            or DamagedMedicine.objects.filter(pharmacy=pharmacy).exists()
+        )
+
+    @staticmethod
+    def _parse_datetime(value):
+        """يقبل ISO datetime أو date فقط؛ يرجع None لأي شيء غير مفهوم (يُطبَّق timezone.now() بدلاً منه لاحقاً)."""
+        if not value or not isinstance(value, str):
+            return None
+        parsed = parse_datetime(value)
+        if parsed is not None:
+            return timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
+        d = parse_date(value)
+        if d is not None:
+            return timezone.make_aware(datetime.combine(d, datetime.min.time()))
+        return None
+
+    @staticmethod
+    def _parse_date(value):
+        if not value or not isinstance(value, str):
+            return None
+        d = parse_date(value)
+        if d is not None:
+            return d
+        dt = parse_datetime(value)
+        return dt.date() if dt is not None else None
+
+    def _migration_stream(self, pharmacy, payload):
+        def line(obj):
+            return json.dumps(obj, default=str) + "\n"
+
+        suppliers_in = payload.get("suppliers") or []
+        medicines_in = payload.get("medicines") or []
+        purchase_invoices_in = payload.get("purchase_invoices") or []
+        invoices_in = payload.get("invoices") or []
+        damaged_in = payload.get("damaged_medicines") or []
+        expenses_in = payload.get("expenses") or []
+
+        # كل عنصر من المستويات العليا الستة = وحدة تقدّم واحدة. العناصر
+        # المتداخلة (payments/returns/items) لا تُحسَب في الإجمالي منفصلة —
+        # تبسيط متعمَّد يبقي شريط التقدّم مفهوماً (فاتورة شراء واحدة = خطوة
+        # واحدة، بصرف النظر عن عدد دفعاتها).
+        overall_total = (
+            len(suppliers_in) + len(medicines_in) + len(purchase_invoices_in)
+            + len(invoices_in) + len(damaged_in) + len(expenses_in)
+        )
+        overall_done = 0
+        yield line({"event": "start", "overall_total": overall_total})
+
+        try:
+            with transaction.atomic():
+                supplier_id_map = {}
+                for item in suppliers_in:
+                    supplier = Supplier.objects.create(
+                        pharmacy=pharmacy,
+                        name=item.get("name") or "",
+                        phone=item.get("phone") or "",
+                    )
+                    local_id = item.get("local_id")
+                    if local_id is not None:
+                        supplier_id_map[local_id] = supplier.id
+                    overall_done += 1
+                    yield line({"event": "progress", "stage": "suppliers", "overall_done": overall_done, "overall_total": overall_total})
+
+                medicine_id_map = {}
+                for item in medicines_in:
+                    medicine = Medicine.objects.create(
+                        pharmacy=pharmacy,
+                        trade_name=item.get("trade_name") or "",
+                        scientific_name=item.get("scientific_name") or "",
+                        category=item.get("category") or "",
+                        quantity=int(item.get("quantity") or 0),
+                        buy_price=Decimal(str(item.get("buy_price") or 0)),
+                        sell_price=Decimal(str(item.get("sell_price") or 0)),
+                        expiry_date=item.get("expiry_date") or None,
+                        shelf_location=item.get("shelf_location") or "",
+                        is_damaged=bool(item.get("is_damaged") or False),
+                        barcode=item.get("barcode") or None,
+                    )
+                    local_id = item.get("local_id")
+                    if local_id is not None:
+                        medicine_id_map[local_id] = medicine.id
+                    overall_done += 1
+                    yield line({"event": "progress", "stage": "medicines", "overall_done": overall_done, "overall_total": overall_total})
+
+                purchase_invoices_created = 0
+                payments_created = 0
+                returns_created = 0
+                for item in purchase_invoices_in:
+                    local_supplier_id = item.get("local_supplier_id")
+                    server_supplier_id = supplier_id_map.get(local_supplier_id)
+                    if server_supplier_id is None:
+                        raise ValidationError(
+                            f"فاتورة شراء تشير لمورد غير موجود ضمن قائمة الموردين المرفوعة (local_supplier_id={local_supplier_id})."
+                        )
+
+                    purchase_invoice = PurchaseInvoice.objects.create(
+                        pharmacy=pharmacy,
+                        supplier_id=server_supplier_id,
+                        invoice_number=item.get("invoice_number") or "",
+                        total_amount=Decimal(str(item.get("total_amount") or 0)),
+                        paid_amount=Decimal(str(item.get("paid_amount") or 0)),
+                        created_at=self._parse_datetime(item.get("created_at")) or timezone.now(),
+                    )
+
+                    for p in item.get("payments") or []:
+                        SupplierPayment.objects.create(
+                            pharmacy=pharmacy,
+                            supplier_id=server_supplier_id,
+                            purchase_invoice=purchase_invoice,
+                            amount_paid=Decimal(str(p.get("amount_paid") or 0)),
+                            notes=p.get("notes") or "",
+                            paid_at=self._parse_datetime(p.get("paid_at")) or timezone.now(),
+                        )
+                        payments_created += 1
+
+                    for r in item.get("returns") or []:
+                        PurchaseInvoiceReturn.objects.create(
+                            pharmacy=pharmacy,
+                            supplier_id=server_supplier_id,
+                            purchase_invoice=purchase_invoice,
+                            amount_returned=Decimal(str(r.get("amount_returned") or 0)),
+                            notes=r.get("notes") or "",
+                            returned_at=self._parse_datetime(r.get("returned_at")) or timezone.now(),
+                        )
+                        returns_created += 1
+
+                    purchase_invoices_created += 1
+                    overall_done += 1
+                    yield line({"event": "progress", "stage": "purchase_invoices", "overall_done": overall_done, "overall_total": overall_total})
+
+                invoices_created = 0
+                invoice_items_created = 0
+                for item in invoices_in:
+                    invoice = Invoice.objects.create(
+                        pharmacy=pharmacy,
+                        invoice_number=item.get("invoice_number") or f"MIGRATED-{overall_done + 1}",
+                        cashier=None,
+                        cashier_name=item.get("cashier_name") or "",
+                        total_amount=Decimal(str(item.get("total_amount") or 0)),
+                        discount=Decimal(str(item.get("discount") or 0)),
+                        final_amount=Decimal(str(item.get("final_amount") or 0)),
+                        created_at=self._parse_datetime(item.get("created_at")) or timezone.now(),
+                        is_refunded=bool(item.get("is_refunded") or False),
+                    )
+                    for it in item.get("items") or []:
+                        local_medicine_id = it.get("local_medicine_id")
+                        server_medicine_id = medicine_id_map.get(local_medicine_id)
+                        if server_medicine_id is None:
+                            raise ValidationError(
+                                f"عنصر فاتورة يشير لدواء غير موجود ضمن قائمة الأدوية المرفوعة (local_medicine_id={local_medicine_id})."
+                            )
+                        InvoiceItem.objects.create(
+                            invoice=invoice,
+                            medicine_id=server_medicine_id,
+                            trade_name=it.get("trade_name") or "",
+                            quantity=int(it.get("quantity") or 0),
+                            unit_price=Decimal(str(it.get("unit_price") or 0)),
+                            total_price=Decimal(str(it.get("total_price") or 0)),
+                        )
+                        invoice_items_created += 1
+
+                    invoices_created += 1
+                    overall_done += 1
+                    yield line({"event": "progress", "stage": "invoices", "overall_done": overall_done, "overall_total": overall_total})
+
+                damaged_created = 0
+                for item in damaged_in:
+                    local_medicine_id = item.get("local_medicine_id")
+                    server_medicine_id = medicine_id_map.get(local_medicine_id)
+                    if server_medicine_id is None:
+                        # سجل تالف يتيم (دواؤه غير موجود ضمن المرفوع) — يُتجاهَل
+                        # بدل إفشال كامل عملية الرفع من أجل سجل واحد شاذ.
+                        overall_done += 1
+                        yield line({"event": "progress", "stage": "damaged_medicines", "overall_done": overall_done, "overall_total": overall_total})
+                        continue
+                    DamagedMedicine.objects.create(
+                        pharmacy=pharmacy,
+                        medicine_id=server_medicine_id,
+                        quantity_damaged=int(item.get("quantity_damaged") or 0),
+                        reason=item.get("reason") or "",
+                        notes=item.get("notes") or "",
+                        damaged_at=self._parse_date(item.get("damaged_at")) or date.today(),
+                    )
+                    damaged_created += 1
+                    overall_done += 1
+                    yield line({"event": "progress", "stage": "damaged_medicines", "overall_done": overall_done, "overall_total": overall_total})
+
+                expenses_created = 0
+                for item in expenses_in:
+                    Expense.objects.create(
+                        pharmacy=pharmacy,
+                        expense_type=item.get("expense_type") or "",
+                        expense_date=self._parse_date(item.get("expense_date")) or date.today(),
+                        amount=Decimal(str(item.get("amount") or 0)),
+                        notes=item.get("notes") or "",
+                    )
+                    expenses_created += 1
+                    overall_done += 1
+                    yield line({"event": "progress", "stage": "expenses", "overall_done": overall_done, "overall_total": overall_total})
+
+                pharmacy.migrated_from_offline_at = timezone.now()
+                pharmacy.save(update_fields=["migrated_from_offline_at"])
+
+                summary = {
+                    "suppliers_created": len(supplier_id_map),
+                    "medicines_created": len(medicine_id_map),
+                    "purchase_invoices_created": purchase_invoices_created,
+                    "supplier_payments_created": payments_created,
+                    "purchase_invoice_returns_created": returns_created,
+                    "invoices_created": invoices_created,
+                    "invoice_items_created": invoice_items_created,
+                    "damaged_records_created": damaged_created,
+                    "expenses_created": expenses_created,
+                    "migrated_at": pharmacy.migrated_from_offline_at.isoformat(),
+                }
+        except Exception as exc:
+            message = str(getattr(exc, "detail", exc))
+            yield line({"event": "error", "message": message})
+            return
+
+        yield line({"event": "done", "ok": True, "summary": summary})
+
+    @action(detail=False, methods=["post"])
+    def upload_offline_data(self, request):
+        membership = self._membership(request)
+        if not membership.is_owner:
+            raise PermissionDenied("الرفع الأولي متاح لمالك الصيدلية فقط.")
+
+        pharmacy = membership.pharmacy
+        if pharmacy.migrated_from_offline_at is not None:
+            raise ValidationError("تم رفع بيانات هذه الصيدلية مسبقاً، لا يمكن تكرار العملية.")
+
+        # فحص الأمان المطلوب: رفض الترحيل إن وُجدت بيانات أونلاين حقيقية
+        # مسبقاً لهذه الصيدلية، حتى لو migrated_from_offline_at غير مضبوط
+        # لسبب ما — تفادياً لدمج بيانات محلية قديمة فوق بيانات أونلاين حية.
+        if self._has_existing_online_data(pharmacy):
+            raise ValidationError("توجد بيانات أونلاين مسجّلة مسبقاً لهذه الصيدلية، لا يمكن تنفيذ رفع أولي فوقها.")
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        for key in ("suppliers", "medicines", "purchase_invoices", "invoices", "damaged_medicines", "expenses"):
+            if key in payload and not isinstance(payload[key], list):
+                raise ValidationError(f"صيغة {key} يجب أن تكون قائمة.")
+
+        response = StreamingHttpResponse(
+            self._migration_stream(pharmacy, payload),
+            content_type="application/x-ndjson",
+        )
+        response["Cache-Control"] = "no-cache"
+        # يمنع أي عكس وسيط (مثل nginx) من تجميع كامل الرد قبل بثه دفعة
+        # واحدة، فيصل التقدّم حياً فعلاً بدل الظهور كله في اللحظة الأخيرة.
+        response["X-Accel-Buffering"] = "no"
+        return response

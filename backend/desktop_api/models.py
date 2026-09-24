@@ -13,6 +13,11 @@ class Pharmacy(models.Model):
     name = models.CharField(max_length=160)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # يُضبط مرة واحدة فقط عبر MigrationViewSet.upload (نقطة 5 من خطة
+    # الأونلاين: تحويل صيدلية أوفلاين إلى أونلاين برفع أولي من جهاز
+    # المالك). null = لم تُرفع بيانات أوفلاين بعد لهذه الصيدلية؛ بمجرد
+    # ضبطه يُرفض أي طلب رفع لاحق لمنع التكرار (راجع MigrationViewSet).
+    migrated_from_offline_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         verbose_name_plural = "Pharmacies"

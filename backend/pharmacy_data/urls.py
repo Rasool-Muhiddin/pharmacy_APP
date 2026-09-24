@@ -5,6 +5,7 @@ from .views import (
     ExpenseViewSet,
     InvoiceViewSet,
     MedicineViewSet,
+    MigrationViewSet,
     PurchaseInvoiceViewSet,
     ReportsViewSet,
     SupplierViewSet,
@@ -18,5 +19,6 @@ router.register("purchase-invoices", PurchaseInvoiceViewSet, basename="purchase-
 router.register("expenses", ExpenseViewSet, basename="expense")
 router.register("damaged-medicines", DamagedMedicineViewSet, basename="damaged-medicine")
 router.register("reports", ReportsViewSet, basename="report")
+router.register("migration", MigrationViewSet, basename="migration")
 
 urlpatterns = router.urls

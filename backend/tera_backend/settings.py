@@ -22,6 +22,12 @@ def read_env_file():
 read_env_file()
 DEBUG = os.getenv("DEBUG", "False").lower() in {"1", "true", "yes"}
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+# افتراضي Django هو 2.5 ميجابايت فقط — غير كافٍ لحمولة MigrationViewSet
+# (نقطة 5: رفع أولي أوفلاين→أونلاين قد تحمل سنوات من الفواتير دفعة واحدة).
+# 80 ميجابايت هامش واسع يكفي عملياً لآلاف الفواتير، مع بقائه حداً حقيقياً
+# يمنع أي طلب ضخم غير معقول.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 80 * 1024 * 1024
 if not SECRET_KEY:
     if DEBUG:
         SECRET_KEY = "development-only-change-before-production"
