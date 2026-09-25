@@ -9,6 +9,7 @@ from django.http import StreamingHttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import mixins, permissions, status, viewsets
+from rest_framework.renderers import BaseRenderer
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -797,6 +798,15 @@ class ReportsViewSet(viewsets.ViewSet):
         return Response({"start": start.isoformat(), "end": end.isoformat(), "sellers": sellers_list})
 
 
+class NDJSONRenderer(BaseRenderer):
+    media_type = "application/x-ndjson"
+    format = "ndjson"
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        return json.dumps(data).encode("utf-8")
+
+
 class MigrationViewSet(viewsets.ViewSet):
     """
     نقطة 5 (المواصفات الكاملة): تحويل صيدلية أوفلاين إلى أونلاين عبر رفع
@@ -1074,7 +1084,7 @@ class MigrationViewSet(viewsets.ViewSet):
 
         yield line({"event": "done", "ok": True, "summary": summary})
 
-    @action(detail=False, methods=["post"])
+    @action(detail=False, methods=["post"], renderer_classes=[NDJSONRenderer])
     def upload_offline_data(self, request):
         membership = self._membership(request)
         if not membership.is_owner:
