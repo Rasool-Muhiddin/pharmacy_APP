@@ -11,7 +11,7 @@ class DeviceActivationInline(admin.TabularInline):
 
 @admin.register(Pharmacy)
 class PharmacyAdmin(admin.ModelAdmin):
-    list_display = ("name", "is_active", "created_at")
+    list_display = ("name", "is_active", "migrated_from_offline_at", "created_at")
     search_fields = ("name",)
 
 
