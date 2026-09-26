@@ -31,7 +31,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 5,
+    version: 6,
     onConfigure: (db) async {
       await db.execute('PRAGMA foreign_keys = ON');
     },
@@ -114,6 +114,7 @@ Future<void> _onCreate(Database db, int version) async {
       pharmacy_id INTEGER NOT NULL,
       invoice_number TEXT NOT NULL UNIQUE,
       cashier_id INTEGER,
+      cashier_name_synced TEXT,
       total_amount REAL NOT NULL DEFAULT 0,
       discount REAL NOT NULL DEFAULT 0,
       final_amount REAL NOT NULL DEFAULT 0,
@@ -300,6 +301,16 @@ Future<void> _onUpgrade(
     // نفس المنطق تماماً، لكن لجدول المصروفات — يبقى NULL لكل المصروفات
     // الأوفلاين الحالية (لم تُزامن بعد).
     await db.execute('ALTER TABLE expense ADD COLUMN last_synced_at TEXT;');
+  }
+
+  if (oldVersion < 6) {
+    // يحل قيد معروف: فواتير أونلاين تُخزَّن بـ cashier_id = NULL دائماً
+    // (مساحة أرقام user.id على السيرفر مختلفة عن user_profile.id المحلي)،
+    // فكان اسم البائع يظهر "غير محدد" دائماً في سجل المبيعات رغم أن
+    // السيرفر يُرجع اسماً جاهزاً (cashier_display_name) في كل فاتورة. هذا
+    // العمود يخزّن ذلك النص كما هو، ويُستخدم كبديل احتياطي في استعلام
+    // sales_history_screen.dart عندما لا يوجد cashier_id محلي مطابق.
+    await db.execute('ALTER TABLE invoice ADD COLUMN cashier_name_synced TEXT;');
   }
 }
 
@@ -507,10 +518,10 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   /// السيرفر هو user.id في Django (مساحة أرقام مختلفة تماماً عن
   /// user_profile.id المحلي الذي يشير إليه القيد
   /// FOREIGN KEY(cashier_id) REFERENCES user_profile(id))، فتخزينه كما هو
-  /// قد يخالف القيد أو يشير خطأً لصف محلي مختلف تماماً. لا تعرض شاشات
-  /// الفواتير الحالية اسم الكاشير للفواتير المتزامنة من السيرفر بسبب هذا
-  /// (تظهر "غير محدد" في سجل المبيعات)، وهذا قيد معروف يستحق حقل اسم كاشير
-  /// نصياً منفصلاً على الفاتورة مستقبلاً بدل الاعتماد على cashier_id فقط.
+  /// قد يخالف القيد أو يشير خطأً لصف محلي مختلف تماماً. بدلاً من ذلك نخزّن
+  /// اسم البائع الجاهز الذي يُرجعه السيرفر (cashier_display_name، يحسبه
+  /// InvoiceSerializer.get_cashier_display_name) كنص في cashier_name_synced،
+  /// وتعتمد عليه شاشة سجل المبيعات كبديل احتياطي بدل عرض "غير محدد" دائماً.
   Future<void> _upsertInvoiceRow(
     DatabaseExecutor txn, {
     required int pharmacyId,
@@ -524,6 +535,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       'pharmacy_id': pharmacyId,
       'invoice_number': serverData['invoice_number'] as String,
       'cashier_id': null,
+      'cashier_name_synced': serverData['cashier_display_name'] as String?,
       'total_amount': _parseServerDecimal(serverData['total_amount']),
       'discount': _parseServerDecimal(serverData['discount']),
       'final_amount': _parseServerDecimal(serverData['final_amount']),

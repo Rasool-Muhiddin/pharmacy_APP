@@ -43,10 +43,10 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 
     try {
       // أونلاين: نُحدّث الكاش المحلي من السيرفر أولاً (قراءة فقط)، ثم
-      // نعرضه بنفس استعلام JOIN المحلي أدناه دون أي تغيير عليه. ملاحظة:
-      // فواتير أونلاين مُخزَّنة عبر cashier_id = NULL دائماً (انظر
-      // db_helper._upsertInvoiceRow)، فستظهر باسم "غير محدد" هنا مؤقتاً
-      // حتى يُضاف حقل اسم كاشير نصي منفصل على الفاتورة مستقبلاً.
+      // نعرضه بنفس استعلام JOIN المحلي أدناه دون أي تغيير عليه. فواتير
+      // أونلاين مُخزَّنة عبر cashier_id = NULL دائماً (انظر
+      // db_helper._upsertInvoiceRow)، لكن اسم البائع الجاهز القادم من
+      // السيرفر محفوظ في invoice.cashier_name_synced ويُستخدم كبديل هنا.
       if (widget.isOnlineMode) {
         await InvoiceRepository.instance.getInvoices(
           pharmacyId: widget.pharmacyId,
@@ -61,7 +61,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
       final data = await db.rawQuery('''
         SELECT 
           i.*,
-          COALESCE(u.full_name, u.username, 'غير محدد') AS cashier_name
+          COALESCE(u.full_name, u.username, i.cashier_name_synced, 'غير محدد') AS cashier_name
         FROM invoice i
         LEFT JOIN user_profile up ON i.cashier_id = up.id
         LEFT JOIN users u ON up.user_id = u.id

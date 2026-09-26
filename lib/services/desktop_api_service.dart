@@ -20,15 +20,20 @@ class DesktopApiService {
 
   static final DesktopApiService instance = DesktopApiService._();
 
-  /// يحدد عند بناء النسخة المستقلة، مثال:
-  /// --dart-define=TERA_API_BASE_URL=https://api.example.com/api/desktop
+  /// نفس متغير TERA_API_ROOT_URL المستخدم في كل خدمات البيانات الأخرى
+  /// (medicine/invoice/suppliers/...)، مثال عند بناء نسخة العملاء:
+  /// --dart-define=TERA_API_ROOT_URL=https://pharmacy-api.tera-software1.com/api
   ///
-  /// القيمة الافتراضية مخصصة للتطوير المحلي. عند بناء نسخة العملاء يجب تمرير
-  /// رابط خادم الإنتاج صراحةً باستخدام --dart-define.
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_BASE_URL',
-    defaultValue: 'http://127.0.0.1:8000/api/desktop',
+  /// القيمة الافتراضية مخصصة للتطوير المحلي فقط. كان هذا الملف سابقاً يقرأ
+  /// متغيراً مختلف الاسم (TERA_API_BASE_URL) لم يكن يُمرَّر عند البناء أبداً،
+  /// فكان التفعيل/الدخول يستخدمان صمتاً نفس الرابط الافتراضي المحلي إن لم
+  /// يُعرَّف أي من المتغيرين، ما قد يسبب سلوكاً غير متسق بين الشاشات.
+  static const String _apiRootUrl = String.fromEnvironment(
+    'TERA_API_ROOT_URL',
+    defaultValue: 'http://127.0.0.1:8000/api',
   );
+
+  static const String _baseUrl = '$_apiRootUrl/desktop';
 
   Future<Map<String, dynamic>> activate({
     required String activationCode,
