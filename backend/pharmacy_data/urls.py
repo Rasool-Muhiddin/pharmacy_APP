@@ -6,6 +6,7 @@ from .views import (
     InvoiceViewSet,
     MedicineViewSet,
     MigrationViewSet,
+    PharmacyLinkViewSet,
     PurchaseInvoiceViewSet,
     ReportsViewSet,
     SupplierViewSet,
@@ -20,5 +21,8 @@ router.register("expenses", ExpenseViewSet, basename="expense")
 router.register("damaged-medicines", DamagedMedicineViewSet, basename="damaged-medicine")
 router.register("reports", ReportsViewSet, basename="report")
 router.register("migration", MigrationViewSet, basename="migration")
+# خاصية الباقة الذهبية: GET /api/pharmacy-links/ فقط (بلا create/update/delete
+# — راجع PharmacyLinkViewSet).
+router.register("pharmacy-links", PharmacyLinkViewSet, basename="pharmacy-link")
 
 urlpatterns = router.urls

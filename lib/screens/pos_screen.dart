@@ -29,6 +29,11 @@ class _PosScreenState extends State<PosScreen> {
   final List<Map<String, dynamic>> _cartItems = [];
   List<Map<String, dynamic>> _recentInvoices = [];
 
+  // خاصية الباقة الذهبية (تعدد المخازن): البيع دائماً من المخزن الرئيسي
+  // فقط، بغض النظر عن أي مخزن ثانٍ قد تملكه الصيدلية. يُحمَّل مرة واحدة في
+  // _loadInitialData ويُستخدم لكل من قائمة الأصناف والبحث بالباركود.
+  int? _mainWarehouseId;
+
   String _discountType = 'amount'; // 'amount' (مبلغ) أو 'percent' (%)
   bool _showSuggestions = false;
   bool _isLoading = false;
@@ -49,7 +54,11 @@ class _PosScreenState extends State<PosScreen> {
     try {
       // المخزون هنا لا يزال يُقرأ من الكاش المحلي مباشرة (يُحدَّثه فتح شاشة
       // المخزون، أو أي checkout/refund أونلاين ناجح هنا نفسه — انظر أسفل).
-      final meds = await DatabaseHelper.instance.getMedicines(widget.pharmacyId);
+      // ⚠️ getMainWarehouseMedicines (لا getMedicines) عمداً: البيع مقصور
+      // على المخزن الرئيسي فقط ولو كانت الصيدلية على الباقة الذهبية وتملك
+      // مخزناً ثانياً.
+      _mainWarehouseId = await DatabaseHelper.instance.ensureMainWarehouse(widget.pharmacyId);
+      final meds = await DatabaseHelper.instance.getMainWarehouseMedicines(widget.pharmacyId);
       final invoices = await InvoiceRepository.instance.getInvoices(
         pharmacyId: widget.pharmacyId,
         isOnlineMode: widget.isOnlineMode,
@@ -142,7 +151,10 @@ class _PosScreenState extends State<PosScreen> {
     if (query.isEmpty) return;
 
     try {
-      final exactMatch = await DatabaseHelper.instance.getMedicineByBarcode(query);
+      // نفس تقييد المخزن الرئيسي المطبّق في _loadInitialData، حتى لا يبيع
+      // الماسح صنفاً موجوداً فقط في المخزن الثانوي.
+      final warehouseId = _mainWarehouseId ??= await DatabaseHelper.instance.ensureMainWarehouse(widget.pharmacyId);
+      final exactMatch = await DatabaseHelper.instance.getMedicineByBarcode(query, warehouseId: warehouseId);
 
       if (!mounted) return;
 

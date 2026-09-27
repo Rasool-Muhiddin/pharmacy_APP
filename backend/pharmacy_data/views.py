@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, F, OuterRef, Subquery, Sum, Value
+from django.db.models import Count, DecimalField, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import StreamingHttpResponse
 from django.utils import timezone
@@ -14,6 +14,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 
+from desktop_api.models import PharmacyLink
 from .models import (
     DamagedMedicine,
     Expense,
@@ -55,6 +56,36 @@ class MedicineViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         membership = self.request.user.pharmacymembership
         serializer.save(pharmacy=membership.pharmacy)
+
+
+class PharmacyLinkViewSet(viewsets.ViewSet):
+    """
+    للقراءة فقط: يرجّع الصيدليات المرتبطة بصيدلية المستخدم الحالي (خاصية
+    الباقة الذهبية: AppFeature.pharmacyLinking). لا create/update/delete
+    هنا عمداً — الربط قرار إداري مركزي يتم فقط من PharmacyLinkAdmin على
+    لوحة أدمن Django، ليس من التطبيق. تطبيق Flutter يستدعي هذا الـendpoint
+    عند بدء التشغيل ويمرر النتيجة لـ
+    DatabaseHelper.instance.replacePharmacyLinksCache() ليحدّث كاشه المحلي.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def list(self, request):
+        membership = getattr(request.user, "pharmacymembership", None)
+        if membership is None:
+            return Response({"ok": True, "linked_pharmacies": []})
+
+        pharmacy_id = membership.pharmacy_id
+        links = PharmacyLink.objects.filter(
+            Q(pharmacy_a_id=pharmacy_id) | Q(pharmacy_b_id=pharmacy_id)
+        ).select_related("pharmacy_a", "pharmacy_b")
+
+        linked = []
+        for link in links:
+            other = link.pharmacy_b if link.pharmacy_a_id == pharmacy_id else link.pharmacy_a
+            linked.append({"id": other.id, "name": other.name})
+
+        return Response({"ok": True, "linked_pharmacies": linked})
 
 
 def _next_invoice_number(pharmacy):

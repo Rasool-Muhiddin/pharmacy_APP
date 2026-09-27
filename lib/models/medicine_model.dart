@@ -3,6 +3,13 @@ class Medicine {
 
   final int pharmacyId;
 
+  /// المخزن الذي ينتمي إليه هذا الصف (خاصية الباقة الذهبية: تعدد المخازن).
+  /// لكل الأصناف القديمة، والصيدليات على الباقة الأساسية، هذه القيمة هي
+  /// دائماً معرّف المخزن الرئيسي — استخدم
+  /// DatabaseHelper.instance.ensureMainWarehouse(pharmacyId) للحصول عليه
+  /// عند إنشاء صنف جديد إن لم يكن معروفاً مسبقاً في الشاشة.
+  final int warehouseId;
+
   final String tradeName;
 
   final String scientificName;
@@ -26,6 +33,7 @@ class Medicine {
   Medicine({
     this.id,
     required this.pharmacyId,
+    required this.warehouseId,
     required this.tradeName,
     required this.scientificName,
     required this.category,
@@ -42,6 +50,7 @@ class Medicine {
     return {
       'id': id,
       'pharmacy_id': pharmacyId,
+      'warehouse_id': warehouseId,
       'trade_name': tradeName,
       'scientific_name': scientificName,
       'category': category,
@@ -59,6 +68,11 @@ class Medicine {
     return Medicine(
       id: map['id'],
       pharmacyId: map['pharmacy_id'],
+      // احتياط فقط: كل صف حقيقي في قاعدة البيانات لديه warehouse_id (عمود
+      // NOT NULL). القيمة 0 هنا لا تطابق أي مخزن حقيقي، وتُستخدم فقط إن
+      // جاءت الخريطة من مصدر خارجي (مثلاً استجابة سيرفر أونلاين) لا يعرف
+      // بعد عن مفهوم المخازن.
+      warehouseId: map['warehouse_id'] ?? 0,
       tradeName: map['trade_name'] ?? '',
       scientificName: map['scientific_name'] ?? '',
       category: map['category'] ?? '',

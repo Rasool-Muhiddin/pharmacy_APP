@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../database/db_helper.dart';
 import '../repository/medicine_repository.dart';
 import '../services/medicine_api_service.dart';
+import '../models/subscription_plan.dart';
 import 'package:sqflite/sqflite.dart';
 
 class InventoryScreen extends StatefulWidget {
@@ -11,11 +12,16 @@ class InventoryScreen extends StatefulWidget {
   final bool isOwner;
   final bool isOnlineMode;
 
+  /// صلاحيات الباقة الحالية — تُستخدم لتحديد ما إذا كانت خاصية تعدد
+  /// المخازن/ربط الصيدليات مفعّلة (Gold) أو ظاهرة-لكن-مقفولة (Basic).
+  final SubscriptionEntitlements entitlements;
+
   const InventoryScreen({
     super.key,
     required this.pharmacyId,
     this.isOwner = true,
     this.isOnlineMode = false,
+    required this.entitlements,
   });
 
   @override
@@ -27,6 +33,22 @@ class _InventoryScreenState extends State<InventoryScreen> {
   List<Map<String, dynamic>> _medicines = [];
   List<Map<String, dynamic>> _masterMedicines = []; // القاموس المحمل من iraqi_drugs.json
   bool _isLoading = false;
+
+  // خاصية الباقة الذهبية: تعدد المخازن + ربط الصيدليات. أوفلاين فقط حالياً
+  // (السيرفر لا يعرف بعد بمفهوم المخازن - راجع db_helper.dart)، لذا كل هذا
+  // القسم يبقى معطّلاً بصمت في وضع الأونلاين.
+  bool get _multiWarehouseUsable => !widget.isOnlineMode;
+  List<Map<String, dynamic>> _warehouses = [];
+  int? _selectedWarehouseId;
+
+  int? get _mainWarehouseId {
+    if (_warehouses.isEmpty) return null;
+    final main = _warehouses.firstWhere(
+      (w) => (w['is_main'] as int) == 1,
+      orElse: () => _warehouses.first,
+    );
+    return main['id'] as int;
+  }
 
   final Map<String, String> _categories = {
     'tablet': 'حبوب / كبسول',
@@ -56,6 +78,9 @@ class _InventoryScreenState extends State<InventoryScreen> {
     super.initState();
     _loadMedicines();
     _loadMasterMedicinesFromJson(); // تحميل الأدوية من الملف عند فتح الشاشة
+    if (_multiWarehouseUsable) {
+      _loadWarehouses();
+    }
   }
 
   @override
@@ -136,6 +161,13 @@ class _InventoryScreenState extends State<InventoryScreen> {
         data = await DatabaseHelper.instance.searchMedicines(widget.pharmacyId, query);
       }
 
+      // تقييد العرض بالمخزن المختار حالياً (خاصية Gold، أوفلاين فقط). لا
+      // يُطبَّق شيء هنا إن كانت الصيدلية على الباقة الأساسية (مخزن واحد
+      // فقط أصلاً) أو أونلاين (المفهوم غير موجود بعد على السيرفر).
+      if (_multiWarehouseUsable && _selectedWarehouseId != null) {
+        data = data.where((m) => m['warehouse_id'] == _selectedWarehouseId).toList();
+      }
+
       setState(() {
         _medicines = data;
       });
@@ -144,6 +176,249 @@ class _InventoryScreenState extends State<InventoryScreen> {
     } finally {
       setState(() => _isLoading = false);
     }
+  }
+
+  // --- خاصية الباقة الذهبية: تعدد المخازن + ربط الصيدليات ---
+
+  Future<void> _loadWarehouses() async {
+    final warehouses = await DatabaseHelper.instance.getWarehouses(widget.pharmacyId);
+    if (!mounted) return;
+    setState(() {
+      _warehouses = warehouses;
+      _selectedWarehouseId ??= _mainWarehouseId;
+    });
+  }
+
+  /// تُعرض بدل فتح أي حوار فعلي عندما تكون الصيدلية على الباقة الأساسية —
+  /// الميزة تبقى ظاهرة دائماً وفق طلب العمل، لا تُخفى، لكنها مقفولة.
+  void _showUpgradeRequiredDialog(String featureLabel) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: Row(
+          children: const [
+            Icon(Icons.lock_outline, color: Color(0xFFD97706)),
+            SizedBox(width: 10),
+            Text('ميزة الباقة الذهبية'),
+          ],
+        ),
+        content: Text(
+          'خطتك الحالية لا تسمح بـ "$featureLabel".\n\n'
+          'قم بالترقية إلى الباقة الذهبية لتفعيل هذه الميزة.',
+        ),
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFD97706)),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('حسناً', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openAddWarehouseDialog() {
+    if (widget.entitlements.isLocked(AppFeature.multiWarehouse)) {
+      _showUpgradeRequiredDialog('إضافة مخزن ثانٍ');
+      return;
+    }
+    final nameCtrl = TextEditingController(text: 'المخزن الثانوي');
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: const Text('إضافة مخزن ثانٍ'),
+        content: TextField(
+          controller: nameCtrl,
+          decoration: const InputDecoration(labelText: 'اسم المخزن', border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1ABC9C)),
+            onPressed: () async {
+              try {
+                await DatabaseHelper.instance.addSecondaryWarehouse(
+                  pharmacyId: widget.pharmacyId,
+                  name: nameCtrl.text.trim().isEmpty ? 'المخزن الثانوي' : nameCtrl.text.trim(),
+                );
+                if (Navigator.canPop(ctx)) Navigator.pop(ctx);
+                await _loadWarehouses();
+                if (mounted) _showSnackBar('تم إضافة المخزن بنجاح', Colors.green);
+              } catch (e) {
+                if (!mounted) return;
+                _showSnackBar(e is StateError ? e.message : _friendlyDbErrorMessage(e), Colors.red);
+              }
+            },
+            child: const Text('إضافة', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// شريط اختيار المخزن. يظهر دائماً (حتى للباقة الأساسية) وفق طلب العمل:
+  /// الميزة "ظاهرة لكن مقفولة"، لا مخفية. ⚠️ لا يوجد هنا أي زر لربط
+  /// الصيدليات — الربط قرار إداري مركزي من لوحة أدمن Django فقط، صاحب
+  /// الصيدلية لا يملك صلاحية إنشائه؛ إن كانت هناك صيدليات مرتبطة (رُبطت من
+  /// الإدارة) فقط تظهر تلقائياً كوجهات ممكنة داخل حوار "نقل مخزون".
+  Widget _buildWarehouseBar() {
+    if (!_multiWarehouseUsable) return const SizedBox.shrink();
+
+    final isLocked = widget.entitlements.isLocked(AppFeature.multiWarehouse);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        children: [
+          const Icon(Icons.warehouse_outlined, size: 18, color: Color(0xFF64748B)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final w in _warehouses)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 8),
+                      child: ChoiceChip(
+                        label: Text(w['name'] as String),
+                        selected: _selectedWarehouseId == w['id'],
+                        onSelected: (_) {
+                          setState(() => _selectedWarehouseId = w['id'] as int);
+                          _loadMedicines();
+                        },
+                      ),
+                    ),
+                  ActionChip(
+                    avatar: Icon(isLocked ? Icons.lock_outline : Icons.add, size: 16),
+                    label: const Text('مخزن ثانٍ'),
+                    onPressed: _warehouses.length >= DatabaseHelper.maxWarehousesPerPharmacy && !isLocked
+                        ? null
+                        : _openAddWarehouseDialog,
+                  ),
+                  const SizedBox(width: 8),
+                  ActionChip(
+                    avatar: const Icon(Icons.sync_alt, size: 16),
+                    label: const Text('نقل مخزون'),
+                    onPressed: _openTransferDialog,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openTransferDialog() {
+    if (_medicines.isEmpty) {
+      _showSnackBar('لا توجد أصناف في هذا المخزن لنقلها.', Colors.orange);
+      return;
+    }
+    Map<String, dynamic>? selectedMedicine;
+    int? destWarehouseId;
+    final qtyCtrl = TextEditingController();
+    List<Map<String, dynamic>> destinationOptions = [];
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          Future<void> loadDestinations() async {
+            final own = _warehouses.where((w) => w['id'] != selectedMedicine?['warehouse_id']).toList();
+            // ⚠️ صيدليات مرتبطة تظهر فقط إن سمحت الباقة الحالية بها. الربط
+            // نفسه يتم فقط من لوحة الأدمن، لكن الاستفادة منه في النقل تبقى
+            // خاضعة لصلاحية AppFeature.pharmacyLinking (Gold) كأي خاصية أخرى.
+            final linkedWarehouses = <Map<String, dynamic>>[];
+            if (!widget.entitlements.isLocked(AppFeature.pharmacyLinking)) {
+              final linkedIds = await DatabaseHelper.instance.getLinkedPharmacyIds(widget.pharmacyId);
+              for (final pid in linkedIds) {
+                linkedWarehouses.addAll(await DatabaseHelper.instance.getWarehouses(pid));
+              }
+            }
+            setDialogState(() => destinationOptions = [...own, ...linkedWarehouses]);
+          }
+
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            title: const Text('نقل مخزون'),
+            content: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  DropdownButtonFormField<Map<String, dynamic>>(
+                    initialValue: selectedMedicine,
+                    decoration: const InputDecoration(labelText: 'الصنف', border: OutlineInputBorder()),
+                    items: _medicines
+                        .map((m) => DropdownMenuItem(
+                              value: m,
+                              child: Text('${m['trade_name']} (${m['quantity']} قطعة)'),
+                            ))
+                        .toList(),
+                    onChanged: (val) {
+                      setDialogState(() {
+                        selectedMedicine = val;
+                        destWarehouseId = null;
+                      });
+                      loadDestinations();
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<int>(
+                    initialValue: destWarehouseId,
+                    decoration: const InputDecoration(labelText: 'المخزن الهدف', border: OutlineInputBorder()),
+                    items: destinationOptions
+                        .map((w) => DropdownMenuItem(
+                              value: w['id'] as int,
+                              child: Text('${w['name']} (صيدلية #${w['pharmacy_id']})'),
+                            ))
+                        .toList(),
+                    onChanged: (val) => setDialogState(() => destWarehouseId = val),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: qtyCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'الكمية المنقولة', border: OutlineInputBorder()),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1ABC9C)),
+                onPressed: () async {
+                  final qty = int.tryParse(qtyCtrl.text.trim());
+                  if (selectedMedicine == null || destWarehouseId == null || qty == null || qty <= 0) {
+                    _showSnackBar('أكمل كل الحقول بكمية صحيحة أكبر من صفر', Colors.red);
+                    return;
+                  }
+                  try {
+                    await DatabaseHelper.instance.transferStock(
+                      sourceMedicineId: selectedMedicine!['id'] as int,
+                      toWarehouseId: destWarehouseId!,
+                      quantity: qty,
+                    );
+                    if (Navigator.canPop(ctx)) Navigator.pop(ctx);
+                    await _loadMedicines();
+                    if (mounted) _showSnackBar('تم نقل المخزون بنجاح', Colors.green);
+                  } catch (e) {
+                    if (!mounted) return;
+                    _showSnackBar(e is StateError ? e.message : _friendlyDbErrorMessage(e), Colors.red);
+                  }
+                },
+                child: const Text('نقل', style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 
 
@@ -503,6 +778,13 @@ void _openAddMedicineDialog() {
                         'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
                         'expiry_date': expiryDate,
                         'shelf_location': shelfCtrl.text.trim(),
+                        // ⚠️ لا يُرسَل أبداً في وضع الأونلاين: السيرفر لا يعرف
+                        // بعد بعمود warehouse_id، وسيرفضه أو يتجاهله كحقل
+                        // غريب. أوفلاين: يُدخل دائماً في المخزن المختار حالياً
+                        // (أو الرئيسي كاحتياط إن لم يُحمَّل شريط المخازن بعد).
+                        if (!widget.isOnlineMode)
+                          'warehouse_id': _selectedWarehouseId ??
+                              await DatabaseHelper.instance.ensureMainWarehouse(widget.pharmacyId),
                       },
                     );
 
@@ -1116,6 +1398,7 @@ void _openSupplyDialog() {
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
+            _buildWarehouseBar(),
             // شريط البحث والأزرار العلوية
             Row(
               children: [

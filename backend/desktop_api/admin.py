@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import DesktopAppVersion, DesktopLicense, DeviceActivation, Pharmacy, PharmacyMembership
+from .models import DesktopAppVersion, DesktopLicense, DeviceActivation, Pharmacy, PharmacyLink, PharmacyMembership
 
 
 class DeviceActivationInline(admin.TabularInline):
@@ -24,8 +24,8 @@ class PharmacyMembershipAdmin(admin.ModelAdmin):
 
 @admin.register(DesktopLicense)
 class DesktopLicenseAdmin(admin.ModelAdmin):
-    list_display = ("pharmacy", "activation_code", "mode", "status", "max_devices", "expires_at")
-    list_filter = ("mode", "status", "license_type")
+    list_display = ("pharmacy", "activation_code", "mode", "plan", "status", "max_devices", "expires_at")
+    list_filter = ("mode", "plan", "status", "license_type")
     search_fields = ("pharmacy__name", "activation_code")
     readonly_fields = ("activation_code", "created_at", "updated_at")
     inlines = (DeviceActivationInline,)
@@ -41,3 +41,12 @@ class DeviceActivationAdmin(admin.ModelAdmin):
 @admin.register(DesktopAppVersion)
 class DesktopAppVersionAdmin(admin.ModelAdmin):
     list_display = ("version", "is_mandatory", "released_at")
+
+
+@admin.register(PharmacyLink)
+class PharmacyLinkAdmin(admin.ModelAdmin):
+    # خاصية الباقة الذهبية (تعدد المخازن + ربط الصيدليات) — يُنشأ الربط من
+    # هنا حصراً، لا يوجد أي مسار آخر من داخل التطبيق نفسه.
+    list_display = ("pharmacy_a", "pharmacy_b", "created_at")
+    search_fields = ("pharmacy_a__name", "pharmacy_b__name")
+    autocomplete_fields = ("pharmacy_a", "pharmacy_b")

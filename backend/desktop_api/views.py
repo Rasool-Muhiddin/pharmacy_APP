@@ -28,6 +28,9 @@ def license_payload(license):
     return {
         "type": license.license_type,
         "mode": license.mode,
+        # يقرأه subscription_plan.dart (SubscriptionEntitlements.fromLicense)
+        # لتفعيل/قفل خصائص الباقة الذهبية (تعدد المخازن، ربط الصيدليات...).
+        "plan": license.plan,
         "status": license.status,
         "expires_at": license.expires_at.isoformat() if license.expires_at else None,
         "max_devices": license.max_devices,

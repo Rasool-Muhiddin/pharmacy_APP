@@ -12,7 +12,23 @@ enum AppFeature {
   damagedMedicines,
   expenses,
   reports,
+
+  /// إمكانية إضافة مخزن ثانٍ لنفس الصيدلية (حد أقصى مخزنين)، والنقل بينهما.
+  /// البيع يبقى دائماً من المخزن الرئيسي فقط.
+  multiWarehouse,
+
+  /// ربط صيدليتين ببعض لإتاحة نقل عناصر (مخزون فقط) بين مخزنيهما.
+  pharmacyLinking,
 }
+
+/// الخصائص "المرئية لكن مقفولة" في الباقة الأساسية: تظهر في الواجهة مع
+/// شارة "خطتك الحالية لا تسمح..." بدل إخفائها بالكامل مثل باقي الخصائص.
+/// أضف هنا أي خاصية جديدة تريدها ظاهرة-لكن-مقفولة في Basic؛ أي خاصية غير
+/// موجودة في هذه المجموعة تُخفى بالكامل عن Basic كما كان يحدث سابقاً.
+const Set<AppFeature> lockedButVisibleInBasic = <AppFeature>{
+  AppFeature.multiWarehouse,
+  AppFeature.pharmacyLinking,
+};
 
 enum SubscriptionPlan {
   basic,
@@ -28,10 +44,22 @@ class SubscriptionEntitlements {
 
   /// كل خصائص الإصدار الحالي متاحة في Basic بناءً على سياسة الباقات الحالية.
   static final Set<AppFeature> basicFeatures =
-      Set<AppFeature>.unmodifiable(AppFeature.values);
+      Set<AppFeature>.unmodifiable(<AppFeature>{
+    AppFeature.dashboard,
+    AppFeature.inventory,
+    AppFeature.pointOfSale,
+    AppFeature.salesHistory,
+    AppFeature.suppliersAndPurchases,
+    AppFeature.damagedMedicines,
+    AppFeature.expenses,
+    AppFeature.reports,
+  });
 
   /// مكان مخصص للخصائص التي ستضاف لاحقاً إلى Gold دون تغيير Basic.
-  static const Set<AppFeature> goldAdditionalFeatures = <AppFeature>{};
+  static const Set<AppFeature> goldAdditionalFeatures = <AppFeature>{
+    AppFeature.multiWarehouse,
+    AppFeature.pharmacyLinking,
+  };
 
   /// مكان مخصص للخصائص الحصرية لـ Diamond التي ستضاف لاحقاً.
   static const Set<AppFeature> diamondAdditionalFeatures = <AppFeature>{};
@@ -71,6 +99,12 @@ class SubscriptionEntitlements {
 
   bool allows(AppFeature feature) => features.contains(feature);
 
+  /// خاص بالخصائص "المرئية-لكن-مقفولة": استخدم هذا بدل [allows] في أي
+  /// شاشة/ويدجت تخص خاصية ضمن [lockedButVisibleInBasic]، لأنها يجب أن
+  /// تظهر دائماً في الواجهة (ممكّنة أو مقفولة) ولا تُخفى أبداً.
+  bool isLocked(AppFeature feature) =>
+      lockedButVisibleInBasic.contains(feature) && !allows(feature);
+
   String get displayName => switch (plan) {
         SubscriptionPlan.basic => 'Basic',
         SubscriptionPlan.gold => 'Gold',
@@ -103,6 +137,8 @@ class SubscriptionEntitlements {
         'damaged_medicines' => AppFeature.damagedMedicines,
         'expenses' => AppFeature.expenses,
         'reports' => AppFeature.reports,
+        'multi_warehouse' => AppFeature.multiWarehouse,
+        'pharmacy_linking' => AppFeature.pharmacyLinking,
         _ => null,
       };
 }
