@@ -19,7 +19,6 @@ import '../screens/missing_suppliers.dart';
 import '../screens/expenses_screen.dart';
 import '../screens/offline_migration_screen.dart';
 import '../services/migration_api_service.dart';
-import '../services/pharmacy_link_api_service.dart';
 import '../models/subscription_plan.dart';
 
 class MainLayout extends StatefulWidget {
@@ -75,30 +74,11 @@ class _MainLayoutState extends State<MainLayout> {
   @override
   void initState() {
     super.initState();
+    // قبل أي قراءة من الشاشات الفرعية: الأونلاين يعرض صفوف كاش الخادم فقط،
+    // والأوفلاين يعرض الصفوف المحلية فقط (راجع DatabaseHelper.localIdBase).
+    DatabaseHelper.instance.setSessionMode(isOnline: widget.isOnlineMode);
     _loadPharmacyData(); // 👈 جلب بيانات الصيدلية عند فتح الشاشة
     _maybeSuggestOfflineMigration();
-    _syncPharmacyLinksCache();
-  }
-
-  /// خاصية الباقة الذهبية (تعدد المخازن + ربط الصيدليات): يزامن كاش
-  /// الروابط المحلي مع القائمة الفعلية من لوحة أدمن Django في كل فتح
-  /// للشاشة الرئيسية. لا تأثير له أوفلاين (PharmacyLinkApiService يحتاج
-  /// اتصالاً بالسيرفر، ولا يوجد token صالح أصلاً في تلك الحالة)، ولا يُزعج
-  /// المستخدم بأي رسالة عند الفشل — تماماً كالنسخ الاحتياطي في main.dart:
-  /// fire-and-forget، لا ينتظره initState ولا يعطّل فتح الشاشة.
-  Future<void> _syncPharmacyLinksCache() async {
-    if (!widget.isOnlineMode) return;
-    try {
-      final linkedIds = await PharmacyLinkApiService.instance.fetchLinkedPharmacyIds();
-      await DatabaseHelper.instance.replacePharmacyLinksCache(
-        pharmacyId: widget.pharmacyId,
-        linkedPharmacyIds: linkedIds,
-      );
-    } catch (_) {
-      // فشل المزامنة (لا اتصال، توكن منتهي، إلخ) يُعاد بصمت في الفتحة
-      // التالية للشاشة — الكاش المحلي القديم يبقى صالحاً للاستخدام حتى ذلك
-      // الحين (كأي كاش أونلاين آخر بالتطبيق).
-    }
   }
 
   /// نقطة 5: يُسأل المالك مرة كل دخول أونلاين (طالما لم يرفع بعد) عن رفع

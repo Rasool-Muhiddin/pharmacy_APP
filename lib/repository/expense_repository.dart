@@ -89,6 +89,7 @@ class ExpenseRepository {
       return _localRowById(id);
     }
 
+    _assertServerRecord(id);
     await _assertOnlineWritable();
 
     final updated = await _api.updateExpense(id, _toApiPayload(data));
@@ -109,12 +110,21 @@ class ExpenseRepository {
       return;
     }
 
+    _assertServerRecord(id);
     await _assertOnlineWritable();
 
     // نحذف من السيرفر أولاً، ثم من الكاش المحلي فقط بعد نجاح ذلك — بنفس
     // منطق MedicineRepository.deleteMedicine تماماً.
     await _api.deleteExpense(id);
     await _db.deleteExpense(id, pharmacyId);
+  }
+
+  void _assertServerRecord(int id) {
+    if (DatabaseHelper.isLocalId(id)) {
+      throw const ExpenseRepositoryException(
+        'هذا المصروف محلي (أوفلاين) ولم يُرفع إلى الخادم بعد، فلا يمكن تعديله في وضع الأونلاين.',
+      );
+    }
   }
 
   Future<void> _assertOnlineWritable() async {

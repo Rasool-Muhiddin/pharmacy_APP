@@ -152,7 +152,7 @@ Future<void> _loadReportDataOffline() async {
         COUNT(id) AS total_count,
         COALESCE(SUM(discount), 0) AS total_discounts
       FROM invoice
-      WHERE pharmacy_id = ? 
+      WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()}
         AND is_refunded = 0 
         AND date(created_at) >= date(?) AND date(created_at) <= date(?)
     ''', [widget.pharmacyId, startStr, endStr]);
@@ -162,10 +162,10 @@ Future<void> _loadReportDataOffline() async {
     final totalDiscounts = (salesSummary.first['total_discounts'] as num).toDouble();
     final expensesSummary = await db.rawQuery('''
       SELECT COALESCE(SUM(amount), 0) AS total FROM expense
-      WHERE pharmacy_id = ? AND date(expense_date) BETWEEN date(?) AND date(?)
+      WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()} AND date(expense_date) BETWEEN date(?) AND date(?)
     ''', [widget.pharmacyId, startStr, endStr]);
     final refundedSummary = await db.rawQuery('''
-      SELECT COUNT(id) AS total FROM invoice WHERE pharmacy_id = ? AND is_refunded = 1
+      SELECT COUNT(id) AS total FROM invoice WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()} AND is_refunded = 1
       AND date(created_at) BETWEEN date(?) AND date(?)
     ''', [widget.pharmacyId, startStr, endStr]);
     final supplierDebtSummary = await db.rawQuery('''
@@ -182,7 +182,7 @@ Future<void> _loadReportDataOffline() async {
     final expiredQuery = await db.rawQuery('''
       SELECT COALESCE(SUM(quantity * buy_price), 0) AS expired_losses
       FROM medicine
-      WHERE pharmacy_id = ? 
+      WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()}
         AND is_damaged = 0 
         AND quantity > 0 
         AND date(expiry_date) >= date(?) AND date(expiry_date) <= date(?)
@@ -196,7 +196,7 @@ Future<void> _loadReportDataOffline() async {
       SELECT COALESCE(SUM(dm.quantity_damaged * m.buy_price), 0) AS damaged_losses
       FROM damaged_medicine dm
       JOIN medicine m ON dm.medicine_id = m.id
-      WHERE dm.pharmacy_id = ?
+      WHERE dm.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('dm.')}
         AND dm.reason != 'correction'
         AND date(dm.damaged_at) >= date(?) AND date(dm.damaged_at) <= date(?)
     ''', [widget.pharmacyId, startStr, endStr]);
@@ -214,7 +214,7 @@ Future<void> _loadReportDataOffline() async {
       FROM invoice_item ii
       JOIN invoice i ON ii.invoice_id = i.id
       JOIN medicine m ON ii.medicine_id = m.id
-      WHERE i.pharmacy_id = ? 
+      WHERE i.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('i.')}
         AND i.is_refunded = 0
         AND date(i.created_at) >= date(?) AND date(i.created_at) <= date(?)
       GROUP BY ii.medicine_id
@@ -231,7 +231,7 @@ Future<void> _loadReportDataOffline() async {
         m.quantity,
         m.category
       FROM medicine m
-      WHERE m.pharmacy_id = ? 
+      WHERE m.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('m.')}
         AND m.is_damaged = 0 
         AND m.quantity > 0
         AND m.id NOT IN (
@@ -249,7 +249,7 @@ Future<void> _loadReportDataOffline() async {
     final invoicesList = await db.rawQuery('''
       SELECT id, invoice_number, created_at, total_amount, discount, final_amount
       FROM invoice
-      WHERE pharmacy_id = ? 
+      WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()}
         AND is_refunded = 0 
         AND date(created_at) >= date(?) AND date(created_at) <= date(?)
       ORDER BY created_at DESC
@@ -337,7 +337,7 @@ Future<void> _loadReportDataOffline() async {
     FROM invoice i
     LEFT JOIN user_profile up ON i.cashier_id = up.id
     LEFT JOIN users u ON up.user_id = u.id
-    WHERE i.pharmacy_id = ? 
+    WHERE i.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('i.')}
       AND COALESCE(i.is_refunded, 0) = 0 
       AND date(i.created_at) >= date(?) 
       AND date(i.created_at) <= date(?)
@@ -350,7 +350,7 @@ Future<void> _loadReportDataOffline() async {
     FROM invoice i
     LEFT JOIN user_profile up ON i.cashier_id = up.id
     LEFT JOIN users u ON up.user_id = u.id
-    WHERE i.pharmacy_id = ? 
+    WHERE i.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('i.')}
       AND COALESCE(i.is_refunded, 0) = 0 
       AND date(i.created_at) >= date(?) 
       AND date(i.created_at) <= date(?)

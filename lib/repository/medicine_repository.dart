@@ -2,6 +2,7 @@ import '../database/db_helper.dart';
 import '../services/connectivity_service.dart';
 import '../services/damaged_api_service.dart';
 import '../services/medicine_api_service.dart';
+import 'warehouse_repository.dart';
 
 class MedicineRepositoryException implements Exception {
   final String message;
@@ -45,6 +46,8 @@ class MedicineRepository {
       return _db.getMedicines(pharmacyId);
     }
 
+    // المخازن أولاً: كل صف دواء يشير لمخزنه بقيد FOREIGN KEY.
+    await WarehouseRepository.instance.syncFromServer(pharmacyId);
     final serverItems = await _api.fetchMedicines();
     await _db.replaceMedicinesCache(
       pharmacyId: pharmacyId,
@@ -63,6 +66,7 @@ class MedicineRepository {
       return _localRowById(id);
     }
 
+    _assertServerRecord(data['warehouse_id']);
     await _assertOnlineWritable();
 
     final created = await _api.createMedicine(_toApiPayload(data));
@@ -84,6 +88,7 @@ class MedicineRepository {
       return _localRowById(id);
     }
 
+    _assertServerRecord(id);
     await _assertOnlineWritable();
 
     final updated = await _api.updateMedicine(id, _toApiPayload(data));
@@ -118,6 +123,7 @@ class MedicineRepository {
       return _localRowById(medicineId);
     }
 
+    _assertServerRecord(medicineId);
     await _assertOnlineWritable();
 
     final current = await _localRowById(medicineId);
@@ -162,6 +168,7 @@ class MedicineRepository {
       return _localRowById(medicineId);
     }
 
+    _assertServerRecord(medicineId);
     await _assertOnlineWritable();
 
     final created = await _damagedApi.createDamagedMedicine({
@@ -196,6 +203,8 @@ class MedicineRepository {
   Map<String, dynamic> _localCacheRowRaw(Map<String, dynamic> row) {
     return {
       'id': row['id'],
+      // بدونه يُعاد الصنف في الكاش إلى المخزن الرئيسي (القيمة الاحتياطية).
+      'warehouse': row['warehouse_id'],
       'trade_name': row['trade_name'],
       'scientific_name': row['scientific_name'],
       'category': row['category'],
@@ -218,6 +227,7 @@ class MedicineRepository {
       return;
     }
 
+    _assertServerRecord(id);
     await _assertOnlineWritable();
 
     // نحذف من السيرفر أولاً، ثم من الكاش المحلي فقط بعد نجاح ذلك — لو فشل
@@ -225,6 +235,17 @@ class MedicineRepository {
     // المحلي متطابقاً مع الحقيقة الفعلية على السيرفر.
     await _api.deleteMedicine(id);
     await _db.deleteMedicine(id);
+  }
+
+  /// وضع الأونلاين يعمل على صفوف الخادم فقط. صف محلي (أوفلاين، معرّف >=
+  /// localIdBase) لا وجود له على الخادم، فإرسال معرّفه قد يعدّل سجلاً آخر
+  /// بالخطأ أو يفشل — يُرفض هنا برسالة واضحة بدلاً من ذلك.
+  void _assertServerRecord(Object? id) {
+    if (id is int && DatabaseHelper.isLocalId(id)) {
+      throw const MedicineRepositoryException(
+        'هذا السجل محلي (أوفلاين) ولم يُرفع إلى الخادم بعد، فلا يمكن تعديله في وضع الأونلاين.',
+      );
+    }
   }
 
   Future<void> _assertOnlineWritable() async {
@@ -248,11 +269,17 @@ class MedicineRepository {
   /// يستبعد الحقول المحلية البحتة (pharmacy_id, id, last_synced_at) قبل
   /// الإرسال للسيرفر — السيرفر يحدد pharmacy تلقائياً من صاحب التوكن
   /// (انظر MedicineViewSet.perform_create)، ولا يقبل id عند الإنشاء أصلاً.
+  /// warehouse_id المحلي يُرسل باسم حقل الخادم "warehouse" (معرّف الخادم نفسه
+  /// لأن قائمة المخازن أونلاين تأتي من كاش الخادم).
   Map<String, dynamic> _toApiPayload(Map<String, dynamic> data) {
     final payload = Map<String, dynamic>.from(data);
     payload.remove('id');
     payload.remove('pharmacy_id');
     payload.remove('last_synced_at');
+    final warehouseId = payload.remove('warehouse_id');
+    if (warehouseId != null) {
+      payload['warehouse'] = warehouseId;
+    }
     return payload;
   }
 }

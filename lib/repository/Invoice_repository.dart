@@ -77,6 +77,9 @@ class InvoiceRepository {
       return invoice;
     }
 
+    for (final item in items) {
+      _assertServerRecord(item['medicine_id']);
+    }
     await _assertOnlineWritable();
 
     final discount = (invoice['discount'] as num).toDouble();
@@ -112,6 +115,7 @@ class InvoiceRepository {
       return;
     }
 
+    _assertServerRecord(invoiceId);
     await _assertOnlineWritable();
 
     final updated = await _api.refundInvoice(invoiceId);
@@ -121,6 +125,16 @@ class InvoiceRepository {
       pharmacyId: pharmacyId,
       isOnlineMode: true,
     );
+  }
+
+  /// نفس حماية MedicineRepository._assertServerRecord: لا معرّفات محلية في
+  /// طلبات الخادم.
+  void _assertServerRecord(Object? id) {
+    if (id is int && DatabaseHelper.isLocalId(id)) {
+      throw const InvoiceRepositoryException(
+        'هذا السجل محلي (أوفلاين) ولم يُرفع إلى الخادم بعد، فلا يمكن استخدامه في وضع الأونلاين.',
+      );
+    }
   }
 
   Future<void> _assertOnlineWritable() async {

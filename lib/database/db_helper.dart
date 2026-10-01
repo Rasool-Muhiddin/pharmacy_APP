@@ -3,6 +3,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'dart:convert';
 import 'dart:io'; 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart' show rootBundle;
 
 class DatabaseHelper {
@@ -13,6 +14,78 @@ class DatabaseHelper {
   static Database? _database;
   static const String _dbName = "pharmacy.db";
 
+  //====================================================
+  // استراتيجية المعرّفات (منع تصادم بيانات الأوفلاين مع كاش الخادم)
+  //
+  // الجداول التي تستقبل صفوفاً من الخادم (medicine, invoice, expense,
+  // damaged_medicine, warehouses) تحتوي نوعين من الصفوف في نفس الجدول:
+  //  - صفوف كاش الخادم: معرّفها = معرّف الخادم نفسه، ودائماً < [localIdBase].
+  //  - صفوف محلية (أُنشئت أوفلاين): معرّفها >= [localIdBase]، يولّده عدّاد
+  //    AUTOINCREMENT المحلي المضبوط على هذا النطاق (_ensureLocalIdSequences).
+  // النطاقان منفصلان تماماً، فلا يمكن لأي مزامنة أو تسجيل دخول أن يكتب صف
+  // خادم فوق صف محلي أو العكس، مهما كانت المعرّفات. أي معرّف خادم >= هذا
+  // الحد يُرفض صراحة (_serverId) بدل المخاطرة بالكتابة فوق بيانات محلية.
+  //
+  // القراءة مقيّدة بالمصدر حسب وضع الجلسة ([setSessionMode]): الأونلاين يعرض
+  // صفوف الخادم فقط، والأوفلاين يعرض الصفوف المحلية فقط — كي لا تظهر نسخة
+  // الأوفلاين المحفوظة بعد الرفع الأولي كتكرار بجانب نسختها على الخادم.
+  //====================================================
+
+  /// بداية نطاق المعرّفات المحلية (10^12). معرّفات الخادم (BigAutoField)
+  /// لن تصل إليه عملياً، وأي معرّف خادم يتجاوزه يُرفض.
+  static const int localIdBase = 1000000000000;
+
+  /// الجداول التي تتشارك صفوفاً محلية وصفوف كاش خادم.
+  static const List<String> sharedOriginTables = [
+    'warehouses',
+    'medicine',
+    'invoice',
+    'expense',
+    'damaged_medicine',
+  ];
+
+  static bool isLocalId(int id) => id >= localIdBase;
+
+  bool _sessionIsOnline = false;
+
+  /// يُضبط عند فتح الواجهة الرئيسية لجلسة الدخول (MainLayout) بحسب
+  /// license.mode، ويحدد أي الصفوف تقرؤها دوال العرض.
+  void setSessionMode({required bool isOnline}) => _sessionIsOnline = isOnline;
+
+  bool get sessionIsOnline => _sessionIsOnline;
+
+  /// شرط SQL يقيّد الصفوف بمصدر الجلسة الحالية. [alias] اسم مستعار للجدول
+  /// إن وُجد (مثلاً 'i.').
+  String originFilter([String alias = '']) => _sessionIsOnline
+      ? '${alias}id < $localIdBase'
+      : '${alias}id >= $localIdBase';
+
+  /// شرط SQL للصفوف المحلية فقط (أوفلاين)، بغض النظر عن وضع الجلسة — للرفع
+  /// الأولي وفحص وجود بيانات أوفلاين.
+  static String localOnly([String alias = '']) => '${alias}id >= $localIdBase';
+
+  /// يتحقق أن معرّفاً قادماً من الخادم يقع في نطاق الخادم.
+  static int _serverId(dynamic value) {
+    final id = (value as num).toInt();
+    if (id <= 0 || id >= localIdBase) {
+      throw StateError('معرّف خادم غير صالح ($id) — رُفضت المزامنة حمايةً للبيانات المحلية.');
+    }
+    return id;
+  }
+
+  /// للاختبارات فقط: مسار قاعدة بيانات بديل بدل مجلد التطبيق (path_provider
+  /// غير متاح في `flutter test`).
+  @visibleForTesting
+  static String? databasePathOverride;
+
+  /// للاختبارات فقط: يغلق الاتصال الحالي كي يُعاد فتح القاعدة (وتشغيل
+  /// onUpgrade) في الاستدعاء التالي.
+  @visibleForTesting
+  static Future<void> resetForTesting() async {
+    await _database?.close();
+    _database = null;
+  }
+
   Future<Database> get database async {
     if (_database != null) return _database!;
     _database = await _initDatabase();
@@ -21,22 +94,42 @@ class DatabaseHelper {
   }
 
 Future<Database> _initDatabase() async {
-  final directory = await getApplicationSupportDirectory();
+  String path;
+  final overridePath = databasePathOverride;
+  if (overridePath != null) {
+    path = overridePath;
+  } else {
+    final directory = await getApplicationSupportDirectory();
 
-  if (!await Directory(directory.path).exists()) {
-    await Directory(directory.path).create(recursive: true);
+    if (!await Directory(directory.path).exists()) {
+      await Directory(directory.path).create(recursive: true);
+    }
+
+    path = join(directory.path, _dbName);
   }
-
-  final path = join(directory.path, _dbName);
 
   return openDatabase(
     path,
-    version: 7,
+    version: 9,
     onConfigure: (db) async {
-      await db.execute('PRAGMA foreign_keys = ON');
+      // ترقيات v7 و v9 تعيد بناء جداول (medicine/invoice: DROP + RENAME) وتنقل
+      // معرّفات صفوف تشير إليها جداول أخرى. PRAGMA foreign_keys لا يمكن تغييره
+      // داخل معاملة onUpgrade، لذا يبقى معطّلاً من هنا حتى تكتمل الترقية،
+      // ويُفعَّل في onOpen. بدون ذلك تفشل الترقية ("FOREIGN KEY constraint
+      // failed" عند COMMIT) على أي جهاز فيه مبيعات أو تالف.
+      final currentVersion = await db.getVersion();
+      final needsTableRebuild = currentVersion > 0 && currentVersion < 9;
+      if (!needsTableRebuild) {
+        await db.execute('PRAGMA foreign_keys = ON');
+      }
     },
     onCreate: _onCreate,
     onUpgrade: _onUpgrade,
+    onOpen: (db) async {
+      await db.execute('PRAGMA foreign_keys = ON');
+      // احتياط: يضمن أن أي صف محلي جديد يُعطى معرّفاً في النطاق المحلي.
+      await _ensureLocalIdSequences(db);
+    },
   );
 }
   
@@ -75,8 +168,10 @@ Future<void> _onCreate(Database db, int version) async {
     )
   ''');
 
-  // 3ب. جدول المخازن (خاصية الباقة الذهبية: حتى مخزنين لكل صيدلية، الأول
-  // هو دائماً is_main = 1 ويُستخدم حصراً في عملية البيع - راجع نقطة 13 أدناه)
+  // 3ب. جدول المخازن (خاصية الباقة الذهبية: عدة مخازن لكل صيدلية حتى
+  // SubscriptionEntitlements.maxWarehouses، الرئيسي is_main = 1 ويُستخدم حصراً
+  // في عملية البيع). last_synced_at: NULL = مخزن محلي (أوفلاين)، غير NULL =
+  // صف كاش قادم من الخادم (أونلاين) بمعرّف الخادم نفسه.
   await db.execute('''
     CREATE TABLE warehouses(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,13 +179,14 @@ Future<void> _onCreate(Database db, int version) async {
       name TEXT NOT NULL,
       is_main INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
+      last_synced_at TEXT,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id)
     )
   ''');
 
   // 4. جدول الأدوية
   // ⚠️ barcode لم يعد UNIQUE على مستوى الجدول كله (كان يمنع وجود نفس
-  // الصنف بمخزنين منفصلين أو بصيدليتين مرتبطتين). التفرّد الآن ضمن نفس
+  // الصنف بمخزنين منفصلين لنفس الصيدلية). التفرّد الآن ضمن نفس
   // المخزن فقط، عبر idx_medicine_warehouse_barcode أدناه (فهرس جزئي
   // يتجاهل القيم الفارغة/الفارغة النصية حتى لا يمنع تعدد الأدوية بلا باركود).
   await db.execute('''
@@ -127,23 +223,7 @@ Future<void> _onCreate(Database db, int version) async {
   ''');
 
   // 6. جدول الفواتير (الرئيسي للمبيعات)
-  await db.execute('''
-    CREATE TABLE invoice(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pharmacy_id INTEGER NOT NULL,
-      invoice_number TEXT NOT NULL UNIQUE,
-      cashier_id INTEGER,
-      cashier_name_synced TEXT,
-      total_amount REAL NOT NULL DEFAULT 0,
-      discount REAL NOT NULL DEFAULT 0,
-      final_amount REAL NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      is_refunded INTEGER NOT NULL DEFAULT 0,
-      last_synced_at TEXT,
-      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
-      FOREIGN KEY(cashier_id) REFERENCES user_profile(id)
-    )
-  ''');
+  await _createInvoiceTable(db, 'invoice');
 
   // 7. جدول تفاصيل الفاتورة (العناصر المباعة)
   await db.execute('''
@@ -246,41 +326,8 @@ Future<void> _onCreate(Database db, int version) async {
     )
   ''');
 
-  // 13. جدول ربط الصيدليات (خاصية الباقة الذهبية: نقل مخزون فقط، بلا أي
-  // مزامنة بيانات أخرى). الربط قرار إداري مركزي يُنشأ من لوحة أدمن Django
-  // فقط، لا من التطبيق — هذا الجدول كاش قراءة فقط يُملأ عبر
-  // replacePharmacyLinksCache() بعد جلب القائمة من السيرفر. العلاقة غير
-  // موجّهة، لكن تُخزَّن دائماً بترتيب ثابت (الأصغر ثم الأكبر) حتى يمنع
-  // القيد UNIQUE تكرار نفس الرابط بترتيب معكوس.
-  await db.execute('''
-    CREATE TABLE pharmacy_links(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pharmacy_id_a INTEGER NOT NULL,
-      pharmacy_id_b INTEGER NOT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY(pharmacy_id_a) REFERENCES pharmacy_branch(id),
-      FOREIGN KEY(pharmacy_id_b) REFERENCES pharmacy_branch(id),
-      UNIQUE(pharmacy_id_a, pharmacy_id_b)
-    )
-  ''');
-
-  // 14. سجل عمليات نقل المخزون (بين مخزنين لنفس الصيدلية، أو بين مخزنين
-  // لصيدليتين مرتبطتين). لا يُخزَّن medicine_id مباشرة لأن الصنف قد "ينتقل"
-  // كصف مستقل بمعرّف جديد في المخزن الهدف - راجع transferStock() أدناه.
-  await db.execute('''
-    CREATE TABLE stock_transfers(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      from_warehouse_id INTEGER NOT NULL,
-      to_warehouse_id INTEGER NOT NULL,
-      trade_name TEXT NOT NULL,
-      barcode TEXT,
-      quantity INTEGER NOT NULL CHECK(quantity > 0),
-      transferred_at TEXT NOT NULL,
-      notes TEXT,
-      FOREIGN KEY(from_warehouse_id) REFERENCES warehouses(id),
-      FOREIGN KEY(to_warehouse_id) REFERENCES warehouses(id)
-    )
-  ''');
+  // 13. سجل عمليات نقل المخزون بين مخازن نفس الصيدلية.
+  await _createStockTransfersTable(db);
 
   // إنشاء الفهارس (Indexes) لتسريع عمليات البحث في قاعدة البيانات
   await db.execute('CREATE INDEX idx_barcode ON medicine(barcode);');
@@ -293,12 +340,9 @@ Future<void> _onCreate(Database db, int version) async {
     WHERE barcode IS NOT NULL AND barcode != ''
   ''');
   await db.execute('CREATE INDEX idx_warehouses_pharmacy ON warehouses(pharmacy_id);');
-  await db.execute('CREATE INDEX idx_stock_transfers_from ON stock_transfers(from_warehouse_id);');
-  await db.execute('CREATE INDEX idx_stock_transfers_to ON stock_transfers(to_warehouse_id);');
   await db.execute('CREATE INDEX idx_trade_name ON medicine(trade_name);');
   await db.execute('CREATE INDEX idx_scientific_name ON medicine(scientific_name);');
-  await db.execute('CREATE INDEX idx_invoice_number ON invoice(invoice_number);');
-  await db.execute('CREATE INDEX idx_invoice_date ON invoice(created_at);');
+  await _createInvoiceIndexes(db);
   await db.execute('CREATE INDEX idx_purchase_invoice_supplier ON purchase_invoice(supplier_id);');
   await db.execute('CREATE INDEX idx_supplier_payment_supplier ON supplier_payment(supplier_id);');
   await db.execute('CREATE INDEX idx_supplier_payment_invoice ON supplier_payment(purchase_invoice_id);');
@@ -310,6 +354,64 @@ Future<void> _onCreate(Database db, int version) async {
 
   // 🚀 تعبئة القاموس تلقائياً بالـ 1000 دواء من ملف الـ JSON
   await _seedMasterMedicines(db);
+
+  await _ensureLocalIdSequences(db);
+}
+
+/// جدول الفواتير. invoice_number لم يعد UNIQUE على مستوى الجدول كله: فاتورة
+/// أوفلاين محلية وفاتورة خادم قد تحملان نفس الرقم (مثلاً INV-000001) بعد
+/// الرفع الأولي أو على أجهزة مختلفة، وكان القيد يُسقط فاتورة الخادم بصمت
+/// (INSERT OR IGNORE) ثم يُفشل مزامنة أصنافها. الفرادة الآن ضمن نفس المصدر
+/// فقط (راجع _createInvoiceIndexes).
+Future<void> _createInvoiceTable(DatabaseExecutor db, String name) async {
+  await db.execute('''
+    CREATE TABLE $name(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      invoice_number TEXT NOT NULL,
+      cashier_id INTEGER,
+      cashier_name_synced TEXT,
+      total_amount REAL NOT NULL DEFAULT 0,
+      discount REAL NOT NULL DEFAULT 0,
+      final_amount REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      is_refunded INTEGER NOT NULL DEFAULT 0,
+      last_synced_at TEXT,
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(cashier_id) REFERENCES user_profile(id)
+    )
+  ''');
+}
+
+Future<void> _createInvoiceIndexes(DatabaseExecutor db) async {
+  await db.execute('CREATE INDEX idx_invoice_number ON invoice(invoice_number);');
+  await db.execute('CREATE INDEX idx_invoice_date ON invoice(created_at);');
+  await db.execute('''
+    CREATE UNIQUE INDEX idx_invoice_number_local
+    ON invoice(pharmacy_id, invoice_number) WHERE id >= $localIdBase
+  ''');
+  await db.execute('''
+    CREATE UNIQUE INDEX idx_invoice_number_server
+    ON invoice(pharmacy_id, invoice_number) WHERE id < $localIdBase
+  ''');
+}
+
+/// يضبط عدّاد AUTOINCREMENT لكل جدول مشترك بحيث يكون أي معرّف محلي جديد
+/// >= [localIdBase]. إدراج صف خادم بمعرّفه الصريح (أصغر) لا يُنقص العدّاد،
+/// فيبقى النطاقان منفصلين دائماً. آمن للاستدعاء المتكرر.
+Future<void> _ensureLocalIdSequences(DatabaseExecutor db) async {
+  for (final table in sharedOriginTables) {
+    final updated = await db.rawUpdate(
+      'UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?',
+      [localIdBase - 1, table, localIdBase - 1],
+    );
+    if (updated == 0) {
+      final exists = await db.rawQuery('SELECT 1 FROM sqlite_sequence WHERE name = ?', [table]);
+      if (exists.isEmpty) {
+        await db.rawInsert('INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)', [table, localIdBase - 1]);
+      }
+    }
+  }
 }
 
 // نقطة بداية نظيفة (Version 1) - أول نسخة توصل فعلياً لأي عميل.
@@ -379,8 +481,8 @@ Future<void> _onUpgrade(
   }
 
   if (oldVersion < 7) {
-    // خاصية الباقة الذهبية: تعدد المخازن + ربط الصيدليات (راجع
-    // subscription_plan.dart: AppFeature.multiWarehouse / pharmacyLinking).
+    // خاصية الباقة الذهبية: تعدد المخازن (راجع
+    // subscription_plan.dart: AppFeature.multiWarehouse).
 
     // أ) جدول المخازن، وإنشاء "المخزن الرئيسي" تلقائياً لكل صيدلية موجودة
     // مسبقاً حتى لا تفقد بياناتها الحالية أي مرجعية مخزن.
@@ -402,43 +504,18 @@ Future<void> _onUpgrade(
       SELECT id, 'المخزن الرئيسي', 1, ? FROM pharmacy_branch
     ''', [nowIso]);
 
-    // ب) جدول ربط الصيدليات وجدول سجل عمليات النقل.
-    await db.execute('''
-      CREATE TABLE pharmacy_links(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        pharmacy_id_a INTEGER NOT NULL,
-        pharmacy_id_b INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(pharmacy_id_a) REFERENCES pharmacy_branch(id),
-        FOREIGN KEY(pharmacy_id_b) REFERENCES pharmacy_branch(id),
-        UNIQUE(pharmacy_id_a, pharmacy_id_b)
-      )
-    ''');
-    await db.execute('''
-      CREATE TABLE stock_transfers(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        from_warehouse_id INTEGER NOT NULL,
-        to_warehouse_id INTEGER NOT NULL,
-        trade_name TEXT NOT NULL,
-        barcode TEXT,
-        quantity INTEGER NOT NULL CHECK(quantity > 0),
-        transferred_at TEXT NOT NULL,
-        notes TEXT,
-        FOREIGN KEY(from_warehouse_id) REFERENCES warehouses(id),
-        FOREIGN KEY(to_warehouse_id) REFERENCES warehouses(id)
-      )
-    ''');
-    await db.execute('CREATE INDEX idx_stock_transfers_from ON stock_transfers(from_warehouse_id);');
-    await db.execute('CREATE INDEX idx_stock_transfers_to ON stock_transfers(to_warehouse_id);');
+    // ب) (جدولا ربط الصيدليات وسجل النقل يُنشآن/يُزالان في خطوة v8 أدناه.)
 
     // ج) إعادة بناء جدول medicine بالكامل: إضافة warehouse_id (وربط كل
     // صف حالي بالمخزن الرئيسي لنفس صيدليته)، وإزالة قيد UNIQUE عن barcode
-    // على مستوى الجدول كله (كان يمنع تكرار نفس الباركود بين مخزنين أو
-    // صيدليتين). SQLite لا يدعم تعديل/حذف قيد عمود مباشرة، فلازم إعادة
-    // بناء الجدول. يُعطَّل foreign_keys مؤقتاً لأن invoice_item و
-    // damaged_medicine يشيران لـ medicine.id بقيد بلا ON DELETE CASCADE،
-    // وسيفشل DROP TABLE أثناء إعادة البناء لو بقي القيد مفعّلاً.
-    await db.execute('PRAGMA foreign_keys = OFF;');
+    // على مستوى الجدول كله (كان يمنع تكرار نفس الباركود بين مخزنين).
+    // SQLite لا يدعم تعديل/حذف قيد عمود مباشرة، فلازم إعادة بناء الجدول.
+    //
+    // ⚠️ invoice_item/damaged_medicine تشير لـ medicine.id، فيفشل DROP TABLE
+    // لو كانت قيود FOREIGN KEY مفعّلة. "PRAGMA foreign_keys = OFF" يُتجاهَل
+    // بصمت داخل معاملة onUpgrade، لذلك يُترك معطّلاً من onConfigure لهذه
+    // الترقية تحديداً ويُعاد تفعيله في onOpen (راجع _initDatabase). المعرّفات
+    // تُنسخ كما هي، فتبقى كل المراجع صحيحة بعد إعادة التسمية.
 
     await db.execute('''
       CREATE TABLE medicine_new(
@@ -487,9 +564,138 @@ Future<void> _onUpgrade(
       ON medicine(warehouse_id, barcode)
       WHERE barcode IS NOT NULL AND barcode != ''
     ''');
-
-    await db.execute('PRAGMA foreign_keys = ON;');
   }
+
+  if (oldVersion < 8) {
+    // أ) إزالة خاصية ربط الصيدليات بالكامل.
+    await db.execute('DROP TABLE IF EXISTS pharmacy_links;');
+
+    // ب) تمييز كاش المخازن القادم من الخادم (أونلاين) عن المخازن المحلية.
+    await db.execute('ALTER TABLE warehouses ADD COLUMN last_synced_at TEXT;');
+
+    // ج) سجل النقل بالشكل الجديد: pharmacy_id + أسماء المخازن محفوظة نصاً
+    // والمراجع ON DELETE SET NULL، حتى لا يمنع السجلُّ حذفَ مخزن إضافي
+    // فارغ. تُنقل السجلات القديمة (v7) إن وُجدت.
+    final hasOldTransfers = (await db.rawQuery(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stock_transfers'",
+    )).isNotEmpty;
+    if (hasOldTransfers) {
+      await db.execute('ALTER TABLE stock_transfers RENAME TO stock_transfers_v7;');
+      await db.execute('DROP INDEX IF EXISTS idx_stock_transfers_from;');
+      await db.execute('DROP INDEX IF EXISTS idx_stock_transfers_to;');
+    }
+    await _createStockTransfersTable(db);
+    if (hasOldTransfers) {
+      await db.rawInsert('''
+        INSERT INTO stock_transfers (
+          id, pharmacy_id, from_warehouse_id, to_warehouse_id,
+          from_warehouse_name, to_warehouse_name, trade_name, barcode,
+          quantity, transferred_at, notes
+        )
+        SELECT
+          st.id, wf.pharmacy_id, st.from_warehouse_id, st.to_warehouse_id,
+          COALESCE(wf.name, ''), COALESCE(wt.name, ''), st.trade_name, st.barcode,
+          st.quantity, st.transferred_at, st.notes
+        FROM stock_transfers_v7 st
+        JOIN warehouses wf ON wf.id = st.from_warehouse_id
+        LEFT JOIN warehouses wt ON wt.id = st.to_warehouse_id
+        -- سجل نقل قديم بين صيدليتين (خاصية الربط المُزالة) يُنسب لصيدلية
+        -- مخزن المصدر.
+      ''');
+      await db.execute('DROP TABLE stock_transfers_v7;');
+    }
+  }
+
+  if (oldVersion < 9) {
+    await _upgradeToSeparateIdRanges(db);
+  }
+}
+
+/// v9: فصل نطاق معرّفات الصفوف المحلية عن معرّفات الخادم (راجع localIdBase).
+///
+/// كل صف محلي (أوفلاين) قائم بمعرّف < localIdBase يُنقل إلى (معرّفه +
+/// localIdBase) — تحويل حتمي بلا تصادم لأن المعرّفات الأصلية فريدة — ومعه كل
+/// المراجع إليه. "محلي" يُحدَّد هكذا:
+///  - warehouses / medicine / invoice / expense: last_synced_at IS NULL
+///    (صفوف الكاش يكتبها الخادم دائماً بقيمة غير NULL).
+///  - damaged_medicine: لا يملك last_synced_at؛ سجل التالف محلي إن لم يكن
+///    دواؤه صف كاش خادم (سجلات كاش الخادم تشير دائماً لأدوية الخادم).
+/// قيود FOREIGN KEY معطّلة طوال الترقية (onConfigure)، فترتيب التحديثات لا
+/// يهم، والمراجع تبقى صحيحة في النهاية (يتحقق منها الاختبار بـforeign_key_check).
+/// ثم يُعاد بناء جدول invoice لإزالة UNIQUE عن invoice_number.
+Future<void> _upgradeToSeparateIdRanges(DatabaseExecutor db) async {
+  const b = localIdBase;
+
+  // 1) سجلات التالف المحلية (قبل نقل معرّفات الأدوية التي يعتمد عليها التحديد).
+  await db.execute('''
+    UPDATE damaged_medicine SET id = id + $b
+    WHERE id < $b
+      AND medicine_id NOT IN (SELECT id FROM medicine WHERE last_synced_at IS NOT NULL)
+  ''');
+
+  // 2) المخازن المحلية ومراجعها.
+  const localWarehouses = 'SELECT id FROM warehouses WHERE last_synced_at IS NULL AND id < $b';
+  await db.execute('UPDATE medicine SET warehouse_id = warehouse_id + $b WHERE warehouse_id IN ($localWarehouses)');
+  await db.execute('UPDATE stock_transfers SET from_warehouse_id = from_warehouse_id + $b WHERE from_warehouse_id IN ($localWarehouses)');
+  await db.execute('UPDATE stock_transfers SET to_warehouse_id = to_warehouse_id + $b WHERE to_warehouse_id IN ($localWarehouses)');
+  await db.execute('UPDATE warehouses SET id = id + $b WHERE last_synced_at IS NULL AND id < $b');
+
+  // 3) الأدوية المحلية ومراجعها (أصناف الفواتير وسجلات التالف).
+  const localMedicines = 'SELECT id FROM medicine WHERE last_synced_at IS NULL AND id < $b';
+  await db.execute('UPDATE invoice_item SET medicine_id = medicine_id + $b WHERE medicine_id IN ($localMedicines)');
+  await db.execute('UPDATE damaged_medicine SET medicine_id = medicine_id + $b WHERE medicine_id IN ($localMedicines)');
+  await db.execute('UPDATE medicine SET id = id + $b WHERE last_synced_at IS NULL AND id < $b');
+
+  // 4) الفواتير المحلية وأصنافها.
+  const localInvoices = 'SELECT id FROM invoice WHERE last_synced_at IS NULL AND id < $b';
+  await db.execute('UPDATE invoice_item SET invoice_id = invoice_id + $b WHERE invoice_id IN ($localInvoices)');
+  await db.execute('UPDATE invoice SET id = id + $b WHERE last_synced_at IS NULL AND id < $b');
+
+  // 5) المصروفات المحلية (لا مراجع إليها).
+  await db.execute('UPDATE expense SET id = id + $b WHERE last_synced_at IS NULL AND id < $b');
+
+  // 6) إعادة بناء invoice بلا UNIQUE على invoice_number (بنفس المعرّفات).
+  await _createInvoiceTable(db, 'invoice_v9');
+  await db.execute('''
+    INSERT INTO invoice_v9 (
+      id, pharmacy_id, invoice_number, cashier_id, cashier_name_synced,
+      total_amount, discount, final_amount, created_at, is_refunded, last_synced_at
+    )
+    SELECT
+      id, pharmacy_id, invoice_number, cashier_id, cashier_name_synced,
+      total_amount, discount, final_amount, created_at, is_refunded, last_synced_at
+    FROM invoice
+  ''');
+  await db.execute('DROP TABLE invoice;');
+  await db.execute('ALTER TABLE invoice_v9 RENAME TO invoice;');
+  await _createInvoiceIndexes(db);
+
+  // 7) أي صف محلي جديد من الآن يُعطى معرّفاً في النطاق المحلي.
+  await _ensureLocalIdSequences(db);
+}
+
+/// جدول سجل عمليات نقل المخزون بين مخازن نفس الصيدلية. لا يُخزَّن
+/// medicine_id لأن صف المصدر قد يُحذف بعد النقل الكامل (راجع transferStock).
+Future<void> _createStockTransfersTable(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE stock_transfers(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      from_warehouse_id INTEGER,
+      to_warehouse_id INTEGER,
+      from_warehouse_name TEXT NOT NULL DEFAULT '',
+      to_warehouse_name TEXT NOT NULL DEFAULT '',
+      trade_name TEXT NOT NULL,
+      barcode TEXT,
+      quantity INTEGER NOT NULL CHECK(quantity > 0),
+      transferred_at TEXT NOT NULL,
+      notes TEXT,
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(from_warehouse_id) REFERENCES warehouses(id) ON DELETE SET NULL,
+      FOREIGN KEY(to_warehouse_id) REFERENCES warehouses(id) ON DELETE SET NULL
+    )
+  ''');
+  await db.execute('CREATE INDEX idx_stock_transfers_pharmacy ON stock_transfers(pharmacy_id, transferred_at);');
 }
 
   //==========================================
@@ -547,32 +753,25 @@ Future<int> insertMedicine(Map<String, dynamic> medicine) async {
 }
 
 // جميع أدوية الصيدلية. warehouseId اختياري: مرّره لتقييد النتيجة بمخزن
-// واحد فقط (مثلاً POS يمرر دائماً المخزن الرئيسي - راجع getMainWarehouseMedicines
-// أدناه) - بدونه تُعاد أصناف كل مخازن الصيدلية معاً (لشاشة الجرد العامة).
+// واحد فقط (مثلاً POS يمرر دائماً المخزن الرئيسي - راجع
+// WarehouseRepository.getMainWarehouseId) - بدونه تُعاد أصناف كل مخازن
+// الصيدلية معاً (لشاشة الجرد العامة).
 Future<List<Map<String, dynamic>>> getMedicines(int pharmacyId, {int? warehouseId}) async {
   final db = await database;
   if (warehouseId != null) {
     return await db.query(
       'medicine',
-      where: 'pharmacy_id = ? AND warehouse_id = ?',
+      where: 'pharmacy_id = ? AND warehouse_id = ? AND ${originFilter()}',
       whereArgs: [pharmacyId, warehouseId],
       orderBy: 'trade_name COLLATE NOCASE ASC',
     );
   }
   return await db.query(
     'medicine',
-    where: 'pharmacy_id = ?',
+    where: 'pharmacy_id = ? AND ${originFilter()}',
     whereArgs: [pharmacyId],
     orderBy: 'trade_name COLLATE NOCASE ASC',
   );
-}
-
-/// ⚠️ تُستخدم حصراً من شاشة نقطة البيع (pos_screen.dart): البيع دائماً
-/// من المخزن الرئيسي فقط بحسب طلب الباقة الذهبية، بغض النظر عن عدد
-/// المخازن الأخرى التي قد تملكها الصيدلية.
-Future<List<Map<String, dynamic>>> getMainWarehouseMedicines(int pharmacyId) async {
-  final mainWarehouseId = await ensureMainWarehouse(pharmacyId);
-  return getMedicines(pharmacyId, warehouseId: mainWarehouseId);
 }
 
 // تعديل دواء
@@ -596,168 +795,167 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   }
 
   //====================================================
-  // Warehouses & Pharmacy Linking CRUD (خاصية الباقة الذهبية)
+  // Warehouses CRUD (خاصية الباقة الذهبية: تعدد المخازن)
   //
-  // ⚠️ هذه الدوال كلها أوفلاين-فقط (SQLite محلي)، تماماً كباقي db_helper.
-  // في وضع الأونلاين هذه الشاشات يجب أن تمر بنفس نمط Repository المتبع
-  // لبقية النطاقات (medicine/expense) بدل استدعاء هذه الدوال مباشرة —
-  // لم يُبنَ ذلك الجزء بعد (يحتاج نظيره على السيرفر أولاً).
+  // دوال الكتابة هنا للوضع الأوفلاين (SQLite محلي هو مصدر الحقيقة). في وضع
+  // الأونلاين تمر الشاشات عبر WarehouseRepository التي تكتب على الخادم ثم
+  // تحدّث الكاش هنا عبر replaceWarehousesCache/applyServerTransfer.
+  //
+  // صفوف المخازن نوعان: محلية (معرّف >= localIdBase، أُنشئت أوفلاين) وكاش
+  // خادم (last_synced_at غير NULL، معرّفها هو معرّف الخادم). الوضع الأونلاين
+  // يقرأ الكاش فقط (syncedOnly: true) حتى لا يظهر مخزن رئيسي محلي قديم
+  // بجانب الرئيسي الحقيقي على الخادم.
   //====================================================
 
-  static const int maxWarehousesPerPharmacy = 2;
+  static const String mainWarehouseName = 'المخزن الرئيسي';
 
-  /// يعيد المخزن الرئيسي للصيدلية (ينشئه إن لم يوجد بعد - حالة صيدلية
-  /// جديدة كلياً لم يمر عليها أي إدخال دواء/فاتورة سابقاً).
+  String _warehouseScope(bool syncedOnly) =>
+      syncedOnly ? 'id < $localIdBase' : 'id >= $localIdBase';
+
+  /// يعيد المخزن الرئيسي المحلي للصيدلية (ينشئه إن لم يوجد بعد - حالة
+  /// صيدلية جديدة كلياً لم يمر عليها أي إدخال دواء/فاتورة سابقاً). للوضع
+  /// الأوفلاين فقط؛ الأونلاين يستخدم getMainWarehouseId(syncedOnly: true).
   Future<int> ensureMainWarehouse(int pharmacyId) async {
-    final db = await database;
-    final existing = await db.query(
-      'warehouses',
-      where: 'pharmacy_id = ? AND is_main = 1',
-      whereArgs: [pharmacyId],
-      limit: 1,
-    );
-    if (existing.isNotEmpty) return existing.first['id'] as int;
+    final existing = await getMainWarehouseId(pharmacyId, syncedOnly: false);
+    if (existing != null) return existing;
 
+    final db = await database;
     return await db.insert('warehouses', {
       'pharmacy_id': pharmacyId,
-      'name': 'المخزن الرئيسي',
+      'name': mainWarehouseName,
       'is_main': 1,
       'created_at': DateTime.now().toIso8601String(),
     });
   }
 
-  /// كل مخازن الصيدلية (الرئيسي أولاً).
-  Future<List<Map<String, dynamic>>> getWarehouses(int pharmacyId) async {
+  Future<int?> getMainWarehouseId(int pharmacyId, {required bool syncedOnly}) async {
     final db = await database;
-    return await db.query(
+    final rows = await db.query(
       'warehouses',
-      where: 'pharmacy_id = ?',
+      columns: ['id'],
+      where: 'pharmacy_id = ? AND is_main = 1 AND ${_warehouseScope(syncedOnly)}',
       whereArgs: [pharmacyId],
-      orderBy: 'is_main DESC, id ASC',
+      orderBy: 'id ASC',
+      limit: 1,
     );
+    return rows.isEmpty ? null : rows.first['id'] as int;
   }
 
-  /// إضافة مخزن ثانٍ (خاصية Gold). يرمي StateError إن كانت الصيدلية
-  /// وصلت الحد الأقصى (مخزنين) بالفعل — تحقق من entitlements.allows
-  /// (AppFeature.multiWarehouse) في الواجهة *قبل* استدعاء هذه الدالة؛
-  /// الفحص هنا طبقة حماية إضافية فقط.
-  Future<int> addSecondaryWarehouse({
+  /// مخازن الصيدلية (الرئيسي أولاً) مع إجمالي الكمية وعدد الأصناف في كل منها.
+  Future<List<Map<String, dynamic>>> getWarehouses(int pharmacyId, {bool syncedOnly = false}) async {
+    final db = await database;
+    return await db.rawQuery('''
+      SELECT w.*,
+        COALESCE((SELECT SUM(m.quantity) FROM medicine m WHERE m.warehouse_id = w.id), 0) AS total_quantity,
+        (SELECT COUNT(*) FROM medicine m WHERE m.warehouse_id = w.id AND m.quantity > 0) AS item_count
+      FROM warehouses w
+      WHERE w.pharmacy_id = ? AND w.${_warehouseScope(syncedOnly)}
+      ORDER BY w.is_main DESC, w.id ASC
+    ''', [pharmacyId]);
+  }
+
+  Future<void> _assertUniqueWarehouseName(int pharmacyId, String name, {int? exceptId}) async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT 1 FROM warehouses
+      WHERE pharmacy_id = ? AND id >= $localIdBase
+        AND LOWER(TRIM(name)) = LOWER(TRIM(?)) AND id != ?
+      LIMIT 1
+    ''', [pharmacyId, name, exceptId ?? -1]);
+    if (rows.isNotEmpty) {
+      throw StateError('يوجد مخزن آخر بنفس الاسم.');
+    }
+  }
+
+  /// إضافة مخزن إضافي (أوفلاين). [maxWarehouses] هو الحد الكلي شاملاً
+  /// الرئيسي (SubscriptionEntitlements.maxWarehouses) — نفس الحد الذي يفرضه
+  /// الخادم أونلاين.
+  Future<int> addWarehouse({
     required int pharmacyId,
     required String name,
+    required int maxWarehouses,
   }) async {
-    final db = await database;
-    await ensureMainWarehouse(pharmacyId);
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) throw StateError('اسم المخزن مطلوب.');
 
+    await ensureMainWarehouse(pharmacyId);
+    await _assertUniqueWarehouseName(pharmacyId, trimmed);
+
+    final db = await database;
     final count = Sqflite.firstIntValue(await db.rawQuery(
-      'SELECT COUNT(*) FROM warehouses WHERE pharmacy_id = ?',
+      'SELECT COUNT(*) FROM warehouses WHERE pharmacy_id = ? AND id >= $localIdBase',
       [pharmacyId],
     )) ?? 0;
 
-    if (count >= maxWarehousesPerPharmacy) {
-      throw StateError('الحد الأقصى لعدد المخازن لكل صيدلية هو $maxWarehousesPerPharmacy.');
+    if (count >= maxWarehouses) {
+      throw StateError('وصلت للحد الأقصى لعدد المخازن في باقتك ($maxWarehouses).');
     }
 
     return await db.insert('warehouses', {
       'pharmacy_id': pharmacyId,
-      'name': name,
+      'name': trimmed,
       'is_main': 0,
       'created_at': DateTime.now().toIso8601String(),
     });
   }
 
-  Future<int> renameWarehouse(int warehouseId, String newName) async {
+  Future<void> renameWarehouse(int warehouseId, String newName) async {
+    final trimmed = newName.trim();
+    if (trimmed.isEmpty) throw StateError('اسم المخزن مطلوب.');
     final db = await database;
-    return await db.update(
-      'warehouses',
-      {'name': newName},
-      where: 'id = ?',
-      whereArgs: [warehouseId],
-    );
+    final rows = await db.query('warehouses', where: 'id = ?', whereArgs: [warehouseId], limit: 1);
+    if (rows.isEmpty) throw StateError('المخزن غير موجود.');
+    await _assertUniqueWarehouseName(rows.first['pharmacy_id'] as int, trimmed, exceptId: warehouseId);
+    await db.update('warehouses', {'name': trimmed}, where: 'id = ?', whereArgs: [warehouseId]);
   }
 
-  /// حذف مخزن ثانوي فارغ (لا يحذف المخزن الرئيسي أبداً، ويرفض حذف مخزن
-  /// فيه أصناف كمياتها > 0 حتى لا يُفقَد أثر المخزون بصمت).
-  Future<void> deleteSecondaryWarehouse(int warehouseId) async {
-    final db = await database;
-    final warehouse = await db.query('warehouses', where: 'id = ?', whereArgs: [warehouseId], limit: 1);
-    if (warehouse.isEmpty) return;
-    if ((warehouse.first['is_main'] as int) == 1) {
-      throw StateError('لا يمكن حذف المخزن الرئيسي.');
-    }
-
-    final stockCount = Sqflite.firstIntValue(await db.rawQuery(
-      'SELECT COALESCE(SUM(quantity), 0) FROM medicine WHERE warehouse_id = ?',
-      [warehouseId],
-    )) ?? 0;
-    if (stockCount > 0) {
-      throw StateError('لا يمكن حذف مخزن يحتوي على كمية مخزون. انقل الأصناف أولاً.');
-    }
-
-    await db.delete('warehouses', where: 'id = ?', whereArgs: [warehouseId]);
+  /// صف دواء له سجل مبيعات أو تالف لا يُحذف (قيد FOREIGN KEY بلا CASCADE).
+  Future<bool> _isMedicineReferenced(DatabaseExecutor txn, int medicineId) async {
+    final rows = await txn.rawQuery('''
+      SELECT 1 FROM invoice_item WHERE medicine_id = ?
+      UNION ALL
+      SELECT 1 FROM damaged_medicine WHERE medicine_id = ?
+      LIMIT 1
+    ''', [medicineId, medicineId]);
+    return rows.isNotEmpty;
   }
 
-  //====================================================
-  // Pharmacy Links — كاش قراءة فقط يُزامَن من لوحة تحكم الأدمن (Django)
-  //
-  // ⚠️ تعديل مهم: الربط بين صيدليتين قرار إداري مركزي فقط (يتم من لوحة
-  // الأدمن)، لا يملك صاحب الصيدلية صلاحية إنشائه أو حذفه من داخل التطبيق.
-  // لذلك لا توجد هنا أي دالة linkPharmacies/unlinkPharmacies تُستدعى من
-  // الواجهة — الجدول المحلي pharmacy_links هو كاش قراءة فقط، تماماً بنفس
-  // نمط medicine/expense الأونلاين، يُحدَّث فقط بعد جلب قائمة الروابط من
-  // endpoint على السيرفر (لم يُبنَ بعد على الباك اند — راجع الملاحظة في
-  // نهاية هذا القسم).
-  //====================================================
-
-  /// يستبدل كل روابط هذه الصيدلية بالقائمة القادمة من السيرفر. يُستدعى فقط
-  /// من كود مزامنة (مثلاً عند فتح التطبيق أو الشاشة، أونلاين أو أوفلاين
-  /// على حد سواء طالما هناك اتصال)، أبداً كنتيجة تفاعل مباشر من المستخدم.
-  Future<void> replacePharmacyLinksCache({
-    required int pharmacyId,
-    required List<int> linkedPharmacyIds,
-  }) async {
+  /// حذف مخزن إضافي (أوفلاين). لا يحذف الرئيسي أبداً، ويرفض حذف مخزن فيه
+  /// كمية مخزون > 0 حتى لا يُفقَد أثر المخزون بصمت. الأصناف ذات الكمية صفر
+  /// تُحذف معه إن لم يكن لها سجل مبيعات/تالف (نفس قاعدة الخادم).
+  Future<void> deleteWarehouse(int warehouseId) async {
     final db = await database;
     await db.transaction((txn) async {
-      await txn.delete(
-        'pharmacy_links',
-        where: 'pharmacy_id_a = ? OR pharmacy_id_b = ?',
-        whereArgs: [pharmacyId, pharmacyId],
-      );
-      final nowIso = DateTime.now().toIso8601String();
-      for (final otherId in linkedPharmacyIds) {
-        if (otherId == pharmacyId) continue;
-        final a = pharmacyId < otherId ? pharmacyId : otherId;
-        final b = pharmacyId < otherId ? otherId : pharmacyId;
-        await txn.insert(
-          'pharmacy_links',
-          {'pharmacy_id_a': a, 'pharmacy_id_b': b, 'created_at': nowIso},
-          conflictAlgorithm: ConflictAlgorithm.ignore,
-        );
+      final warehouse = await txn.query('warehouses', where: 'id = ?', whereArgs: [warehouseId], limit: 1);
+      if (warehouse.isEmpty) return;
+      if ((warehouse.first['is_main'] as int) == 1) {
+        throw StateError('لا يمكن حذف المخزن الرئيسي.');
       }
+
+      final medicines = await txn.query('medicine', where: 'warehouse_id = ?', whereArgs: [warehouseId]);
+      if (medicines.any((m) => ((m['quantity'] as num?) ?? 0) > 0)) {
+        throw StateError('لا يمكن حذف مخزن يحتوي على كمية مخزون. انقل الأصناف أولاً.');
+      }
+      for (final medicine in medicines) {
+        if (await _isMedicineReferenced(txn, medicine['id'] as int)) {
+          throw StateError(
+            'لا يمكن حذف المخزن: الصنف ${medicine['trade_name']} فيه له سجل مبيعات أو إتلاف.',
+          );
+        }
+        await txn.delete('medicine', where: 'id = ?', whereArgs: [medicine['id']]);
+      }
+
+      // سجل النقل يبقى (ON DELETE SET NULL + أسماء المخازن محفوظة نصاً).
+      await txn.delete('warehouses', where: 'id = ?', whereArgs: [warehouseId]);
     });
   }
 
-  /// معرّفات كل الصيدليات المرتبطة بهذه الصيدلية.
-  Future<List<int>> getLinkedPharmacyIds(int pharmacyId) async {
-    final db = await database;
-    final rows = await db.rawQuery('''
-      SELECT CASE WHEN pharmacy_id_a = ? THEN pharmacy_id_b ELSE pharmacy_id_a END AS other_id
-      FROM pharmacy_links
-      WHERE pharmacy_id_a = ? OR pharmacy_id_b = ?
-    ''', [pharmacyId, pharmacyId, pharmacyId]);
-    return rows.map((r) => r['other_id'] as int).toList();
-  }
-
-  Future<bool> arePharmaciesLinked(int pharmacyIdA, int pharmacyIdB) async {
-    final linked = await getLinkedPharmacyIds(pharmacyIdA);
-    return linked.contains(pharmacyIdB);
-  }
-
-  /// ينقل كمية من صنف موجود في مخزن مصدر إلى مخزن هدف (لنفس الصيدلية أو
-  /// لصيدلية مرتبطة). يتحقق من الرابط عند اختلاف الصيدلية، ويرفض نقل كمية
-  /// أكبر من الموجودة. إن وُجد بالفعل صنف بنفس الباركود (أو بنفس الاسم إن
-  /// كان بلا باركود) في المخزن الهدف يُزاد رصيده، وإلا يُنشأ صف جديد هناك.
-  /// صف المصدر يُحذف تماماً إن أصبحت كميته صفراً بعد النقل (بدل تركه
-  /// بكمية 0 كصف يتيم).
+  /// ينقل كمية من صنف موجود في مخزن إلى مخزن آخر لنفس الصيدلية (أوفلاين).
+  /// يرفض نقل كمية أكبر من الموجودة. إن وُجد بالفعل صنف بنفس الباركود (أو
+  /// بنفس الاسم إن كان بلا باركود) في المخزن الهدف يُزاد رصيده، وإلا يُنشأ
+  /// صف جديد هناك. صف المصدر يُحذف إن أصبحت كميته صفراً، إلا إن كان له سجل
+  /// مبيعات/تالف فيبقى بكمية صفر (حذفه كان يُفشل النقل كله بقيد FOREIGN KEY).
+  /// نفس منطق WarehouseViewSet.transfer على الخادم تماماً.
   Future<void> transferStock({
     required int sourceMedicineId,
     required int toWarehouseId,
@@ -783,24 +981,15 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         throw StateError('الكمية المطلوب نقلها أكبر من الكمية المتوفرة.');
       }
 
+      final fromWarehouseRows = await txn.query('warehouses', where: 'id = ?', whereArgs: [fromWarehouseId], limit: 1);
       final toWarehouseRows = await txn.query('warehouses', where: 'id = ?', whereArgs: [toWarehouseId], limit: 1);
       if (toWarehouseRows.isEmpty) throw StateError('المخزن الهدف غير موجود.');
-      final destPharmacyId = toWarehouseRows.first['pharmacy_id'] as int;
       final sourcePharmacyId = source['pharmacy_id'] as int;
-
-      if (destPharmacyId != sourcePharmacyId) {
-        final linkRows = await txn.rawQuery('''
-          SELECT 1 FROM pharmacy_links
-          WHERE (pharmacy_id_a = ? AND pharmacy_id_b = ?)
-             OR (pharmacy_id_a = ? AND pharmacy_id_b = ?)
-          LIMIT 1
-        ''', [sourcePharmacyId, destPharmacyId, destPharmacyId, sourcePharmacyId]);
-        if (linkRows.isEmpty) {
-          throw StateError('الصيدليتان غير مرتبطتين ببعض. لا يمكن نقل المخزون بينهما.');
-        }
+      if (toWarehouseRows.first['pharmacy_id'] as int != sourcePharmacyId) {
+        throw StateError('لا يمكن النقل إلا بين مخازن نفس الصيدلية.');
       }
 
-      final barcode = (source['barcode'] as String?) ?? '';
+      final barcode = ((source['barcode'] as String?) ?? '').trim();
       List<Map<String, dynamic>> destMatch;
       if (barcode.isNotEmpty) {
         destMatch = await txn.query(
@@ -812,8 +1001,8 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       } else {
         destMatch = await txn.query(
           'medicine',
-          where: 'warehouse_id = ? AND trade_name = ? AND (barcode IS NULL OR barcode = ?)',
-          whereArgs: [toWarehouseId, source['trade_name'], ''],
+          where: "warehouse_id = ? AND trade_name = ? AND (barcode IS NULL OR barcode = '')",
+          whereArgs: [toWarehouseId, source['trade_name']],
           limit: 1,
         );
       }
@@ -825,7 +1014,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         );
       } else {
         await txn.insert('medicine', {
-          'pharmacy_id': destPharmacyId,
+          'pharmacy_id': sourcePharmacyId,
           'warehouse_id': toWarehouseId,
           'trade_name': source['trade_name'],
           'scientific_name': source['scientific_name'],
@@ -841,7 +1030,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       }
 
       final remaining = currentQty - quantity;
-      if (remaining > 0) {
+      if (remaining > 0 || await _isMedicineReferenced(txn, sourceMedicineId)) {
         await txn.update(
           'medicine',
           {'quantity': remaining},
@@ -853,8 +1042,11 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       }
 
       await txn.insert('stock_transfers', {
+        'pharmacy_id': sourcePharmacyId,
         'from_warehouse_id': fromWarehouseId,
         'to_warehouse_id': toWarehouseId,
+        'from_warehouse_name': fromWarehouseRows.isEmpty ? '' : fromWarehouseRows.first['name'],
+        'to_warehouse_name': toWarehouseRows.first['name'],
         'trade_name': source['trade_name'],
         'barcode': barcode.isNotEmpty ? barcode : null,
         'quantity': quantity,
@@ -864,19 +1056,91 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     });
   }
 
-  /// سجل عمليات النقل لجميع مخازن صيدلية معيّنة (وارد وصادر).
+  /// سجل عمليات النقل المحلية لصيدلية معيّنة (الأحدث أولاً).
   Future<List<Map<String, dynamic>>> getStockTransfers(int pharmacyId) async {
     final db = await database;
-    return await db.rawQuery('''
-      SELECT st.*, wf.name AS from_warehouse_name, wt.name AS to_warehouse_name
-      FROM stock_transfers st
-      JOIN warehouses wf ON wf.id = st.from_warehouse_id
-      JOIN warehouses wt ON wt.id = st.to_warehouse_id
-      WHERE wf.pharmacy_id = ? OR wt.pharmacy_id = ?
-      ORDER BY st.transferred_at DESC
-    ''', [pharmacyId, pharmacyId]);
+    return await db.query(
+      'stock_transfers',
+      where: 'pharmacy_id = ?',
+      whereArgs: [pharmacyId],
+      orderBy: 'transferred_at DESC, id DESC',
+    );
   }
 
+  /// يستبدل كاش مخازن الخادم لهذه الصيدلية (أونلاين). مخزن حُذف على الخادم
+  /// يُحذف من الكاش إن لم يبقَ فيه أي صف دواء محلي (وإلا يبقى حتى تُزال
+  /// أصنافه من الكاش في المزامنة التالية). المخازن المحلية (أوفلاين) لا تُمس.
+  Future<void> replaceWarehousesCache({
+    required int pharmacyId,
+    required List<Map<String, dynamic>> serverItems,
+  }) async {
+    final db = await database;
+    final now = DateTime.now().toIso8601String();
+
+    await db.transaction((txn) async {
+      final serverIds = <int>{};
+      for (final item in serverItems) {
+        final id = _serverId(item['id']);
+        serverIds.add(id);
+        final row = <String, dynamic>{
+          'id': id,
+          'pharmacy_id': pharmacyId,
+          'name': (item['name'] as String?) ?? '',
+          'is_main': item['is_main'] == true ? 1 : 0,
+          'created_at': (item['created_at'] as String?) ?? now,
+          'last_synced_at': now,
+        };
+        await txn.insert('warehouses', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+        await txn.update('warehouses', row, where: 'id = ?', whereArgs: [id]);
+      }
+
+      final cached = await txn.query(
+        'warehouses',
+        columns: ['id'],
+        where: 'pharmacy_id = ? AND id < $localIdBase',
+        whereArgs: [pharmacyId],
+      );
+      for (final row in cached) {
+        final id = row['id'] as int;
+        if (serverIds.contains(id)) continue;
+        final inUse = await txn.rawQuery('SELECT 1 FROM medicine WHERE warehouse_id = ? LIMIT 1', [id]);
+        if (inUse.isEmpty) {
+          await txn.delete('warehouses', where: 'id = ?', whereArgs: [id]);
+        }
+      }
+    });
+  }
+
+  /// يحدّث الكاش المحلي من رد WarehouseViewSet.transfer على الخادم: صف الهدف
+  /// (جديد أو مدموج) وصف المصدر (كميته الجديدة، أو إزالته إن حذفه الخادم).
+  Future<void> applyServerTransfer({
+    required int pharmacyId,
+    required Map<String, dynamic> response,
+  }) async {
+    final destination = response['destination'];
+    if (destination is Map<String, dynamic>) {
+      await upsertMedicineFromServer(pharmacyId: pharmacyId, serverData: destination);
+    }
+    final source = response['source'];
+    if (source is Map<String, dynamic>) {
+      await upsertMedicineFromServer(pharmacyId: pharmacyId, serverData: source);
+    } else if (response['source_deleted'] == true && response['source_id'] is num) {
+      final db = await database;
+      await db.transaction((txn) async {
+        await _removeCachedMedicine(txn, _serverId(response['source_id']));
+      });
+    }
+  }
+
+  /// يزيل صف دواء من الكاش؛ إن كانت له فواتير/تالف محلية (لا يُحذف بسبب
+  /// قيود FOREIGN KEY) يُصفَّر بدلاً من ذلك كي لا يظهر رصيد وهمي للبيع.
+  Future<void> _removeCachedMedicine(DatabaseExecutor txn, int medicineId) async {
+    if (await _isMedicineReferenced(txn, medicineId)) {
+      await txn.update('medicine', {'quantity': 0}, where: 'id = ?', whereArgs: [medicineId]);
+    } else {
+      await txn.delete('medicine', where: 'id = ?', whereArgs: [medicineId]);
+    }
+  }
   //====================================================
   // كاش القراءة فقط لوضع الأونلاين — يُستدعى بعد كل قراءة/كتابة ناجحة
   // من السيرفر فقط (MedicineRepository)، ولا يُستدعى أبداً كإدخال مباشر
@@ -900,23 +1164,17 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     required Map<String, dynamic> serverData,
   }) async {
     final db = await database;
+    final fallbackWarehouseId = await _serverMainWarehouseFallback(pharmacyId);
 
-    final row = <String, dynamic>{
-      'id': serverData['id'] as int,
-      'pharmacy_id': pharmacyId,
-      'trade_name': serverData['trade_name'] as String,
-      'scientific_name': (serverData['scientific_name'] as String?) ?? '',
-      'category': (serverData['category'] as String?) ?? '',
-      'quantity': (serverData['quantity'] as num?)?.toInt() ?? 0,
-      'buy_price': _parseServerDecimal(serverData['buy_price']),
-      'sell_price': _parseServerDecimal(serverData['sell_price']),
-      'expiry_date': serverData['expiry_date'] as String?,
-      'shelf_location': (serverData['shelf_location'] as String?) ?? '',
-      'is_damaged': serverData['is_damaged'] == true ? 1 : 0,
-      'barcode': serverData['barcode'] as String?,
-      'last_synced_at': DateTime.now().toIso8601String(),
-    };
+    final row = _serverMedicineRow(
+      pharmacyId: pharmacyId,
+      item: serverData,
+      fallbackWarehouseId: fallbackWarehouseId,
+      syncedAt: DateTime.now().toIso8601String(),
+    );
 
+    // ⚠️ warehouse_id عمود NOT NULL منذ v7: كان غائباً هنا فكان
+    // INSERT OR IGNORE يتجاهل كل صف بصمت ولا يُحفظ أي دواء أونلاين في الكاش.
     await db.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
     await db.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
   }
@@ -924,35 +1182,78 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   /// يستبدل كامل كاش المخزون المحلي بقائمة كاملة قادمة من السيرفر (بعد
   /// جلب medicine_api_service.fetchMedicines() لكل الصفحات)، داخل معاملة
   /// واحدة لضمان عدم رؤية الشاشات لحالة كاش منتصفة أثناء التحديث.
+  ///
+  /// يجب تحديث كاش المخازن (replaceWarehousesCache) قبله، لأن كل صف يشير
+  /// لمخزنه بقيد FOREIGN KEY. الصفوف المزامَنة سابقاً التي لم تعد موجودة على
+  /// الخادم (حُذفت، أو نُقلت كميتها كاملة لمخزن آخر) تُزال من الكاش؛ أما
+  /// الصفوف المحلية الأصلية (معرّف >= localIdBase — بيانات أوفلاين لم
+  /// تُرفع بعد) فلا تُمس أبداً، حتى لا تضيع قبل الرفع الأولي.
   Future<void> replaceMedicinesCache({
     required int pharmacyId,
     required List<Map<String, dynamic>> serverItems,
   }) async {
     final db = await database;
     final now = DateTime.now().toIso8601String();
+    final fallbackWarehouseId = await _serverMainWarehouseFallback(pharmacyId);
 
     await db.transaction((txn) async {
+      final serverIds = <int>{};
       for (final item in serverItems) {
-        final row = <String, dynamic>{
-          'id': item['id'] as int,
-          'pharmacy_id': pharmacyId,
-          'trade_name': item['trade_name'] as String,
-          'scientific_name': (item['scientific_name'] as String?) ?? '',
-          'category': (item['category'] as String?) ?? '',
-          'quantity': (item['quantity'] as num?)?.toInt() ?? 0,
-          'buy_price': _parseServerDecimal(item['buy_price']),
-          'sell_price': _parseServerDecimal(item['sell_price']),
-          'expiry_date': item['expiry_date'] as String?,
-          'shelf_location': (item['shelf_location'] as String?) ?? '',
-          'is_damaged': item['is_damaged'] == true ? 1 : 0,
-          'barcode': item['barcode'] as String?,
-          'last_synced_at': now,
-        };
+        final row = _serverMedicineRow(
+          pharmacyId: pharmacyId,
+          item: item,
+          fallbackWarehouseId: fallbackWarehouseId,
+          syncedAt: now,
+        );
+        serverIds.add(row['id'] as int);
 
         await txn.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
         await txn.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
       }
+
+      final cached = await txn.query(
+        'medicine',
+        columns: ['id'],
+        where: 'pharmacy_id = ? AND id < $localIdBase',
+        whereArgs: [pharmacyId],
+      );
+      for (final row in cached) {
+        final id = row['id'] as int;
+        if (!serverIds.contains(id)) {
+          await _removeCachedMedicine(txn, id);
+        }
+      }
     });
+  }
+
+  /// المخزن الرئيسي في كاش الخادم: احتياط لرد سيرفر أقدم لا يرسل "warehouse".
+  Future<int> _serverMainWarehouseFallback(int pharmacyId) async {
+    return await getMainWarehouseId(pharmacyId, syncedOnly: true) ??
+        await ensureMainWarehouse(pharmacyId);
+  }
+
+  Map<String, dynamic> _serverMedicineRow({
+    required int pharmacyId,
+    required Map<String, dynamic> item,
+    required int fallbackWarehouseId,
+    required String syncedAt,
+  }) {
+    return <String, dynamic>{
+      'id': _serverId(item['id']),
+      'pharmacy_id': pharmacyId,
+      'warehouse_id': item['warehouse'] != null ? _serverId(item['warehouse']) : fallbackWarehouseId,
+      'trade_name': item['trade_name'] as String,
+      'scientific_name': (item['scientific_name'] as String?) ?? '',
+      'category': (item['category'] as String?) ?? '',
+      'quantity': (item['quantity'] as num?)?.toInt() ?? 0,
+      'buy_price': _parseServerDecimal(item['buy_price']),
+      'sell_price': _parseServerDecimal(item['sell_price']),
+      'expiry_date': item['expiry_date'] as String?,
+      'shelf_location': (item['shelf_location'] as String?) ?? '',
+      'is_damaged': item['is_damaged'] == true ? 1 : 0,
+      'barcode': item['barcode'] as String?,
+      'last_synced_at': syncedAt,
+    };
   }
 
   /// أسعار DRF (DecimalField) تصل كنص "500.00" غالباً، أحياناً كرقم — تُقبل
@@ -1010,7 +1311,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     required Map<String, dynamic> serverData,
     required String syncedAt,
   }) async {
-    final invoiceId = serverData['id'] as int;
+    final invoiceId = _serverId(serverData['id']);
 
     final row = <String, dynamic>{
       'id': invoiceId,
@@ -1041,7 +1342,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         await txn.insert('invoice_item', {
           'invoice_id': invoiceId,
           'trade_name': rawItem['trade_name'] as String,
-          'medicine_id': rawItem['medicine'] as int,
+          'medicine_id': _serverId(rawItem['medicine']),
           'quantity': (rawItem['quantity'] as num).toInt(),
           'unit_price': _parseServerDecimal(rawItem['unit_price']),
           'total_price': _parseServerDecimal(rawItem['total_price']),
@@ -1057,6 +1358,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       SELECT * 
       FROM medicine 
       WHERE pharmacy_id = ? 
+        AND ${originFilter()}
         AND (
           trade_name LIKE ? 
           OR scientific_name LIKE ? 
@@ -1079,7 +1381,9 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final db = await database;
     final result = await db.query(
       'medicine',
-      where: warehouseId != null ? 'barcode = ? AND warehouse_id = ?' : 'barcode = ?',
+      where: warehouseId != null
+          ? 'barcode = ? AND warehouse_id = ? AND ${originFilter()}'
+          : 'barcode = ? AND ${originFilter()}',
       whereArgs: warehouseId != null ? [barcode, warehouseId] : [barcode],
     );
     if (result.isEmpty) return null;
@@ -1110,7 +1414,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final db = await database;
     return await db.query(
       'medicine',
-      where: 'pharmacy_id = ? AND quantity <= ?',
+      where: 'pharmacy_id = ? AND quantity <= ? AND ${originFilter()}',
       whereArgs: [pharmacyId, limit],
       orderBy: 'quantity ASC',
     );
@@ -1139,6 +1443,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     return await db.rawQuery('''
       SELECT * FROM medicine
       WHERE pharmacy_id = ?
+        AND ${originFilter()}
         AND quantity > 0
         AND expiry_date IS NOT NULL AND expiry_date != ''
         AND date(expiry_date) < date(?)
@@ -1155,7 +1460,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final db = await database;
     return await db.query(
       'invoice',
-      where: 'pharmacy_id = ?',
+      where: 'pharmacy_id = ? AND ${originFilter()}',
       whereArgs: [pharmacyId],
       orderBy: 'created_at DESC',
     );
@@ -1168,7 +1473,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     String? expenseType,
   }) async {
     final db = await database;
-    final clauses = <String>['pharmacy_id = ?'];
+    final clauses = <String>['pharmacy_id = ?', originFilter()];
     final args = <Object?>[pharmacyId];
     if (startDate != null) { clauses.add('date(expense_date) >= date(?)'); args.add(startDate); }
     if (endDate != null) { clauses.add('date(expense_date) <= date(?)'); args.add(endDate); }
@@ -1209,7 +1514,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final db = await database;
 
     final row = <String, dynamic>{
-      'id': serverData['id'] as int,
+      'id': _serverId(serverData['id']),
       'pharmacy_id': pharmacyId,
       'expense_type': serverData['expense_type'] as String,
       'expense_date': serverData['expense_date'] as String,
@@ -1235,7 +1540,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     await db.transaction((txn) async {
       for (final item in serverItems) {
         final row = <String, dynamic>{
-          'id': item['id'] as int,
+          'id': _serverId(item['id']),
           'pharmacy_id': pharmacyId,
           'expense_type': item['expense_type'] as String,
           'expense_date': item['expense_date'] as String,
@@ -1264,9 +1569,9 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final db = await database;
 
     final row = <String, dynamic>{
-      'id': serverData['id'] as int,
+      'id': _serverId(serverData['id']),
       'pharmacy_id': pharmacyId,
-      'medicine_id': serverData['medicine'] as int,
+      'medicine_id': _serverId(serverData['medicine']),
       'quantity_damaged': serverData['quantity_damaged'] as int,
       'reason': (serverData['reason'] as String?) ?? '',
       'notes': (serverData['notes'] as String?) ?? '',
@@ -1288,9 +1593,9 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     await db.transaction((txn) async {
       for (final item in serverItems) {
         final row = <String, dynamic>{
-          'id': item['id'] as int,
+          'id': _serverId(item['id']),
           'pharmacy_id': pharmacyId,
-          'medicine_id': item['medicine'] as int,
+          'medicine_id': _serverId(item['medicine']),
           'quantity_damaged': item['quantity_damaged'] as int,
           'reason': (item['reason'] as String?) ?? '',
           'notes': (item['notes'] as String?) ?? '',
@@ -1388,7 +1693,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final result = await db.rawQuery('''
       SELECT COUNT(*) AS total
       FROM medicine
-      WHERE pharmacy_id = ?
+      WHERE pharmacy_id = ? AND ${originFilter()}
     ''', [pharmacyId]);
 
     return Sqflite.firstIntValue(result) ?? 0;
@@ -1411,6 +1716,7 @@ Future<int> todayInvoiceCount(int pharmacyId) async {
     SELECT COUNT(*) AS total
     FROM invoice
     WHERE pharmacy_id = ?
+      AND ${originFilter()}
       AND is_refunded = 0
       AND DATE(created_at) = ?
   ''', [pharmacyId, today]);
@@ -1431,6 +1737,7 @@ Future<double> totalSalesToday(int pharmacyId) async {
     SELECT SUM(final_amount) AS total
     FROM invoice
     WHERE pharmacy_id = ?
+      AND ${originFilter()}
       AND is_refunded = 0
       AND DATE(created_at) = ?
   ''', [pharmacyId, today]);
@@ -1442,24 +1749,27 @@ Future<double> totalSalesToday(int pharmacyId) async {
   return (result.first['total'] as num).toDouble();
 }
 
-  // الحصول على آخر ID في جدول الفواتير
-  Future<int> getLastInvoiceId() async {
-    final db = await database;
-    final result = await db.rawQuery('''
-      SELECT MAX(id) AS last_id 
-      FROM invoice
-    ''');
-
-    if (result.first["last_id"] == null) {
-      return 0;
-    }
-    return result.first["last_id"] as int;
-  }
-
-  // توليد رقم فاتورة جديد ومنسق
+  /// رقم فاتورة أوفلاين جديد: أكبر رقم `INV-<n>` بين الفواتير المحلية + 1.
+  ///
+  /// كان يُشتق من MAX(id)، وهذا لم يعد صالحاً: المعرّفات المحلية تبدأ من
+  /// localIdBase (كانت ستنتج INV-1000000000001)، كما أن فواتير كاش الخادم لا
+  /// تخص ترقيم هذا الجهاز. نفس منطق _next_invoice_number على الخادم.
   Future<String> generateInvoiceNumber() async {
-    final lastId = await getLastInvoiceId();
-    return "INV-${(lastId + 1).toString().padLeft(6, '0')}";
+    final db = await database;
+    final rows = await db.rawQuery(
+      "SELECT invoice_number FROM invoice WHERE ${localOnly()} AND invoice_number GLOB 'INV-[0-9]*'",
+    );
+    var last = 0;
+    for (final row in rows) {
+      final n = int.tryParse((row['invoice_number'] as String).substring(4));
+      if (n != null && n > last) last = n;
+    }
+    final used = rows.map((r) => r['invoice_number'] as String).toSet();
+    var candidate = last + 1;
+    while (used.contains('INV-${candidate.toString().padLeft(6, '0')}')) {
+      candidate++;
+    }
+    return 'INV-${candidate.toString().padLeft(6, '0')}';
   }
 
   //====================================================
@@ -2031,7 +2341,7 @@ Future<void> settlePurchaseInvoiceCredit(int purchaseInvoiceId) async {
 Future<bool> hasLocalDataWorthMigrating(int pharmacyId) async {
   final db = await database;
   final medCount = Sqflite.firstIntValue(await db.rawQuery(
-    'SELECT COUNT(*) FROM medicine WHERE pharmacy_id = ?', [pharmacyId],
+    'SELECT COUNT(*) FROM medicine WHERE pharmacy_id = ? AND ${localOnly()}', [pharmacyId],
   )) ?? 0;
   final supCount = Sqflite.firstIntValue(await db.rawQuery(
     'SELECT COUNT(*) FROM pharmacy_supplier WHERE pharmacy_id = ?', [pharmacyId],
@@ -2057,11 +2367,28 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
           })
       .toList();
 
-  // 2. المخزون الكامل
-  final medicines = await db.query('medicine', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  // 1ب. المخازن المحلية (الرئيسي يُطابَق مع رئيسي الخادم، والباقي تُنشأ
+  // كمخازن إضافية). كاش مخازن الخادم مستبعد — هنا وفي كل أقسام الحمولة:
+  // تُرفع الصفوف المحلية فقط (معرّف >= localIdBase)، لا صفوف كاش الخادم.
+  final warehouses = await db.query(
+    'warehouses',
+    where: 'pharmacy_id = ? AND ${localOnly()}',
+    whereArgs: [pharmacyId],
+  );
+  final warehousesPayload = warehouses
+      .map((w) => {
+            'local_id': w['id'],
+            'name': w['name'],
+            'is_main': (w['is_main'] as int?) == 1,
+          })
+      .toList();
+
+  // 2. المخزون الكامل (كل صف بمرجع مخزنه المحلي)
+  final medicines = await db.query('medicine', where: 'pharmacy_id = ? AND ${localOnly()}', whereArgs: [pharmacyId]);
   final medicinesPayload = medicines
       .map((m) => {
             'local_id': m['id'],
+            'local_warehouse_id': m['warehouse_id'],
             'trade_name': m['trade_name'],
             'scientific_name': m['scientific_name'],
             'category': m['category'],
@@ -2114,7 +2441,7 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
     FROM invoice i
     LEFT JOIN user_profile up ON i.cashier_id = up.id
     LEFT JOIN users u ON up.user_id = u.id
-    WHERE i.pharmacy_id = ?
+    WHERE i.pharmacy_id = ? AND ${localOnly('i.')}
   ''', [pharmacyId]);
   final invoicesPayload = <Map<String, dynamic>>[];
   for (final inv in invoices) {
@@ -2141,7 +2468,7 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
   }
 
   // 5. كل سجلات الإتلاف
-  final damaged = await db.query('damaged_medicine', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final damaged = await db.query('damaged_medicine', where: 'pharmacy_id = ? AND ${localOnly()}', whereArgs: [pharmacyId]);
   final damagedPayload = damaged
       .map((d) => {
             'local_medicine_id': d['medicine_id'],
@@ -2153,7 +2480,7 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
       .toList();
 
   // 6. كل المصاريف
-  final expenses = await db.query('expense', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final expenses = await db.query('expense', where: 'pharmacy_id = ? AND ${localOnly()}', whereArgs: [pharmacyId]);
   final expensesPayload = expenses
       .map((e) => {
             'expense_type': e['expense_type'],
@@ -2163,13 +2490,29 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
           })
       .toList();
 
+  // 7. سجل عمليات النقل (تاريخي فقط؛ الكميات النهائية مرفوعة مع الأدوية).
+  final transfers = await db.query('stock_transfers', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  final transfersPayload = transfers
+      .map((t) => {
+            'local_from_warehouse_id': t['from_warehouse_id'],
+            'local_to_warehouse_id': t['to_warehouse_id'],
+            'trade_name': t['trade_name'],
+            'barcode': t['barcode'],
+            'quantity': t['quantity'],
+            'notes': t['notes'],
+            'transferred_at': t['transferred_at'],
+          })
+      .toList();
+
   return {
+    'warehouses': warehousesPayload,
     'suppliers': suppliersPayload,
     'medicines': medicinesPayload,
     'purchase_invoices': purchaseInvoicesPayload,
     'invoices': invoicesPayload,
     'damaged_medicines': damagedPayload,
     'expenses': expensesPayload,
+    'stock_transfers': transfersPayload,
   };
 }
 

@@ -65,7 +65,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
         FROM invoice i
         LEFT JOIN user_profile up ON i.cashier_id = up.id
         LEFT JOIN users u ON up.user_id = u.id
-        WHERE i.pharmacy_id = ?
+        WHERE i.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('i.')}
         ORDER BY i.created_at DESC
       ''', [widget.pharmacyId]);
 

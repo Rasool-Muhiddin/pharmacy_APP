@@ -33,6 +33,10 @@ if not SECRET_KEY:
         SECRET_KEY = "development-only-change-before-production"
     else:
         raise RuntimeError("SECRET_KEY is required when DEBUG is false.")
+elif not DEBUG and (SECRET_KEY.startswith("replace-with") or len(SECRET_KEY) < 32):
+    # القيمة النموذجية في .env.example (أو مفتاح قصير) تجعل توقيع الجلسات
+    # وCSRF قابلاً للتخمين، فنرفض تشغيل الإنتاج بها.
+    raise RuntimeError("SECRET_KEY ضعيف أو ما زال قيمة المثال؛ استخدم مفتاحاً عشوائياً طوله 32+ حرفاً.")
 
 ALLOWED_HOSTS = [item.strip() for item in os.getenv("ALLOWED_HOSTS", "").split(",") if item.strip()]
 if not DEBUG and not ALLOWED_HOSTS:
@@ -102,7 +106,21 @@ SESSION_COOKIE_SAMESITE = "Lax"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
-RATELIMIT_IP_META_KEY = "HTTP_CF_CONNECTING_IP"
+# كان RATELIMIT_IP_META_KEY = "HTTP_CF_CONNECTING_IP" مباشرة، فيتعطل التفعيل
+# وتسجيل الدخول بخطأ 500 عند أي طلب لا يمر عبر Cloudflare (التطوير المحلي،
+# الاتصال بعنوان IP مباشرة، فحوص الصحة). الدالة التالية ترجع لـ REMOTE_ADDR.
+RATELIMIT_IP_META_KEY = "desktop_api.permissions.client_ip"
+# True افتراضياً ليبقى سلوك الإنتاج الحالي (خلف Cloudflare) كما هو.
+TRUST_CLOUDFLARE_IP = os.getenv("TRUST_CLOUDFLARE_IP", "True").lower() in {"1", "true", "yes"}
+
+# لوحة الأدمن عبر HTTPS خلف Cloudflare/Nginx: بدون هذين الإعدادين يفشل
+# تسجيل دخول الأدمن بخطأ "CSRF verification failed".
+CSRF_TRUSTED_ORIGINS = [item.strip() for item in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",") if item.strip()]
+if os.getenv("USE_PROXY_SSL_HEADER", "False").lower() in {"1", "true", "yes"}:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# عدد الأيام التي يبقى فيها Token الدخول صالحاً منذ آخر تسجيل دخول ناجح.
+API_TOKEN_TTL_DAYS = int(os.getenv("API_TOKEN_TTL_DAYS", "60"))
 
 # ---------------------------------------------------------------------------
 # Django REST Framework
@@ -111,7 +129,7 @@ RATELIMIT_IP_META_KEY = "HTTP_CF_CONNECTING_IP"
 # الافتراضي: كل endpoint مغلق ما لم يُصرّح بغير ذلك صراحة داخل الـ View.
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
+        "desktop_api.authentication.ExpiringTokenAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",

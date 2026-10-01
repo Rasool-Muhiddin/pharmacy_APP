@@ -3,6 +3,8 @@ import '../database/db_helper.dart';
 import '../services/migration_api_service.dart';
 
 const Map<String, String> _kStageLabels = {
+  'warehouses': 'المخازن',
+  'stock_transfers': 'سجل نقل المخزون',
   'suppliers': 'الموردون',
   'medicines': 'الأدوية',
   'purchase_invoices': 'فواتير الشراء',

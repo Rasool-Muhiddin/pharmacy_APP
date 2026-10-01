@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart'; // تأكد من صحة مسار الملف لديك
 import '../repository/invoice_repository.dart';
+import '../repository/medicine_repository.dart';
+import '../repository/warehouse_repository.dart';
 
 class PosScreen extends StatefulWidget {
   final int pharmacyId;
@@ -52,13 +54,27 @@ class _PosScreenState extends State<PosScreen> {
     setState(() => _isLoading = true);
 
     try {
-      // المخزون هنا لا يزال يُقرأ من الكاش المحلي مباشرة (يُحدَّثه فتح شاشة
-      // المخزون، أو أي checkout/refund أونلاين ناجح هنا نفسه — انظر أسفل).
-      // ⚠️ getMainWarehouseMedicines (لا getMedicines) عمداً: البيع مقصور
-      // على المخزن الرئيسي فقط ولو كانت الصيدلية على الباقة الذهبية وتملك
-      // مخزناً ثانياً.
-      _mainWarehouseId = await DatabaseHelper.instance.ensureMainWarehouse(widget.pharmacyId);
-      final meds = await DatabaseHelper.instance.getMainWarehouseMedicines(widget.pharmacyId);
+      // أونلاين: نحدّث كاش المخازن والمخزون من الخادم أولاً (إن توفر اتصال)
+      // كي تعكس الشاشة الكميات الحالية من كل الأجهزة؛ الفشل لا يمنع البيع
+      // من آخر كاش محفوظ (والخادم يتحقق من الكمية عند checkout أصلاً).
+      if (widget.isOnlineMode) {
+        try {
+          await MedicineRepository.instance.getMedicines(
+            pharmacyId: widget.pharmacyId,
+            isOnlineMode: true,
+          );
+        } catch (_) {}
+      }
+      // ⚠️ المخزن الرئيسي فقط عمداً: البيع مقصور عليه ولو كانت الصيدلية على
+      // الباقة الذهبية وتملك مخازن أخرى (الخادم يفرض نفس القاعدة).
+      _mainWarehouseId = await WarehouseRepository.instance.getMainWarehouseId(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+      final meds = await DatabaseHelper.instance.getMedicines(
+        widget.pharmacyId,
+        warehouseId: _mainWarehouseId,
+      );
       final invoices = await InvoiceRepository.instance.getInvoices(
         pharmacyId: widget.pharmacyId,
         isOnlineMode: widget.isOnlineMode,
@@ -153,7 +169,10 @@ class _PosScreenState extends State<PosScreen> {
     try {
       // نفس تقييد المخزن الرئيسي المطبّق في _loadInitialData، حتى لا يبيع
       // الماسح صنفاً موجوداً فقط في المخزن الثانوي.
-      final warehouseId = _mainWarehouseId ??= await DatabaseHelper.instance.ensureMainWarehouse(widget.pharmacyId);
+      final warehouseId = _mainWarehouseId ??= await WarehouseRepository.instance.getMainWarehouseId(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
       final exactMatch = await DatabaseHelper.instance.getMedicineByBarcode(query, warehouseId: warehouseId);
 
       if (!mounted) return;

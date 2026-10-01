@@ -1,6 +1,7 @@
 import secrets
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -70,6 +71,10 @@ class DesktopLicense(models.Model):
     plan = models.CharField(max_length=12, choices=PLAN_CHOICES, default=PLAN_BASIC)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=ACTIVE)
     max_devices = models.PositiveSmallIntegerField(default=1)
+    # الحد الأقصى لعدد المخازن (الرئيسي ضمنها) لباقات Gold/Diamond. الباقة
+    # الأساسية تبقى دائماً على مخزن واحد بغض النظر عن هذه القيمة — راجع
+    # desktop_api.permissions.max_warehouses_for.
+    max_warehouses = models.PositiveSmallIntegerField(default=2)
     expires_at = models.DateTimeField(null=True, blank=True)
     offline_grace_days = models.PositiveSmallIntegerField(default=30)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -81,6 +86,14 @@ class DesktopLicense(models.Model):
             self.license_type == self.LIFETIME or
             (self.expires_at is not None and self.expires_at >= timezone.now())
         )
+
+    def clean(self):
+        super().clean()
+        # استيراد متأخر: permissions يستورد هذا الملف عند تحميله.
+        from .permissions import ONLINE_PLAN_REQUIRED_MESSAGE, plan_allows_online
+
+        if self.mode == self.ONLINE and not plan_allows_online(self):
+            raise ValidationError({"mode": ONLINE_PLAN_REQUIRED_MESSAGE})
 
     def __str__(self):
         return f"{self.pharmacy.name} ({self.mode})"
@@ -114,42 +127,3 @@ class DesktopAppVersion(models.Model):
     def __str__(self):
         return self.version
 
-
-class PharmacyLink(models.Model):
-    """
-    ربط بين صيدليتين لإتاحة نقل المخزون بينهما (خاصية الباقة الذهبية في
-    التطبيق: AppFeature.pharmacyLinking، راجع subscription_plan.dart).
-
-    ⚠️ يُنشأ ويُحذف حصراً من لوحة أدمن Django — لا يوجد أي endpoint يسمح
-    لصاحب الصيدلية بإنشاء أو حذف رابط من داخل التطبيق نفسه، هذا قرار عمل
-    مقصود. التطبيق يقرأ الروابط فقط عبر
-    pharmacy_data.views.linked_pharmacies، ويخزّنها محلياً كـ"كاش قراءة
-    فقط" (راجع DatabaseHelper.replacePharmacyLinksCache في db_helper.dart).
-
-    العلاقة غير موجّهة؛ pharmacy_a/pharmacy_b يُطبَّعان دائماً بترتيب ثابت
-    (id الأصغر أولاً) في save()، تماماً كمنطق linkPharmacies السابق في
-    Flutter، حتى يمنع UniqueConstraint تكرار نفس الرابط بترتيب معكوس.
-    """
-
-    pharmacy_a = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="links_as_a")
-    pharmacy_b = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="links_as_b")
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=["pharmacy_a", "pharmacy_b"], name="unique_pharmacy_link"),
-            models.CheckConstraint(condition=~models.Q(pharmacy_a=models.F("pharmacy_b")), name="pharmacy_link_not_self"),
-        ]
-
-    def clean(self):
-        from django.core.exceptions import ValidationError
-        if self.pharmacy_a_id and self.pharmacy_b_id and self.pharmacy_a_id == self.pharmacy_b_id:
-            raise ValidationError("لا يمكن ربط الصيدلية بنفسها.")
-
-    def save(self, *args, **kwargs):
-        if self.pharmacy_a_id and self.pharmacy_b_id and self.pharmacy_a_id > self.pharmacy_b_id:
-            self.pharmacy_a_id, self.pharmacy_b_id = self.pharmacy_b_id, self.pharmacy_a_id
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.pharmacy_a.name} \u2194 {self.pharmacy_b.name}"

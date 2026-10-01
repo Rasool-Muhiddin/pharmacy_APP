@@ -1,6 +1,21 @@
+from django import forms
 from django.contrib import admin
 
-from .models import DesktopAppVersion, DesktopLicense, DeviceActivation, Pharmacy, PharmacyLink, PharmacyMembership
+from .models import DesktopAppVersion, DesktopLicense, DeviceActivation, Pharmacy, PharmacyMembership
+
+
+class DesktopLicenseAdminForm(forms.ModelForm):
+    """
+    نموذج الترخيص في الأدمن (صفحة الترخيص + الترخيص المضمَّن في صفحة الصيدلية).
+    ModelForm يستدعي DesktopLicense.full_clean() تلقائياً، فيظهر رفض
+    "أونلاين + Basic" تحت حقل mode بدل حفظ ترخيص لا يعمل. نص المساعدة هنا
+    (لا على حقل الموديل) كي لا يتطلب ترحيل قاعدة بيانات.
+    """
+
+    class Meta:
+        model = DesktopLicense
+        fields = "__all__"
+        help_texts = {"mode": "Online requires Gold or Diamond plan"}
 
 
 class DeviceActivationInline(admin.TabularInline):
@@ -24,7 +39,8 @@ class PharmacyMembershipAdmin(admin.ModelAdmin):
 
 @admin.register(DesktopLicense)
 class DesktopLicenseAdmin(admin.ModelAdmin):
-    list_display = ("pharmacy", "activation_code", "mode", "plan", "status", "max_devices", "expires_at")
+    form = DesktopLicenseAdminForm
+    list_display = ("pharmacy", "activation_code", "mode", "plan", "status", "max_devices", "max_warehouses", "expires_at")
     list_filter = ("mode", "plan", "status", "license_type")
     search_fields = ("pharmacy__name", "activation_code")
     readonly_fields = ("activation_code", "created_at", "updated_at")
@@ -43,10 +59,18 @@ class DesktopAppVersionAdmin(admin.ModelAdmin):
     list_display = ("version", "is_mandatory", "released_at")
 
 
-@admin.register(PharmacyLink)
-class PharmacyLinkAdmin(admin.ModelAdmin):
-    # خاصية الباقة الذهبية (تعدد المخازن + ربط الصيدليات) — يُنشأ الربط من
-    # هنا حصراً، لا يوجد أي مسار آخر من داخل التطبيق نفسه.
-    list_display = ("pharmacy_a", "pharmacy_b", "created_at")
-    search_fields = ("pharmacy_a__name", "pharmacy_b__name")
-    autocomplete_fields = ("pharmacy_a", "pharmacy_b")
+# تسهيل إنشاء صيدلية كاملة من صفحة واحدة: الصيدلية + الترخيص + حساب المالك.
+class PharmacyMembershipInline(admin.TabularInline):
+    model = PharmacyMembership
+    extra = 0
+    autocomplete_fields = ("user",)
+
+
+class DesktopLicenseInline(admin.StackedInline):
+    model = DesktopLicense
+    form = DesktopLicenseAdminForm
+    extra = 0
+    readonly_fields = ("activation_code", "created_at", "updated_at")
+
+
+PharmacyAdmin.inlines = (DesktopLicenseInline, PharmacyMembershipInline)

@@ -1,14 +1,85 @@
 from django.db.models import Sum
 from rest_framework import serializers
 
-from .models import DamagedMedicine, Expense, Invoice, InvoiceItem, Medicine, PurchaseInvoice, Supplier
+from .models import (
+    DamagedMedicine,
+    Expense,
+    Invoice,
+    InvoiceItem,
+    Medicine,
+    PurchaseInvoice,
+    StockTransfer,
+    Supplier,
+    Warehouse,
+)
+
+
+def _request_pharmacy(serializer):
+    request = serializer.context.get("request")
+    membership = getattr(getattr(request, "user", None), "pharmacymembership", None)
+    return membership.pharmacy if membership is not None else None
+
+
+class WarehouseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Warehouse
+        fields = ["id", "name", "is_main", "created_at", "updated_at"]
+        # is_main لا يُضبط من العميل: الرئيسي يُنشأ تلقائياً وحده، وكل مخزن
+        # يُضاف عبر API هو مخزن إضافي.
+        read_only_fields = ["id", "is_main", "created_at", "updated_at"]
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("اسم المخزن مطلوب.")
+        pharmacy = _request_pharmacy(self)
+        if pharmacy is not None:
+            duplicates = Warehouse.objects.filter(pharmacy=pharmacy, name__iexact=value)
+            if self.instance is not None:
+                duplicates = duplicates.exclude(pk=self.instance.pk)
+            if duplicates.exists():
+                raise serializers.ValidationError("يوجد مخزن آخر بنفس الاسم في صيدليتك.")
+        return value
+
+
+class StockTransferSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockTransfer
+        fields = [
+            "id",
+            "from_warehouse",
+            "from_warehouse_name",
+            "to_warehouse",
+            "to_warehouse_name",
+            "trade_name",
+            "barcode",
+            "quantity",
+            "notes",
+            "transferred_at",
+        ]
+        read_only_fields = fields
+
+
+class StockTransferInputSerializer(serializers.Serializer):
+    """بيانات الدخل لـ POST /api/warehouses/transfer/ فقط."""
+
+    medicine_id = serializers.IntegerField()
+    to_warehouse_id = serializers.IntegerField()
+    quantity = serializers.IntegerField(min_value=1)
+    notes = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
 
 
 class MedicineSerializer(serializers.ModelSerializer):
+    # اختياري عند الإنشاء (الافتراضي: المخزن الرئيسي، لتوافق عملاء Flutter
+    # القدامى). لا يُغيَّر بعد الإنشاء — النقل بين المخازن حصراً عبر
+    # /api/warehouses/transfer/ ليبقى له سجل وتبقى الكميات متسقة.
+    warehouse = serializers.PrimaryKeyRelatedField(queryset=Warehouse.objects.none(), required=False)
+
     class Meta:
         model = Medicine
         fields = [
             "id",
+            "warehouse",
             "trade_name",
             "scientific_name",
             "category",
@@ -24,6 +95,43 @@ class MedicineSerializer(serializers.ModelSerializer):
         # pharmacy لا يُرسَل من العميل إطلاقاً — يُحدَّد تلقائياً من صيدلية المستخدم المسجّل دخوله
         # (انظر MedicineViewSet.perform_create)، منعاً لأي محاولة لكتابة بيانات في صيدلية أخرى.
         read_only_fields = ["id", "updated_at"]
+        # DRF يولّد تلقائياً مدقِّق فرادة من قيد (warehouse, barcode) يجعل
+        # warehouse إلزامياً؛ الفحص نفسه مطبَّق يدوياً في validate() مع مراعاة
+        # المخزن الرئيسي الافتراضي.
+        validators = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # المخازن المقبولة = مخازن صيدلية المستخدم فقط، لا أي معرّف عام.
+        pharmacy = _request_pharmacy(self)
+        if pharmacy is not None:
+            self.fields["warehouse"].queryset = Warehouse.objects.filter(pharmacy=pharmacy)
+
+    def validate_barcode(self, value):
+        return (value or "").strip() or None
+
+    def validate(self, attrs):
+        if self.instance is not None and "warehouse" in attrs and attrs["warehouse"].pk != self.instance.warehouse_id:
+            raise serializers.ValidationError(
+                {"warehouse": "لا يمكن تغيير مخزن الصنف مباشرة. استخدم عملية نقل المخزون."}
+            )
+
+        barcode = attrs.get("barcode")
+        if barcode:
+            pharmacy = _request_pharmacy(self)
+            if self.instance is not None:
+                warehouse = self.instance.warehouse
+            else:
+                warehouse = attrs.get("warehouse") or (Warehouse.main_for(pharmacy) if pharmacy else None)
+            if warehouse is not None:
+                duplicates = Medicine.objects.filter(warehouse=warehouse, barcode=barcode)
+                if self.instance is not None:
+                    duplicates = duplicates.exclude(pk=self.instance.pk)
+                if duplicates.exists():
+                    raise serializers.ValidationError(
+                        {"barcode": "هذا الباركود مستخدم لدواء آخر في نفس المخزن."}
+                    )
+        return attrs
 
 
 class InvoiceItemSerializer(serializers.ModelSerializer):
@@ -149,6 +257,15 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def validate(self, attrs):
+        total = attrs.get("total_amount", 0)
+        paid = attrs.get("paid_amount", 0)
+        if total < 0 or paid < 0:
+            raise serializers.ValidationError("المبالغ لا يمكن أن تكون سالبة.")
+        if paid > total:
+            raise serializers.ValidationError("المبلغ المدفوع أكبر من إجمالي الفاتورة.")
+        return attrs
 
     def get_returned_amount(self, obj):
         return obj.returns.aggregate(s=Sum("amount_returned"))["s"] or 0

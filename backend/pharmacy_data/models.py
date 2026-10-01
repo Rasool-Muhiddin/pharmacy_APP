@@ -1,10 +1,54 @@
 from datetime import date
 
 from django.conf import settings
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
 from desktop_api.models import Pharmacy
+
+MAIN_WAREHOUSE_NAME = "المخزن الرئيسي"
+
+
+class Warehouse(models.Model):
+    """
+    يقابل جدول warehouses المحلي في Flutter. لكل صيدلية مخزن رئيسي واحد
+    بالضبط (is_main=True) يُنشأ تلقائياً عند الحاجة (Warehouse.main_for)،
+    والبيع (checkout) يتم منه حصراً. المخازن الإضافية خاصية Gold/Diamond
+    وعددها محدود بـ desktop_api.permissions.max_warehouses_for.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="warehouses")
+    name = models.CharField(max_length=120)
+    is_main = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-is_main", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["pharmacy"],
+                condition=models.Q(is_main=True),
+                name="one_main_warehouse_per_pharmacy",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.pharmacy.name})"
+
+    @classmethod
+    def main_for(cls, pharmacy):
+        """يعيد المخزن الرئيسي للصيدلية، وينشئه إن لم يوجد (آمن مع التزامن)."""
+        pharmacy_id = getattr(pharmacy, "pk", pharmacy)
+        existing = cls.objects.filter(pharmacy_id=pharmacy_id, is_main=True).first()
+        if existing is not None:
+            return existing
+        try:
+            with transaction.atomic():
+                return cls.objects.create(pharmacy_id=pharmacy_id, name=MAIN_WAREHOUSE_NAME, is_main=True)
+        except IntegrityError:
+            # طلب متزامن أنشأه للتو (قيد one_main_warehouse_per_pharmacy).
+            return cls.objects.get(pharmacy_id=pharmacy_id, is_main=True)
 
 
 class Medicine(models.Model):
@@ -14,6 +58,9 @@ class Medicine(models.Model):
     """
 
     pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="medicines")
+    # PROTECT: لا يُحذف مخزن فيه أصناف — يجب نقلها أو تصفيرها أولاً
+    # (راجع WarehouseViewSet.destroy).
+    warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT, related_name="medicines")
     trade_name = models.CharField(max_length=200)
     scientific_name = models.CharField(max_length=200, blank=True, default="")
     category = models.CharField(max_length=120, blank=True, default="")
@@ -23,7 +70,11 @@ class Medicine(models.Model):
     expiry_date = models.DateField(null=True, blank=True)
     shelf_location = models.CharField(max_length=120, blank=True, default="")
     is_damaged = models.BooleanField(default=False)
-    barcode = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    # الباركود فريد داخل المخزن الواحد فقط (انظر constraints): نفس الصنف قد
+    # يوجد في المخزن الرئيسي والمخزن الثانوي معاً بعد عملية نقل، تماماً كقيد
+    # idx_medicine_warehouse_barcode في قاعدة Flutter المحلية. الباركود
+    # الفارغ/NULL لا يتصادم أبداً.
+    barcode = models.CharField(max_length=64, null=True, blank=True)
 
     # وقت آخر تعديل على السيرفر — يستخدمه تطبيق Flutter لمعرفة ما تغيّر منذ آخر مزامنة
     updated_at = models.DateTimeField(auto_now=True)
@@ -34,6 +85,11 @@ class Medicine(models.Model):
             models.Index(fields=["pharmacy", "scientific_name"]),
         ]
         constraints = [
+            models.UniqueConstraint(
+                fields=["warehouse", "barcode"],
+                condition=models.Q(barcode__isnull=False) & ~models.Q(barcode=""),
+                name="unique_medicine_barcode_per_warehouse",
+            ),
             models.CheckConstraint(condition=models.Q(quantity__gte=0), name="medicine_quantity_gte_0"),
             models.CheckConstraint(condition=models.Q(buy_price__gte=0), name="medicine_buy_price_gte_0"),
             models.CheckConstraint(condition=models.Q(sell_price__gte=0), name="medicine_sell_price_gte_0"),
@@ -41,6 +97,55 @@ class Medicine(models.Model):
 
     def __str__(self):
         return self.trade_name
+
+    def save(self, *args, **kwargs):
+        # أي إنشاء لا يحدد مخزناً (عملاء Flutter قدامى، لوحة الأدمن، seed_demo)
+        # يذهب للمخزن الرئيسي بدل الفشل بقيد NOT NULL.
+        if self.warehouse_id is None and self.pharmacy_id is not None:
+            self.warehouse = Warehouse.main_for(self.pharmacy_id)
+        super().save(*args, **kwargs)
+
+
+class StockTransfer(models.Model):
+    """
+    سجل عمليات نقل المخزون بين مخازن نفس الصيدلية (يقابل جدول stock_transfers
+    المحلي). يُنشأ فقط عبر WarehouseViewSet.transfer داخل نفس معاملة تعديل
+    الكميات. لا يُخزَّن معرّف الدواء لأن صف المصدر قد يُحذف بعد النقل الكامل.
+    أسماء المخازن تُحفظ كنص وقت النقل، والمرجع نفسه SET_NULL، كي يبقى السجل
+    مقروءاً ولا يمنع حذف مخزن إضافي فارغ لاحقاً.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="stock_transfers")
+    from_warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.SET_NULL, null=True, blank=True, related_name="transfers_out"
+    )
+    to_warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.SET_NULL, null=True, blank=True, related_name="transfers_in"
+    )
+    from_warehouse_name = models.CharField(max_length=120, blank=True, default="")
+    to_warehouse_name = models.CharField(max_length=120, blank=True, default="")
+    trade_name = models.CharField(max_length=200)
+    barcode = models.CharField(max_length=64, null=True, blank=True)
+    quantity = models.PositiveIntegerField()
+    notes = models.CharField(max_length=255, blank=True, default="")
+    transferred_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="stock_transfers"
+    )
+    transferred_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-transferred_at", "-id"]
+        indexes = [models.Index(fields=["pharmacy", "transferred_at"])]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(quantity__gt=0), name="stock_transfer_quantity_gt_0"),
+            models.CheckConstraint(
+                condition=~models.Q(from_warehouse=models.F("to_warehouse")),
+                name="stock_transfer_distinct_warehouses",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.trade_name} x{self.quantity}"
 
 
 class Invoice(models.Model):

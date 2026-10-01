@@ -10,6 +10,15 @@ from django_ratelimit.decorators import ratelimit
 from rest_framework.authtoken.models import Token
 
 from .models import DesktopAppVersion, DesktopLicense, DeviceActivation, PharmacyMembership
+from .permissions import (
+    ONLINE_PLAN_REQUIRED_MESSAGE,
+    login_username_key,
+    max_warehouses_for,
+    plan_allows_online,
+)
+
+
+TOO_MANY_REQUESTS = "محاولات كثيرة متتالية. انتظر دقيقة ثم حاول مجدداً."
 
 
 def error(message, status):
@@ -29,8 +38,11 @@ def license_payload(license):
         "type": license.license_type,
         "mode": license.mode,
         # يقرأه subscription_plan.dart (SubscriptionEntitlements.fromLicense)
-        # لتفعيل/قفل خصائص الباقة الذهبية (تعدد المخازن، ربط الصيدليات...).
+        # لتفعيل/قفل خصائص الباقة الذهبية (تعدد المخازن).
         "plan": license.plan,
+        # الحد الفعلي لعدد المخازن؛ يفرضه التطبيق محلياً في الوضع الأوفلاين
+        # (SubscriptionEntitlements.maxWarehouses) والخادم في الأونلاين.
+        "max_warehouses": max_warehouses_for(license),
         "status": license.status,
         "expires_at": license.expires_at.isoformat() if license.expires_at else None,
         "max_devices": license.max_devices,
@@ -42,10 +54,12 @@ def health(request):
     return JsonResponse({"ok": True, "service": "tera-desktop-backend"})
 
 
-@ratelimit(key="ip", rate="20/m", method="POST", block=True)
+@ratelimit(key="ip", rate="20/m", method="POST", block=False)
 @csrf_exempt
 @require_POST
 def desktop_activate(request):
+    if getattr(request, "limited", False):
+        return error(TOO_MANY_REQUESTS, 429)
     data = request_json(request)
     if data is None:
         return error("بيانات الطلب غير صحيحة.", 400)
@@ -77,10 +91,13 @@ def desktop_activate(request):
     return JsonResponse({"ok": True, "message": "تم تفعيل النسخة بنجاح.", "pharmacy": {"id": license.pharmacy_id, "name": license.pharmacy.name}, "license": license_payload(license)})
 
 
-@ratelimit(key="ip", rate="20/m", method="POST", block=True)
+@ratelimit(key="ip", rate="20/m", method="POST", block=False)
+@ratelimit(key=login_username_key, rate="10/m", method="POST", block=False)
 @csrf_exempt
 @require_POST
 def desktop_login(request):
+    if getattr(request, "limited", False):
+        return error(TOO_MANY_REQUESTS, 429)
     data = request_json(request)
     if data is None:
         return error("بيانات الطلب غير صحيحة.", 400)
@@ -100,10 +117,16 @@ def desktop_login(request):
         return error("الحساب أو الجهاز غير مفعّل لهذه الصيدلية.", 403)
     if not membership.pharmacy.is_active or not device.is_active or not license.is_valid:
         return error("الحساب أو الجهاز أو الترخيص غير فعال.", 403)
+    # الأونلاين حصري لـ Gold/Diamond؛ الأوفلاين يبقى متاحاً لكل الباقات.
+    if license.mode == DesktopLicense.ONLINE and not plan_allows_online(license):
+        return error(ONLINE_PLAN_REQUIRED_MESSAGE, 403)
     device.save(update_fields=["last_seen_at"])
     # Token واحد ثابت لكل مستخدم (get_or_create) — يُستخدم لاحقاً كـ Authorization: Token <key>
     # في كل طلبات API بيانات الصيدلية (المخزون، الفواتير...)، منفصل تماماً عن جلسة desktop_login نفسها.
     token, _ = Token.objects.get_or_create(user=user)
+    # تجديد صلاحية الـToken عند كل دخول ناجح (مدته API_TOKEN_TTL_DAYS من آخر دخول)
+    # دون تغيير مفتاحه، كي لا يُفصَل جهاز آخر للمستخدم نفسه.
+    Token.objects.filter(pk=token.pk).update(created=timezone.now())
     return JsonResponse({
         "ok": True,
         "message": "تم تسجيل الدخول بنجاح.",
@@ -116,9 +139,11 @@ def desktop_login(request):
     })
 
 
-@ratelimit(key="ip", rate="30/m", method="GET", block=True)
+@ratelimit(key="ip", rate="30/m", method="GET", block=False)
 @require_GET
 def desktop_latest_version(request):
+    if getattr(request, "limited", False):
+        return error(TOO_MANY_REQUESTS, 429)
     latest = DesktopAppVersion.objects.first()
     if latest is None:
         return error("لا توجد بيانات إصدار متاحة.", 404)

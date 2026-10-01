@@ -8,15 +8,32 @@ from .models import (
     Medicine,
     PurchaseInvoice,
     PurchaseInvoiceReturn,
+    StockTransfer,
     Supplier,
     SupplierPayment,
+    Warehouse,
 )
+
+
+@admin.register(Warehouse)
+class WarehouseAdmin(admin.ModelAdmin):
+    list_display = ("name", "pharmacy", "is_main", "created_at")
+    list_filter = ("pharmacy", "is_main")
+    search_fields = ("name", "pharmacy__name")
+
+
+@admin.register(StockTransfer)
+class StockTransferAdmin(admin.ModelAdmin):
+    list_display = ("trade_name", "pharmacy", "from_warehouse_name", "to_warehouse_name", "quantity", "transferred_at")
+    list_filter = ("pharmacy",)
+    search_fields = ("trade_name", "barcode")
+    date_hierarchy = "transferred_at"
 
 
 @admin.register(Medicine)
 class MedicineAdmin(admin.ModelAdmin):
-    list_display = ("trade_name", "scientific_name", "pharmacy", "quantity", "buy_price", "sell_price", "expiry_date", "is_damaged")
-    list_filter = ("pharmacy", "is_damaged")
+    list_display = ("trade_name", "scientific_name", "pharmacy", "warehouse", "quantity", "buy_price", "sell_price", "expiry_date", "is_damaged")
+    list_filter = ("pharmacy", "warehouse", "is_damaged")
     search_fields = ("trade_name", "scientific_name", "barcode")
 
 

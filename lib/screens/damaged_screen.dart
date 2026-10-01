@@ -69,7 +69,7 @@ class _DamagedScreenState extends State<DamagedScreen> {
           m.buy_price 
         FROM damaged_medicine dm
         LEFT JOIN medicine m ON dm.medicine_id = m.id
-        WHERE dm.pharmacy_id = ?
+        WHERE dm.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('dm.')}
         ORDER BY dm.id DESC
       ''', [widget.pharmacyId]);
 

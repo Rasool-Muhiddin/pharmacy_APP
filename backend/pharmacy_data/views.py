@@ -1,20 +1,27 @@
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Count, DecimalField, F, OuterRef, Q, Subquery, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Length
 from django.http import StreamingHttpResponse
 from django.utils import timezone
-from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.renderers import BaseRenderer
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 
-from desktop_api.models import PharmacyLink
+from desktop_api.models import Pharmacy
+from desktop_api.permissions import (
+    FEATURE_MULTI_WAREHOUSE,
+    IsActiveOnlineMember,
+    IsActiveOnlineOwner,
+    max_warehouses_for,
+    plan_allows,
+    resolve_context,
+)
 from .models import (
     DamagedMedicine,
     Expense,
@@ -23,8 +30,16 @@ from .models import (
     Medicine,
     PurchaseInvoice,
     PurchaseInvoiceReturn,
+    StockTransfer,
     Supplier,
     SupplierPayment,
+    Warehouse,
+)
+from .offline_import import (
+    error_message,
+    has_existing_online_data,
+    iter_offline_import,
+    validate_offline_import,
 )
 from .serializers import (
     CheckoutInputSerializer,
@@ -33,8 +48,11 @@ from .serializers import (
     InvoiceSerializer,
     MedicineSerializer,
     PurchaseInvoiceSerializer,
+    StockTransferInputSerializer,
+    StockTransferSerializer,
     SupplierSerializer,
     SupplierSummarySerializer,
+    WarehouseSerializer,
 )
 
 
@@ -45,59 +63,242 @@ class MedicineViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = MedicineSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # القراءة لكل أعضاء الصيدلية (الموظف يحتاجها للبيع)، والكتابة للمالك فقط
+    # — مطابق لما تعرضه شاشة المخزون في Flutter (أزرار الإضافة/التعديل/الحذف للمالك).
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsActiveOnlineMember()]
+        return [IsActiveOnlineOwner()]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
         if membership is None:
             return Medicine.objects.none()
-        return Medicine.objects.filter(pharmacy=membership.pharmacy).order_by("trade_name")
+        qs = Medicine.objects.filter(pharmacy=membership.pharmacy)
+        warehouse_id = self.request.query_params.get("warehouse")
+        if warehouse_id:
+            if not str(warehouse_id).isdigit():
+                raise ValidationError("معرّف المخزن غير صحيح.")
+            qs = qs.filter(warehouse_id=warehouse_id)
+        return qs.order_by("trade_name")
 
     def perform_create(self, serializer):
         membership = self.request.user.pharmacymembership
-        serializer.save(pharmacy=membership.pharmacy)
+        warehouse = serializer.validated_data.get("warehouse") or Warehouse.main_for(membership.pharmacy)
+        serializer.save(pharmacy=membership.pharmacy, warehouse=warehouse)
 
 
-class PharmacyLinkViewSet(viewsets.ViewSet):
+def _is_referenced(medicine):
+    """صف دواء له سجل مبيعات أو إتلاف (PROTECT) لا يُحذف — يُصفَّر بدلاً من ذلك."""
+    return medicine.invoice_items.exists() or medicine.damaged_records.exists()
+
+
+class WarehouseViewSet(viewsets.ModelViewSet):
     """
-    للقراءة فقط: يرجّع الصيدليات المرتبطة بصيدلية المستخدم الحالي (خاصية
-    الباقة الذهبية: AppFeature.pharmacyLinking). لا create/update/delete
-    هنا عمداً — الربط قرار إداري مركزي يتم فقط من PharmacyLinkAdmin على
-    لوحة أدمن Django، ليس من التطبيق. تطبيق Flutter يستدعي هذا الـendpoint
-    عند بدء التشغيل ويمرر النتيجة لـ
-    DatabaseHelper.instance.replacePharmacyLinksCache() ليحدّث كاشه المحلي.
+    مخازن الصيدلية (خاصية Gold/Diamond: AppFeature.multiWarehouse).
+
+    - list/retrieve: لكل الأعضاء؛ يضمن وجود المخزن الرئيسي دائماً.
+    - create: للمالك فقط، بشرط سماح الباقة وعدم تجاوز max_warehouses_for.
+    - update: إعادة تسمية فقط.
+    - destroy: مخزن إضافي فارغ فقط (لا يُحذف الرئيسي أبداً).
+    - transfer: نقل كمية صنف بين مخزنين لنفس الصيدلية ذرّياً + سجل.
+    - transfers: سجل عمليات النقل.
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = WarehouseSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
-    def list(self, request):
-        membership = getattr(request.user, "pharmacymembership", None)
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsActiveOnlineMember()]
+        return [IsActiveOnlineOwner()]
+
+    def get_queryset(self):
+        membership = getattr(self.request.user, "pharmacymembership", None)
         if membership is None:
-            return Response({"ok": True, "linked_pharmacies": []})
+            return Warehouse.objects.none()
+        return Warehouse.objects.filter(pharmacy=membership.pharmacy).order_by("-is_main", "id")
 
-        pharmacy_id = membership.pharmacy_id
-        links = PharmacyLink.objects.filter(
-            Q(pharmacy_a_id=pharmacy_id) | Q(pharmacy_b_id=pharmacy_id)
-        ).select_related("pharmacy_a", "pharmacy_b")
+    def list(self, request, *args, **kwargs):
+        membership, _ = resolve_context(request)
+        Warehouse.main_for(membership.pharmacy)
+        # قائمة صغيرة (حد أقصى بضعة مخازن) — بلا ترقيم صفحات.
+        return Response(self.get_serializer(self.get_queryset(), many=True).data)
 
-        linked = []
-        for link in links:
-            other = link.pharmacy_b if link.pharmacy_a_id == pharmacy_id else link.pharmacy_a
-            linked.append({"id": other.id, "name": other.name})
+    def create(self, request, *args, **kwargs):
+        membership, license = resolve_context(request)
+        if not plan_allows(license, FEATURE_MULTI_WAREHOUSE):
+            raise PermissionDenied("باقتك الحالية لا تسمح بإضافة مخازن. قم بالترقية إلى الباقة الذهبية.")
 
-        return Response({"ok": True, "linked_pharmacies": linked})
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            # قفل صف الصيدلية يمنع طلبين متزامنين من تجاوز الحد معاً.
+            pharmacy = Pharmacy.objects.select_for_update().get(pk=membership.pharmacy_id)
+            Warehouse.main_for(pharmacy)
+            limit = max_warehouses_for(license)
+            if Warehouse.objects.filter(pharmacy=pharmacy).count() >= limit:
+                raise ValidationError(f"وصلت للحد الأقصى لعدد المخازن في باقتك ({limit}).")
+            serializer.save(pharmacy=pharmacy, is_main=False)
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        warehouse = self.get_object()
+        if warehouse.is_main:
+            raise ValidationError("لا يمكن حذف المخزن الرئيسي.")
+
+        with transaction.atomic():
+            medicines = list(Medicine.objects.select_for_update().filter(warehouse=warehouse))
+            if any(m.quantity > 0 for m in medicines):
+                raise ValidationError("لا يمكن حذف مخزن يحتوي على كمية مخزون. انقل الأصناف أولاً.")
+            # أصناف بكمية صفر: تُحذف إن لم يكن لها سجل، وإلا يبقى المخزن.
+            for medicine in medicines:
+                if _is_referenced(medicine):
+                    raise ValidationError(
+                        f"لا يمكن حذف المخزن: الصنف {medicine.trade_name} فيه له سجل مبيعات أو إتلاف."
+                    )
+                medicine.delete()
+            # سجل النقل يبقى (أسماء المخازن محفوظة نصاً فيه، والمرجع SET_NULL).
+            warehouse.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=["post"])
+    def transfer(self, request):
+        """
+        POST /api/warehouses/transfer/
+        body: {"medicine_id": 1, "to_warehouse_id": 2, "quantity": 5, "notes": ""}
+
+        نفس منطق DatabaseHelper.transferStock المحلي تماماً: إن وُجد في المخزن
+        الهدف صنف بنفس الباركود (أو بنفس الاسم إن كان بلا باركود) تُزاد كميته،
+        وإلا يُنشأ صف جديد. صف المصدر يُحذف إن صار صفراً، إلا إن كان له سجل
+        مبيعات/إتلاف فيبقى بكمية صفر. إن لم تسمح الباقة بتعدد المخازن (مثلاً
+        بعد تخفيضها) يُسمح فقط بالنقل *إلى* المخزن الرئيسي لتفريغ المخازن الأخرى.
+        """
+        membership, license = resolve_context(request)
+        data = StockTransferInputSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        data = data.validated_data
+        quantity = data["quantity"]
+
+        with transaction.atomic():
+            pharmacy = Pharmacy.objects.select_for_update().get(pk=membership.pharmacy_id)
+            try:
+                source = Medicine.objects.select_for_update().get(pk=data["medicine_id"], pharmacy=pharmacy)
+            except Medicine.DoesNotExist:
+                raise ValidationError("الصنف غير موجود في هذه الصيدلية.")
+            try:
+                destination = Warehouse.objects.get(pk=data["to_warehouse_id"], pharmacy=pharmacy)
+            except Warehouse.DoesNotExist:
+                raise ValidationError("المخزن الهدف غير موجود في هذه الصيدلية.")
+
+            if destination.pk == source.warehouse_id:
+                raise ValidationError("المخزن المصدر والهدف متطابقان.")
+            if not destination.is_main and not plan_allows(license, FEATURE_MULTI_WAREHOUSE):
+                raise PermissionDenied("باقتك الحالية تسمح فقط بالنقل إلى المخزن الرئيسي.")
+            if quantity > source.quantity:
+                raise ValidationError("الكمية المطلوب نقلها أكبر من الكمية المتوفرة.")
+
+            barcode = (source.barcode or "").strip() or None
+            if barcode:
+                target = Medicine.objects.select_for_update().filter(warehouse=destination, barcode=barcode).first()
+            else:
+                target = (
+                    Medicine.objects.select_for_update()
+                    .filter(warehouse=destination, trade_name=source.trade_name)
+                    .filter(Q(barcode__isnull=True) | Q(barcode=""))
+                    .first()
+                )
+
+            if target is not None:
+                Medicine.objects.filter(pk=target.pk).update(quantity=F("quantity") + quantity)
+            else:
+                target = Medicine.objects.create(
+                    pharmacy=pharmacy,
+                    warehouse=destination,
+                    trade_name=source.trade_name,
+                    scientific_name=source.scientific_name,
+                    category=source.category,
+                    quantity=quantity,
+                    buy_price=source.buy_price,
+                    sell_price=source.sell_price,
+                    expiry_date=source.expiry_date,
+                    shelf_location=source.shelf_location,
+                    is_damaged=False,
+                    barcode=barcode,
+                )
+
+            source_warehouse = source.warehouse
+            remaining = source.quantity - quantity
+            source_deleted = False
+            if remaining > 0 or _is_referenced(source):
+                Medicine.objects.filter(pk=source.pk).update(quantity=remaining)
+            else:
+                source.delete()
+                source_deleted = True
+
+            record = StockTransfer.objects.create(
+                pharmacy=pharmacy,
+                from_warehouse=source_warehouse,
+                to_warehouse=destination,
+                from_warehouse_name=source_warehouse.name,
+                to_warehouse_name=destination.name,
+                trade_name=source.trade_name,
+                barcode=barcode,
+                quantity=quantity,
+                notes=data.get("notes") or "",
+                transferred_by=request.user,
+            )
+
+        target.refresh_from_db()
+        context = self.get_serializer_context()
+        return Response(
+            {
+                "transfer": StockTransferSerializer(record, context=context).data,
+                "source": None if source_deleted else MedicineSerializer(
+                    Medicine.objects.get(pk=data["medicine_id"]), context=context
+                ).data,
+                "source_deleted": source_deleted,
+                "source_id": data["medicine_id"],
+                "destination": MedicineSerializer(target, context=context).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=["get"])
+    def transfers(self, request):
+        membership, _ = resolve_context(request)
+        qs = StockTransfer.objects.filter(pharmacy=membership.pharmacy).select_related("from_warehouse", "to_warehouse")
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            return self.get_paginated_response(StockTransferSerializer(page, many=True).data)
+        return Response(StockTransferSerializer(qs, many=True).data)
 
 
 def _next_invoice_number(pharmacy):
     """
-    يولَّد داخل معاملة تُقفل فيها الصيدلية أصلاً (انظر
-    InvoiceViewSet.checkout)، فلا حاجة لقفل إضافي هنا. الصيغة نفس شكل
-    الترقيم المحلي الحالي في Flutter (generateInvoiceNumber) للتناسق:
-    "INV-" ثم رقم تسلسلي بمحاذاة 6 أصفار، لكن هنا لكل صيدلية على حدة.
+    يولَّد داخل معاملة تُقفل فيها الصيدلية أصلاً (انظر InvoiceViewSet.checkout)،
+    فلا حاجة لقفل إضافي هنا. الصيغة: "INV-" ثم رقم بمحاذاة 6 أصفار، لكل صيدلية.
+
+    كان الرقم يُحسب بـ count()+1، فيتكرر رقم موجود (وينهار البيع بخطأ 500 بسبب
+    قيد unique_invoice_number_per_pharmacy) في حالتين: بعد حذف أي فاتورة من
+    لوحة الأدمن، أو بعد ترحيل فواتير أوفلاين بترقيمها المحلي الذي فيه فجوات.
+    الآن: أكبر رقم INV-<n> موجود + 1، مع التأكد أنه غير مستخدم.
     """
 
-    last_count = Invoice.objects.filter(pharmacy=pharmacy).count()
-    return f"INV-{last_count + 1:06d}"
+    last = (
+        Invoice.objects.filter(pharmacy=pharmacy, invoice_number__regex=r"^INV-[0-9]+$")
+        .annotate(number_length=Length("invoice_number"))
+        .order_by("-number_length", "-invoice_number")
+        .values_list("invoice_number", flat=True)
+        .first()
+    )
+    candidate = int(last[len("INV-"):]) + 1 if last else 1
+    while Invoice.objects.filter(pharmacy=pharmacy, invoice_number=f"INV-{candidate:06d}").exists():
+        candidate += 1
+    return f"INV-{candidate:06d}"
 
 
 class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
@@ -109,7 +310,11 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     serializer_class = InvoiceSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # القراءة والبيع (checkout) للمالك والموظف، أما الإرجاع (refund) فللمالك فقط.
+    def get_permissions(self):
+        if self.action == "refund":
+            return [IsActiveOnlineOwner()]
+        return [IsActiveOnlineMember()]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
@@ -148,6 +353,19 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
         input_serializer.is_valid(raise_exception=True)
         data = input_serializer.validated_data
 
+        # دمج الأسطر المكررة لنفس الدواء قبل فحص الكمية. بدون هذا كان الفحص
+        # يقارن كل سطر بالمخزون الأصلي منفصلاً (4+4 من مخزون 5 يمر كلاهما)، ثم
+        # يفشل الخصم بقيد قاعدة البيانات فيرجع خطأ 500 بدل رسالة واضحة.
+        merged_quantities = {}
+        for line in data["items"]:
+            merged_quantities[line["medicine_id"]] = (
+                merged_quantities.get(line["medicine_id"], 0) + line["quantity"]
+            )
+        checkout_items = [
+            {"medicine_id": medicine_id, "quantity": quantity}
+            for medicine_id, quantity in merged_quantities.items()
+        ]
+
         with transaction.atomic():
             pharmacy = (
                 type(membership.pharmacy)
@@ -155,7 +373,7 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
                 .get(pk=membership.pharmacy_id)
             )
 
-            requested_ids = [item["medicine_id"] for item in data["items"]]
+            requested_ids = [item["medicine_id"] for item in checkout_items]
             medicines = {
                 medicine.id: medicine
                 for medicine in Medicine.objects.select_for_update().filter(
@@ -165,12 +383,19 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
 
             total_amount = Decimal("0")
             prepared_items = []
+            # البيع من المخزن الرئيسي حصراً (نفس قاعدة شاشة POS في Flutter)؛
+            # المخازن الإضافية للتخزين فقط ويُنقل منها للرئيسي قبل البيع.
+            main_warehouse = Warehouse.main_for(pharmacy)
 
-            for item in data["items"]:
+            for item in checkout_items:
                 medicine = medicines.get(item["medicine_id"])
                 if medicine is None:
                     raise ValidationError(
                         f"الدواء رقم {item['medicine_id']} غير موجود في هذه الصيدلية."
+                    )
+                if medicine.warehouse_id != main_warehouse.pk:
+                    raise ValidationError(
+                        f"{medicine.trade_name} ليس في المخزن الرئيسي. انقله إلى المخزن الرئيسي قبل البيع."
                     )
                 if medicine.quantity < item["quantity"]:
                     raise ValidationError(
@@ -261,7 +486,7 @@ class SupplierViewSet(viewsets.ModelViewSet):
     """CRUD كامل للمذاخر، مقيَّد بصيدلية المستخدم فقط — نفس نمط MedicineViewSet."""
 
     serializer_class = SupplierSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveOnlineOwner]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
@@ -414,7 +639,7 @@ class PurchaseInvoiceViewSet(
     """
 
     serializer_class = PurchaseInvoiceSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveOnlineOwner]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
@@ -530,7 +755,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     """CRUD كامل للمصاريف، مقيَّد بصيدلية المستخدم فقط — نفس نمط SupplierViewSet/MedicineViewSet."""
 
     serializer_class = ExpenseSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveOnlineOwner]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
@@ -559,7 +784,7 @@ class DamagedMedicineViewSet(
     """
 
     serializer_class = DamagedMedicineSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveOnlineOwner]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
@@ -629,7 +854,7 @@ class ReportsViewSet(viewsets.ViewSet):
     واحد.
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveOnlineOwner]
 
     def _membership(self, request):
         membership = getattr(request.user, "pharmacymembership", None)
@@ -860,7 +1085,7 @@ class MigrationViewSet(viewsets.ViewSet):
     يستحق الانتباه إن جرت عدة عمليات ترحيل متزامنة على خادم بموارد محدودة.
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsActiveOnlineOwner]
 
     def _membership(self, request):
         membership = getattr(request.user, "pharmacymembership", None)
@@ -872,7 +1097,7 @@ class MigrationViewSet(viewsets.ViewSet):
     def status(self, request):
         """يفحصه Flutter عند كل دخول أونلاين للمالك ليقرر عرض اقتراح الرفع أو إخفاءه."""
         pharmacy = self._membership(request).pharmacy
-        has_existing_online_data = self._has_existing_online_data(pharmacy)
+        existing_online_data = has_existing_online_data(pharmacy)
         return Response(
             {
                 "migrated": pharmacy.migrated_from_offline_at is not None,
@@ -882,238 +1107,22 @@ class MigrationViewSet(viewsets.ViewSet):
                     else None
                 ),
                 # true تعني: لا يمكن بدء رفع أولي جديد حتى لو migrated=false،
-                # لوجود بيانات أونلاين حقيقية مسبقاً (راجع _has_existing_online_data).
-                "has_existing_online_data": has_existing_online_data,
+                # لوجود بيانات أونلاين حقيقية مسبقاً (راجع offline_import.has_existing_online_data).
+                "has_existing_online_data": existing_online_data,
             }
         )
 
-    def _has_existing_online_data(self, pharmacy):
-        return (
-            Medicine.objects.filter(pharmacy=pharmacy).exists()
-            or Supplier.objects.filter(pharmacy=pharmacy).exists()
-            or Invoice.objects.filter(pharmacy=pharmacy).exists()
-            or Expense.objects.filter(pharmacy=pharmacy).exists()
-            or DamagedMedicine.objects.filter(pharmacy=pharmacy).exists()
-        )
-
-    @staticmethod
-    def _parse_datetime(value):
-        """يقبل ISO datetime أو date فقط؛ يرجع None لأي شيء غير مفهوم (يُطبَّق timezone.now() بدلاً منه لاحقاً)."""
-        if not value or not isinstance(value, str):
-            return None
-        parsed = parse_datetime(value)
-        if parsed is not None:
-            return timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
-        d = parse_date(value)
-        if d is not None:
-            return timezone.make_aware(datetime.combine(d, datetime.min.time()))
-        return None
-
-    @staticmethod
-    def _parse_date(value):
-        if not value or not isinstance(value, str):
-            return None
-        d = parse_date(value)
-        if d is not None:
-            return d
-        dt = parse_datetime(value)
-        return dt.date() if dt is not None else None
-
     def _migration_stream(self, pharmacy, payload):
+        """يحوّل أحداث iter_offline_import إلى أسطر NDJSON، والخطأ إلى حدث error."""
         def line(obj):
             return json.dumps(obj, default=str) + "\n"
 
-        suppliers_in = payload.get("suppliers") or []
-        medicines_in = payload.get("medicines") or []
-        purchase_invoices_in = payload.get("purchase_invoices") or []
-        invoices_in = payload.get("invoices") or []
-        damaged_in = payload.get("damaged_medicines") or []
-        expenses_in = payload.get("expenses") or []
-
-        # كل عنصر من المستويات العليا الستة = وحدة تقدّم واحدة. العناصر
-        # المتداخلة (payments/returns/items) لا تُحسَب في الإجمالي منفصلة —
-        # تبسيط متعمَّد يبقي شريط التقدّم مفهوماً (فاتورة شراء واحدة = خطوة
-        # واحدة، بصرف النظر عن عدد دفعاتها).
-        overall_total = (
-            len(suppliers_in) + len(medicines_in) + len(purchase_invoices_in)
-            + len(invoices_in) + len(damaged_in) + len(expenses_in)
-        )
-        overall_done = 0
-        yield line({"event": "start", "overall_total": overall_total})
-
         try:
-            with transaction.atomic():
-                supplier_id_map = {}
-                for item in suppliers_in:
-                    supplier = Supplier.objects.create(
-                        pharmacy=pharmacy,
-                        name=item.get("name") or "",
-                        phone=item.get("phone") or "",
-                    )
-                    local_id = item.get("local_id")
-                    if local_id is not None:
-                        supplier_id_map[local_id] = supplier.id
-                    overall_done += 1
-                    yield line({"event": "progress", "stage": "suppliers", "overall_done": overall_done, "overall_total": overall_total})
-
-                medicine_id_map = {}
-                for item in medicines_in:
-                    medicine = Medicine.objects.create(
-                        pharmacy=pharmacy,
-                        trade_name=item.get("trade_name") or "",
-                        scientific_name=item.get("scientific_name") or "",
-                        category=item.get("category") or "",
-                        quantity=int(item.get("quantity") or 0),
-                        buy_price=Decimal(str(item.get("buy_price") or 0)),
-                        sell_price=Decimal(str(item.get("sell_price") or 0)),
-                        expiry_date=item.get("expiry_date") or None,
-                        shelf_location=item.get("shelf_location") or "",
-                        is_damaged=bool(item.get("is_damaged") or False),
-                        barcode=item.get("barcode") or None,
-                    )
-                    local_id = item.get("local_id")
-                    if local_id is not None:
-                        medicine_id_map[local_id] = medicine.id
-                    overall_done += 1
-                    yield line({"event": "progress", "stage": "medicines", "overall_done": overall_done, "overall_total": overall_total})
-
-                purchase_invoices_created = 0
-                payments_created = 0
-                returns_created = 0
-                for item in purchase_invoices_in:
-                    local_supplier_id = item.get("local_supplier_id")
-                    server_supplier_id = supplier_id_map.get(local_supplier_id)
-                    if server_supplier_id is None:
-                        raise ValidationError(
-                            f"فاتورة شراء تشير لمورد غير موجود ضمن قائمة الموردين المرفوعة (local_supplier_id={local_supplier_id})."
-                        )
-
-                    purchase_invoice = PurchaseInvoice.objects.create(
-                        pharmacy=pharmacy,
-                        supplier_id=server_supplier_id,
-                        invoice_number=item.get("invoice_number") or "",
-                        total_amount=Decimal(str(item.get("total_amount") or 0)),
-                        paid_amount=Decimal(str(item.get("paid_amount") or 0)),
-                        created_at=self._parse_datetime(item.get("created_at")) or timezone.now(),
-                    )
-
-                    for p in item.get("payments") or []:
-                        SupplierPayment.objects.create(
-                            pharmacy=pharmacy,
-                            supplier_id=server_supplier_id,
-                            purchase_invoice=purchase_invoice,
-                            amount_paid=Decimal(str(p.get("amount_paid") or 0)),
-                            notes=p.get("notes") or "",
-                            paid_at=self._parse_datetime(p.get("paid_at")) or timezone.now(),
-                        )
-                        payments_created += 1
-
-                    for r in item.get("returns") or []:
-                        PurchaseInvoiceReturn.objects.create(
-                            pharmacy=pharmacy,
-                            supplier_id=server_supplier_id,
-                            purchase_invoice=purchase_invoice,
-                            amount_returned=Decimal(str(r.get("amount_returned") or 0)),
-                            notes=r.get("notes") or "",
-                            returned_at=self._parse_datetime(r.get("returned_at")) or timezone.now(),
-                        )
-                        returns_created += 1
-
-                    purchase_invoices_created += 1
-                    overall_done += 1
-                    yield line({"event": "progress", "stage": "purchase_invoices", "overall_done": overall_done, "overall_total": overall_total})
-
-                invoices_created = 0
-                invoice_items_created = 0
-                for item in invoices_in:
-                    invoice = Invoice.objects.create(
-                        pharmacy=pharmacy,
-                        invoice_number=item.get("invoice_number") or f"MIGRATED-{overall_done + 1}",
-                        cashier=None,
-                        cashier_name=item.get("cashier_name") or "",
-                        total_amount=Decimal(str(item.get("total_amount") or 0)),
-                        discount=Decimal(str(item.get("discount") or 0)),
-                        final_amount=Decimal(str(item.get("final_amount") or 0)),
-                        created_at=self._parse_datetime(item.get("created_at")) or timezone.now(),
-                        is_refunded=bool(item.get("is_refunded") or False),
-                    )
-                    for it in item.get("items") or []:
-                        local_medicine_id = it.get("local_medicine_id")
-                        server_medicine_id = medicine_id_map.get(local_medicine_id)
-                        if server_medicine_id is None:
-                            raise ValidationError(
-                                f"عنصر فاتورة يشير لدواء غير موجود ضمن قائمة الأدوية المرفوعة (local_medicine_id={local_medicine_id})."
-                            )
-                        InvoiceItem.objects.create(
-                            invoice=invoice,
-                            medicine_id=server_medicine_id,
-                            trade_name=it.get("trade_name") or "",
-                            quantity=int(it.get("quantity") or 0),
-                            unit_price=Decimal(str(it.get("unit_price") or 0)),
-                            total_price=Decimal(str(it.get("total_price") or 0)),
-                        )
-                        invoice_items_created += 1
-
-                    invoices_created += 1
-                    overall_done += 1
-                    yield line({"event": "progress", "stage": "invoices", "overall_done": overall_done, "overall_total": overall_total})
-
-                damaged_created = 0
-                for item in damaged_in:
-                    local_medicine_id = item.get("local_medicine_id")
-                    server_medicine_id = medicine_id_map.get(local_medicine_id)
-                    if server_medicine_id is None:
-                        # سجل تالف يتيم (دواؤه غير موجود ضمن المرفوع) — يُتجاهَل
-                        # بدل إفشال كامل عملية الرفع من أجل سجل واحد شاذ.
-                        overall_done += 1
-                        yield line({"event": "progress", "stage": "damaged_medicines", "overall_done": overall_done, "overall_total": overall_total})
-                        continue
-                    DamagedMedicine.objects.create(
-                        pharmacy=pharmacy,
-                        medicine_id=server_medicine_id,
-                        quantity_damaged=int(item.get("quantity_damaged") or 0),
-                        reason=item.get("reason") or "",
-                        notes=item.get("notes") or "",
-                        damaged_at=self._parse_date(item.get("damaged_at")) or date.today(),
-                    )
-                    damaged_created += 1
-                    overall_done += 1
-                    yield line({"event": "progress", "stage": "damaged_medicines", "overall_done": overall_done, "overall_total": overall_total})
-
-                expenses_created = 0
-                for item in expenses_in:
-                    Expense.objects.create(
-                        pharmacy=pharmacy,
-                        expense_type=item.get("expense_type") or "",
-                        expense_date=self._parse_date(item.get("expense_date")) or date.today(),
-                        amount=Decimal(str(item.get("amount") or 0)),
-                        notes=item.get("notes") or "",
-                    )
-                    expenses_created += 1
-                    overall_done += 1
-                    yield line({"event": "progress", "stage": "expenses", "overall_done": overall_done, "overall_total": overall_total})
-
-                pharmacy.migrated_from_offline_at = timezone.now()
-                pharmacy.save(update_fields=["migrated_from_offline_at"])
-
-                summary = {
-                    "suppliers_created": len(supplier_id_map),
-                    "medicines_created": len(medicine_id_map),
-                    "purchase_invoices_created": purchase_invoices_created,
-                    "supplier_payments_created": payments_created,
-                    "purchase_invoice_returns_created": returns_created,
-                    "invoices_created": invoices_created,
-                    "invoice_items_created": invoice_items_created,
-                    "damaged_records_created": damaged_created,
-                    "expenses_created": expenses_created,
-                    "migrated_at": pharmacy.migrated_from_offline_at.isoformat(),
-                }
+            for event in iter_offline_import(pharmacy, payload):
+                yield line(event)
         except Exception as exc:
-            message = str(getattr(exc, "detail", exc))
-            yield line({"event": "error", "message": message})
-            return
-
-        yield line({"event": "done", "ok": True, "summary": summary})
+            # المعاملة أُلغيت كاملة داخل iter_offline_import قبل وصول الاستثناء.
+            yield line({"event": "error", "message": error_message(exc)})
 
     @action(detail=False, methods=["post"], renderer_classes=[NDJSONRenderer])
     def upload_offline_data(self, request):
@@ -1121,20 +1130,12 @@ class MigrationViewSet(viewsets.ViewSet):
         if not membership.is_owner:
             raise PermissionDenied("الرفع الأولي متاح لمالك الصيدلية فقط.")
 
+        _, license = resolve_context(request)
         pharmacy = membership.pharmacy
-        if pharmacy.migrated_from_offline_at is not None:
-            raise ValidationError("تم رفع بيانات هذه الصيدلية مسبقاً، لا يمكن تكرار العملية.")
-
-        # فحص الأمان المطلوب: رفض الترحيل إن وُجدت بيانات أونلاين حقيقية
-        # مسبقاً لهذه الصيدلية، حتى لو migrated_from_offline_at غير مضبوط
-        # لسبب ما — تفادياً لدمج بيانات محلية قديمة فوق بيانات أونلاين حية.
-        if self._has_existing_online_data(pharmacy):
-            raise ValidationError("توجد بيانات أونلاين مسجّلة مسبقاً لهذه الصيدلية، لا يمكن تنفيذ رفع أولي فوقها.")
-
         payload = request.data if isinstance(request.data, dict) else {}
-        for key in ("suppliers", "medicines", "purchase_invoices", "invoices", "damaged_medicines", "expenses"):
-            if key in payload and not isinstance(payload[key], list):
-                raise ValidationError(f"صيغة {key} يجب أن تكون قائمة.")
+        # نفس شروط أمر migrate_offline_data: الباقة، عدم التكرار، لا بيانات
+        # أونلاين قائمة، وصيغة القوائم.
+        validate_offline_import(pharmacy, license, payload)
 
         response = StreamingHttpResponse(
             self._migration_stream(pharmacy, payload),
