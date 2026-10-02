@@ -20,6 +20,7 @@ import 'services/warehouse_api_service.dart';
 import 'services/backup_service.dart';
 import 'services/update_service.dart';
 import 'models/subscription_plan.dart';
+import 'models/license_expiry.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -185,11 +186,12 @@ class _StartupGateState extends State<_StartupGate> {
         isOwner: isOwner,
         isOnlineMode: isOnlineMode,
         entitlements: SubscriptionEntitlements.fromLicense(license),
+        licenseExpiry: LicenseExpiry.fromLicense(license),
       );
     }
 
     return AuthScreen(
-      onLoginSuccess: (pharmacyId, userId, isOwner, isOnlineMode, entitlements) {
+      onLoginSuccess: (pharmacyId, userId, isOwner, isOnlineMode, entitlements, licenseExpiry) {
         // طبقة أمان إضافية: تغطي أول تسجيل دخول قبل وجود أي جلسة محفوظة،
         // ولا تكرر النسخة لو كانت _checkActivation أخذتها أصلاً بنفس اليوم.
         BackupService.runDailyBackupIfNeeded();
@@ -202,6 +204,7 @@ class _StartupGateState extends State<_StartupGate> {
               isOwner: isOwner,
               isOnlineMode: isOnlineMode,
               entitlements: entitlements,
+              licenseExpiry: licenseExpiry,
             ),
           ),
         );

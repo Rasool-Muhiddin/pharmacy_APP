@@ -3,8 +3,11 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
+
+import '../models/license_expiry.dart';
 
 class DesktopAuthException implements Exception {
   final String message;
@@ -29,9 +32,14 @@ class DesktopAuthStorage {
     bits: 256,
   );
 
+  /// للاختبارات فقط: مجلد بديل لملف الحالة (path_provider غير متاح في
+  /// `flutter test`).
+  @visibleForTesting
+  static String? stateDirectoryOverride;
+
   Future<File> _stateFile() async {
-    final directory = await getApplicationSupportDirectory();
-    return File('${directory.path}${Platform.pathSeparator}$_fileName');
+    final directoryPath = stateDirectoryOverride ?? (await getApplicationSupportDirectory()).path;
+    return File('$directoryPath${Platform.pathSeparator}$_fileName');
   }
 
   Future<Map<String, dynamic>> _readState() async {
@@ -237,13 +245,15 @@ class DesktopAuthStorage {
       throw const DesktopAuthException('ترخيص نسخة سطح المكتب غير فعال.');
     }
 
-    final expiresAtText = license['expires_at'] as String?;
-    if (expiresAtText != null && expiresAtText.isNotEmpty) {
-      final expiresAt = DateTime.tryParse(expiresAtText)?.toLocal();
-
-      if (expiresAt != null && DateTime.now().isAfter(expiresAt)) {
-        throw const DesktopAuthException('انتهت صلاحية ترخيص نسخة سطح المكتب.');
-      }
+    // نفس قاعدة الخادم (DesktopLicense.is_valid): مدى الحياة لا ينتهي مهما
+    // كان expires_at، وannual/trial يحتاجان expires_at لم يمضِ.
+    final expiry = LicenseExpiry.fromLicense(license);
+    if (expiry.isExpired(DateTime.now())) {
+      throw DesktopAuthException(
+        expiry.expiresAt == null
+            ? 'ترخيص نسخة سطح المكتب غير فعال.'
+            : 'انتهت صلاحية ترخيص نسخة سطح المكتب.',
+      );
     }
 
     final validatedAt = DateTime.tryParse(

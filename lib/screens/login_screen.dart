@@ -14,6 +14,7 @@ import '../services/warehouse_api_service.dart';
 import 'main_layout.dart';
 import '../database/db_helper.dart';
 import '../models/subscription_plan.dart';
+import '../models/license_expiry.dart';
 
 class AuthScreen extends StatefulWidget {
   final Function(
@@ -22,6 +23,7 @@ class AuthScreen extends StatefulWidget {
     bool isOwner,
     bool isOnlineMode,
     SubscriptionEntitlements entitlements,
+    LicenseExpiry licenseExpiry,
   )? onLoginSuccess;
 
   const AuthScreen({
@@ -147,6 +149,7 @@ class _AuthScreenState extends State<AuthScreen> {
     final isOwner = user['is_owner'] == true || user['is_owner'] == 1;
     final license = Map<String, dynamic>.from(response['license'] as Map);
     final entitlements = SubscriptionEntitlements.fromLicense(license);
+    final licenseExpiry = LicenseExpiry.fromLicense(license);
     // license.mode قادم من DesktopLicense.mode على الخادم ("online"/"offline")؛
     // متوفر سواء جاء الرد من دخول أونلاين فعلي أو من verifyOfflineLogin
     // (لأنه يُحفظ ويُعاد من الترخيص المخزَّن محلياً في كلتا الحالتين).
@@ -260,7 +263,7 @@ class _AuthScreenState extends State<AuthScreen> {
     );
 
     if (widget.onLoginSuccess != null) {
-      widget.onLoginSuccess!(pharmacyId, userId, isOwner, isOnlineMode, entitlements);
+      widget.onLoginSuccess!(pharmacyId, userId, isOwner, isOnlineMode, entitlements, licenseExpiry);
       return;
     }
 
@@ -272,6 +275,7 @@ class _AuthScreenState extends State<AuthScreen> {
           isOwner: isOwner,
           isOnlineMode: isOnlineMode,
           entitlements: entitlements,
+          licenseExpiry: licenseExpiry,
         ),
       ),
     );

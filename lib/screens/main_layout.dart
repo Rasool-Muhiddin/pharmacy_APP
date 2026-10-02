@@ -20,6 +20,8 @@ import '../screens/expenses_screen.dart';
 import '../screens/offline_migration_screen.dart';
 import '../services/migration_api_service.dart';
 import '../models/subscription_plan.dart';
+import '../models/license_expiry.dart';
+import '../widgets/license_expiry_banner.dart';
 
 class MainLayout extends StatefulWidget {
   final int pharmacyId; // رقم الفرع الحالي
@@ -27,6 +29,7 @@ class MainLayout extends StatefulWidget {
   final bool isOwner;   // صلاحية المالك/المدير
   final bool isOnlineMode; // من license.mode القادم من التفعيل/تسجيل الدخول
   final SubscriptionEntitlements entitlements;
+  final LicenseExpiry licenseExpiry; // من license.expires_at المحفوظ (تحذير اقتراب الانتهاء)
 
   MainLayout({
     super.key, 
@@ -35,6 +38,7 @@ class MainLayout extends StatefulWidget {
     this.isOwner = true, // قيمة افتراضية
     this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين) قبل ربط الاستدعاءات القديمة
     SubscriptionEntitlements? entitlements,
+    this.licenseExpiry = const LicenseExpiry.none(),
   }) : entitlements = entitlements ?? SubscriptionEntitlements.basic();
 
   @override
@@ -224,6 +228,8 @@ class _MainLayoutState extends State<MainLayout> {
                     pageTitle: _currentPage,
                     icon: _pageIcons[_currentPage] ?? Icons.circle,
                   ),
+
+                  LicenseExpiryBanner(expiry: widget.licenseExpiry),
 
                   // الشاشة النشطة
                   Expanded(
