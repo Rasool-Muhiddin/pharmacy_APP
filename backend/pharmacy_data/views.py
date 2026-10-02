@@ -1098,17 +1098,18 @@ class MigrationViewSet(viewsets.ViewSet):
         """يفحصه Flutter عند كل دخول أونلاين للمالك ليقرر عرض اقتراح الرفع أو إخفاءه."""
         pharmacy = self._membership(request).pharmacy
         existing_online_data = has_existing_online_data(pharmacy)
+        # "مرفوعة" فعلاً فقط إن وُجدت بياناتها على الخادم: علَم بلا بيانات لا
+        # يُعدّ رفعاً، فتعود النسخ المثبّتة من التطبيق (التي تكتفي بفحص
+        # migrated/has_existing_online_data) لعرض اقتراح الرفع تلقائياً.
+        migrated = pharmacy.migrated_from_offline_at is not None and existing_online_data
         return Response(
             {
-                "migrated": pharmacy.migrated_from_offline_at is not None,
-                "migrated_at": (
-                    pharmacy.migrated_from_offline_at.isoformat()
-                    if pharmacy.migrated_from_offline_at
-                    else None
-                ),
+                "migrated": migrated,
+                "migrated_at": pharmacy.migrated_from_offline_at.isoformat() if migrated else None,
                 # true تعني: لا يمكن بدء رفع أولي جديد حتى لو migrated=false،
                 # لوجود بيانات أونلاين حقيقية مسبقاً (راجع offline_import.has_existing_online_data).
                 "has_existing_online_data": existing_online_data,
+                "can_migrate": not existing_online_data,
             }
         )
 

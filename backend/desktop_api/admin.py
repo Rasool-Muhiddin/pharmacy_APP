@@ -28,6 +28,8 @@ class DeviceActivationInline(admin.TabularInline):
 class PharmacyAdmin(admin.ModelAdmin):
     list_display = ("name", "is_active", "migrated_from_offline_at", "created_at")
     search_fields = ("name",)
+    # يضبطه الرفع الأولي فقط؛ ضبطه يدوياً كان يُخفي اقتراح الرفع عن المالك.
+    readonly_fields = ("migrated_from_offline_at",)
 
 
 @admin.register(PharmacyMembership)

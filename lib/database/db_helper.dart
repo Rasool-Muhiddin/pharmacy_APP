@@ -2335,18 +2335,25 @@ Future<void> settlePurchaseInvoiceCredit(int purchaseInvoiceId) async {
 // "تفريغ" هنا إطلاقاً (خلافاً لتصميم سابق أُلغي عمداً).
 //====================================================
 
-/// عدد صفوف المخزون/الموردين محلياً — يُستخدم فقط لتقرير ما إذا كان يستحق
-/// عرض اقتراح الرفع أصلاً (صيدلية أونلاين جديدة بلا بيانات سابقة لا تحتاج
-/// أي رفع، فلا داعي لإزعاج صاحبها بالسؤال).
+/// هل توجد أي بيانات أوفلاين محلية تستحق الرفع — يُستخدم فقط لتقرير ما إذا
+/// كان يستحق عرض اقتراح الرفع أصلاً (صيدلية أونلاين جديدة بلا بيانات سابقة
+/// لا تحتاج أي رفع، فلا داعي لإزعاج صاحبها بالسؤال). يشمل كل ما تحمله
+/// getOfflineMigrationPayload، لا المخزون/الموردين فقط، وإلا بقيت مثلاً
+/// مصروفات صيدلية بلا أدوية مخفية أونلاين بلا أي اقتراح رفع.
 Future<bool> hasLocalDataWorthMigrating(int pharmacyId) async {
   final db = await database;
-  final medCount = Sqflite.firstIntValue(await db.rawQuery(
-    'SELECT COUNT(*) FROM medicine WHERE pharmacy_id = ? AND ${localOnly()}', [pharmacyId],
-  )) ?? 0;
-  final supCount = Sqflite.firstIntValue(await db.rawQuery(
-    'SELECT COUNT(*) FROM pharmacy_supplier WHERE pharmacy_id = ?', [pharmacyId],
-  )) ?? 0;
-  return medCount > 0 || supCount > 0;
+  const checks = [
+    'SELECT 1 FROM medicine WHERE pharmacy_id = ? AND id >= $localIdBase LIMIT 1',
+    'SELECT 1 FROM invoice WHERE pharmacy_id = ? AND id >= $localIdBase LIMIT 1',
+    'SELECT 1 FROM expense WHERE pharmacy_id = ? AND id >= $localIdBase LIMIT 1',
+    'SELECT 1 FROM damaged_medicine WHERE pharmacy_id = ? AND id >= $localIdBase LIMIT 1',
+    'SELECT 1 FROM pharmacy_supplier WHERE pharmacy_id = ? LIMIT 1',
+    'SELECT 1 FROM purchase_invoice WHERE pharmacy_id = ? LIMIT 1',
+  ];
+  for (final sql in checks) {
+    if ((await db.rawQuery(sql, [pharmacyId])).isNotEmpty) return true;
+  }
+  return false;
 }
 
 /// يبني حمولة الرفع الكاملة (النطاق الشامل بلا استثناء) من الجداول

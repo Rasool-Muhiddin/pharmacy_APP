@@ -218,6 +218,64 @@ class RegressionTests(TestCase):
         self.assertIn('"event": "done"', body, body)
         self.assertEqual(Medicine.objects.filter(pharmacy=self.pharmacy).count(), 4)
 
+    def upload(self, payload):
+        r = self.api("post", "/api/migration/upload_offline_data/", payload)
+        if r.status_code != 200:
+            return r.status_code, r.content.decode()
+        return 200, b"".join(r.streaming_content).decode()
+
+    def test_flag_without_online_data_does_not_lock_out_migration(self):
+        # حالة "صيدلية الشعب": migrated_from_offline_at مضبوط لكن لا بيانات
+        # أونلاين إطلاقاً للصيدلية — كان الخادم يرفض الرفع للأبد، والتطبيق
+        # يُخفي الاقتراح، فتظهر الصيدلية فارغة رغم وجود بياناتها محلياً.
+        Medicine.objects.filter(pharmacy=self.pharmacy).delete()
+        Pharmacy.objects.filter(pk=self.pharmacy.pk).update(migrated_from_offline_at=timezone.now())
+
+        status = self.api("get", "/api/migration/status/").json()
+        self.assertEqual(status["migrated"], False)
+        self.assertEqual(status["has_existing_online_data"], False)
+        self.assertEqual(status["can_migrate"], True)
+
+        code, body = self.upload({"medicines": [{"local_id": 10**12, "trade_name": "Local"}]})
+        self.assertEqual(code, 200, body)
+        self.assertIn('"event": "done"', body, body)
+        self.assertEqual(Medicine.objects.get(pharmacy=self.pharmacy).trade_name, "Local")
+
+        status = self.api("get", "/api/migration/status/").json()
+        self.assertEqual((status["migrated"], status["can_migrate"]), (True, False))
+        code, body = self.upload({"medicines": [{"local_id": 10**12, "trade_name": "Local"}]})
+        self.assertEqual(code, 400, body)  # لا تكرار بعد رفع فعلي
+        self.assertIn("مسبقاً", json.loads(body)[0])
+        self.assertEqual(Medicine.objects.filter(pharmacy=self.pharmacy).count(), 1)
+
+    def test_empty_upload_is_rejected_and_does_not_consume_migration(self):
+        Medicine.objects.filter(pharmacy=self.pharmacy).delete()
+        for payload in ({}, {key: [] for key in ("warehouses", "suppliers", "medicines", "invoices", "expenses")}):
+            code, body = self.upload(payload)
+            self.assertEqual(code, 400, body)
+        self.pharmacy.refresh_from_db()
+        self.assertIsNone(self.pharmacy.migrated_from_offline_at)
+        self.assertTrue(self.api("get", "/api/migration/status/").json()["can_migrate"])
+
+    def test_migration_targets_token_pharmacy_only(self):
+        # لا يرسل التطبيق pharmacy_id إطلاقاً: الصيدلية تُحدَّد من عضوية صاحب
+        # الـToken، فلا يمكن لأي اختلاف معرّفات محلي أن يرفع لصيدلية أخرى.
+        Medicine.objects.filter(pharmacy=self.pharmacy).delete()
+        other = Pharmacy.objects.create(name="P2")
+        code, body = self.upload({"pharmacy_id": other.pk, "medicines": [{"local_id": 1, "trade_name": "A", "pharmacy": other.pk}]})
+        self.assertIn('"event": "done"', body, body)
+        self.assertEqual(Medicine.objects.get().pharmacy, self.pharmacy)
+        other.refresh_from_db()
+        self.assertIsNone(other.migrated_from_offline_at)
+        self.assertEqual([m["trade_name"] for m in self.api("get", "/api/medicines/").json()["results"]], ["A"])
+
+    def test_pharmacy_admin_cannot_edit_migration_flag(self):
+        admin_user = User.objects.create_superuser("admin", password=PASSWORD)
+        self.client.force_login(admin_user)
+        r = self.client.get(f"/admin/desktop_api/pharmacy/{self.pharmacy.pk}/change/")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotContains(r, 'name="migrated_from_offline_at_0"')
+
 
 @override_settings(ALLOWED_HOSTS=["testserver", "localhost"], PASSWORD_HASHERS=FAST_HASHERS)
 class WarehouseTests(TestCase):

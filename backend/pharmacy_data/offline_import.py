@@ -47,6 +47,10 @@ def has_existing_online_data(pharmacy):
     """
     بيانات أونلاين حقيقية مسجّلة مسبقاً لهذه الصيدلية. المخازن لا تُحتسب (المخزن
     الرئيسي يُنشأ تلقائياً عند أول طلب).
+
+    هذا هو الشرط الحاسم لمنع تكرار الرفع، لا migrated_from_offline_at وحده:
+    علَم بلا أي بيانات (رفع فارغ قديم، أو ضبطه يدوياً، أو حذف البيانات بعده)
+    كان يقفل الصيدلية نهائياً فتظهر فارغة أونلاين رغم وجود بياناتها محلياً.
     """
     return (
         Medicine.objects.filter(pharmacy=pharmacy).exists()
@@ -54,7 +58,13 @@ def has_existing_online_data(pharmacy):
         or Invoice.objects.filter(pharmacy=pharmacy).exists()
         or Expense.objects.filter(pharmacy=pharmacy).exists()
         or DamagedMedicine.objects.filter(pharmacy=pharmacy).exists()
+        or PurchaseInvoice.objects.filter(pharmacy=pharmacy).exists()
+        or StockTransfer.objects.filter(pharmacy=pharmacy).exists()
     )
+
+
+def payload_has_records(payload):
+    return any(payload.get(key) for key in PAYLOAD_LIST_KEYS)
 
 
 def validate_offline_import(pharmacy, license, payload):
@@ -64,18 +74,22 @@ def validate_offline_import(pharmacy, license, payload):
     """
     if license is None or not plan_allows_online(license):
         raise PermissionDenied(ONLINE_PLAN_REQUIRED_MESSAGE)
-    if pharmacy.migrated_from_offline_at is not None:
-        raise ValidationError("تم رفع بيانات هذه الصيدلية مسبقاً، لا يمكن تكرار العملية.")
-    # رفض الترحيل إن وُجدت بيانات أونلاين حقيقية مسبقاً، حتى لو
-    # migrated_from_offline_at غير مضبوط لسبب ما — تفادياً لدمج بيانات محلية
-    # قديمة فوق بيانات أونلاين حية.
+    # رفض الترحيل إن وُجدت بيانات أونلاين حقيقية مسبقاً — تفادياً للتكرار أو
+    # لدمج بيانات محلية قديمة فوق بيانات أونلاين حية. العلَم وحده بلا بيانات
+    # لا يمنع (راجع has_existing_online_data).
     if has_existing_online_data(pharmacy):
+        if pharmacy.migrated_from_offline_at is not None:
+            raise ValidationError("تم رفع بيانات هذه الصيدلية مسبقاً، لا يمكن تكرار العملية.")
         raise ValidationError("توجد بيانات أونلاين مسجّلة مسبقاً لهذه الصيدلية، لا يمكن تنفيذ رفع أولي فوقها.")
     if not isinstance(payload, dict):
         raise ValidationError("صيغة البيانات المرفوعة غير صحيحة.")
     for key in PAYLOAD_LIST_KEYS:
         if key in payload and not isinstance(payload[key], list):
             raise ValidationError(f"صيغة {key} يجب أن تكون قائمة.")
+    # رفع فارغ كان "ينجح" ويضبط migrated_from_offline_at بلا أي سجل، فيستهلك
+    # الرفع الأولي الوحيد ويُخفي التطبيق اقتراح الرفع بعدها.
+    if not payload_has_records(payload):
+        raise ValidationError("لا توجد بيانات محلية لرفعها.")
 
 
 def error_message(exc):

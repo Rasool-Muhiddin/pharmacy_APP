@@ -93,11 +93,9 @@ class _MainLayoutState extends State<MainLayout> {
       if (!hasLocalData) return;
 
       final status = await MigrationApiService.instance.checkStatus();
-      if (status['migrated'] == true) return;
-      // بيانات أونلاين حقيقية موجودة مسبقاً لهذه الصيدلية (حالة استثنائية)
-      // — السيرفر سيرفض أي محاولة رفع فوقها، فلا داعي لعرض اقتراح مضمون
-      // الفشل على المالك.
-      if (status['has_existing_online_data'] == true) return;
+      // مرفوعة فعلاً، أو بيانات أونلاين حقيقية موجودة مسبقاً — السيرفر سيرفض
+      // أي محاولة رفع فوقها، فلا داعي لعرض اقتراح مضمون الفشل على المالك.
+      if (!MigrationApiService.shouldOfferMigration(status)) return;
 
       if (!mounted) return;
       final shouldOpen = await showDialog<bool>(

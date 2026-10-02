@@ -37,6 +37,16 @@ class MigrationApiService {
     _token = token;
   }
 
+  /// هل يُعرض اقتراح الرفع الأولي بناءً على رد /api/migration/status/؟
+  /// can_migrate (الخوادم الأحدث) هو الحاسم: الرفع ممكن ما دامت الصيدلية بلا
+  /// بيانات أونلاين، حتى لو كان migrated_from_offline_at مضبوطاً — علَم بلا
+  /// بيانات كان يُخفي الاقتراح للأبد فتظهر الصيدلية فارغة أونلاين.
+  static bool shouldOfferMigration(Map<String, dynamic> status) {
+    final canMigrate = status['can_migrate'];
+    if (canMigrate is bool) return canMigrate;
+    return status['migrated'] != true && status['has_existing_online_data'] != true;
+  }
+
   Future<Map<String, dynamic>> checkStatus() async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
     try {
