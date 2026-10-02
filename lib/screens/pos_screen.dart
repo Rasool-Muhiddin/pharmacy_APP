@@ -227,9 +227,12 @@ class _PosScreenState extends State<PosScreen> {
     }
   }
   // --- 2. إضافة وتعديل عناصر السلة ---
+  /// باركود الصنف يُحفظ في سطر السلة ليُعرض تحت اسمه في الفاتورة (سواء أُضيف
+  /// بالماسح أو بالاسم) فيتأكد الصيدلي من الصنف المختار؛ لا يدخل في بيانات البيع.
   void _addMedicineToCart(Map<String, dynamic> medicine) {
     int maxQty = medicine['quantity'] ?? 0;
     int medId = medicine['id'];
+    final barcode = (medicine['barcode'] ?? '').toString().trim();
 
     int existingIndex = _cartItems.indexWhere((item) => item['id'] == medId);
 
@@ -252,6 +255,7 @@ class _PosScreenState extends State<PosScreen> {
           'maxQty': maxQty,
           'selectedQty': 1,
           'total_price': (medicine['sell_price'] as num).toDouble(),
+          if (barcode.isNotEmpty) 'barcode': barcode,
         });
       });
     }
@@ -594,7 +598,23 @@ class _PosScreenState extends State<PosScreen> {
                                         children: [
                                           Expanded(
                                             flex: 3,
-                                            child: Text(item['trade_name'], style: const TextStyle(fontWeight: FontWeight.bold)),
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Text(item['trade_name'], style: const TextStyle(fontWeight: FontWeight.bold)),
+                                                // نفس شكل الباركود في شاشة المخزن.
+                                                if (item['barcode'] != null) ...[
+                                                  const SizedBox(height: 2),
+                                                  Text(
+                                                    '║ ${item['barcode']}',
+                                                    style: TextStyle(color: Colors.grey.shade500, fontSize: 11, fontFamily: 'monospace'),
+                                                    maxLines: 1,
+                                                    overflow: TextOverflow.ellipsis,
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
                                           ),
                                           Expanded(
                                             flex: 2,

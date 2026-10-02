@@ -719,10 +719,10 @@ void _openAddMedicineDialog() {
                             return const Iterable<Map<String, dynamic>>.empty();
                           }
                           final query = textEditingValue.text.trim().toLowerCase();
+                          // الاقتراحات حسب الاسم التجاري فقط؛ تطابق الاسم العلمي وحده لا يُظهر الدواء.
                           return _masterMedicines.where((med) {
                             final trade = (med['trade_name'] ?? '').toString().toLowerCase();
-                            final scientific = (med['scientific_name'] ?? '').toString().toLowerCase();
-                            return trade.contains(query) || scientific.contains(query);
+                            return trade.contains(query);
                           });
                         },
                         onSelected: (Map<String, dynamic> selection) {
