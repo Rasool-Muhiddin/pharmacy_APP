@@ -1,7 +1,10 @@
 import json
+import unittest
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import TestCase, override_settings
@@ -9,10 +12,20 @@ from django.utils import timezone
 
 from desktop_api.models import DesktopLicense, DeviceActivation, Pharmacy, PharmacyMembership
 from pharmacy_data import stock
-from pharmacy_data.models import DamagedMedicine, InvoiceItem, Medicine, MedicineBatch, Warehouse
+from pharmacy_data.models import (
+    DamagedMedicine,
+    Expense,
+    Invoice,
+    InvoiceItem,
+    Medicine,
+    MedicineBatch,
+    Warehouse,
+)
 
 User = get_user_model()
 PASSWORD = "Passw0rd!x-test"
+# نفس الملف تقرؤه test/profit_tracking_test.dart في Flutter: الحسابان يجب أن يتطابقا.
+PARITY_FIXTURE = Path(settings.BASE_DIR).parent / "test" / "fixtures" / "profit_parity.json"
 
 
 @override_settings(ALLOWED_HOSTS=["testserver"], PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
@@ -223,6 +236,94 @@ class ProfitTrackingTests(TestCase):
         self.assert_invariant(medicine)
         self.assertEqual(InvoiceItem.objects.get().unit_cost, Decimal("120.5000"))
         self.assertEqual(DamagedMedicine.objects.get().total_cost, Decimal("120.50"))
+
+    # --- الخصومات ---
+
+    def test_checkout_rounds_fractional_discount_half_up_and_rejects_negative(self):
+        medicine = self.create_medicine(quantity=10, buy="500", sell="1255")
+        # نسخة أقدم من التطبيق ترسل 12.5% من 1255 كما هي (156.875).
+        r = self.api("post", "/api/invoices/checkout/",
+                     {"discount": 156.875, "items": [{"medicine_id": medicine.pk, "quantity": 1}]})
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual((Decimal(r.json()["discount"]), Decimal(r.json()["final_amount"])),
+                         (Decimal("156.88"), Decimal("1098.12")))
+
+        before = Invoice.objects.count()
+        r = self.api("post", "/api/invoices/checkout/",
+                     {"discount": "-1", "items": [{"medicine_id": medicine.pk, "quantity": 1}]})
+        self.assertEqual(r.status_code, 400, r.content)
+        self.assertIn("discount", r.json())
+        self.assertEqual(Invoice.objects.count(), before)  # لا بيع
+        medicine.refresh_from_db()
+        self.assertEqual(medicine.quantity, 9)
+
+    def test_offline_import_clamps_negative_discount_and_logs_it(self):
+        payload = {
+            "medicines": [{"local_id": 1, "trade_name": "A", "quantity": 5, "avg_cost": 100}],
+            "invoices": [{"invoice_number": "INV-000009", "total_amount": 200, "discount": -40, "final_amount": 240,
+                          "items": [{"local_medicine_id": 1, "trade_name": "A", "quantity": 1, "unit_price": 200,
+                                     "total_price": 200, "unit_cost": 100}]}],
+        }
+        with self.assertLogs("pharmacy_data.offline_import", level="WARNING") as logs:
+            r = self.api("post", "/api/migration/upload_offline_data/", payload)
+            body = b"".join(r.streaming_content).decode()
+        self.assertIn('"event": "done"', body)
+        self.assertIn("INV-000009", logs.output[0])
+        invoice = Invoice.objects.get(invoice_number="INV-000009")
+        self.assertEqual((invoice.discount, invoice.final_amount), (Decimal("0"), Decimal("240")))
+
+    def test_refund_of_discounted_invoice_reverses_exactly_its_own_profit(self):
+        medicine = self.create_medicine(quantity=10, buy="400", sell="1000")
+        keep = self.api("post", "/api/invoices/checkout/",
+                        {"discount": "150", "items": [{"medicine_id": medicine.pk, "quantity": 2}]}).json()
+        keep_profit = Decimal(self.api("get", "/api/reports/summary/").json()["gross_profit"])
+        self.assertEqual(keep_profit, Decimal("1050.00"))  # 2000 - 150 - 800
+        refunded = self.api("post", "/api/invoices/checkout/",
+                            {"discount": "75", "items": [{"medicine_id": medicine.pk, "quantity": 3}]}).json()
+        self.assertEqual(Decimal(self.api("get", "/api/reports/summary/").json()["gross_profit"]),
+                         keep_profit + Decimal("1725.00"))  # 3000 - 75 - 1200
+        self.assertEqual(self.api("post", f"/api/invoices/{refunded['id']}/refund/").status_code, 200)
+        report = self.api("get", "/api/reports/summary/").json()
+        self.assertEqual(Decimal(report["gross_profit"]), keep_profit)
+        self.assertEqual(Decimal(report["revenue"]), Decimal(keep["final_amount"]))
+
+    @unittest.skipUnless(PARITY_FIXTURE.exists(), "Flutter test fixture not available")
+    def test_profit_summary_matches_shared_parity_fixture(self):
+        fixture = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))
+        warehouse = Warehouse.main_for(self.pharmacy)
+        medicines = {
+            key: Medicine.objects.create(
+                pharmacy=self.pharmacy, warehouse=warehouse, trade_name=key,
+                avg_cost=None if spec["avg_cost"] is None else Decimal(str(spec["avg_cost"])),
+            )
+            for key, spec in fixture["medicines"].items()
+        }
+        for inv in fixture["invoices"]:
+            total = sum(Decimal(str(it["unit_price"])) * it["quantity"] for it in inv["items"])
+            discount = Decimal(str(inv["discount"]))
+            invoice = Invoice.objects.create(
+                pharmacy=self.pharmacy, invoice_number=inv["number"], total_amount=total,
+                discount=discount, final_amount=total - discount, is_refunded=inv["is_refunded"],
+            )
+            for it in inv["items"]:
+                InvoiceItem.objects.create(
+                    invoice=invoice, medicine=medicines[it["medicine"]], trade_name=it["medicine"],
+                    quantity=it["quantity"], unit_price=Decimal(str(it["unit_price"])),
+                    total_price=Decimal(str(it["unit_price"])) * it["quantity"],
+                    unit_cost=None if it["unit_cost"] is None else Decimal(str(it["unit_cost"])),
+                )
+        for amount in fixture["expenses"]:
+            Expense.objects.create(pharmacy=self.pharmacy, expense_type="x", expense_date=self.today,
+                                   amount=Decimal(str(amount)))
+        for d in fixture["damaged"]:
+            DamagedMedicine.objects.create(
+                pharmacy=self.pharmacy, medicine=medicines[d["medicine"]], quantity_damaged=d["quantity"],
+                total_cost=None if d["total_cost"] is None else Decimal(str(d["total_cost"])), reason=d["reason"],
+            )
+
+        report = self.api("get", "/api/reports/summary/").json()
+        for key, expected in fixture["expected"].items():
+            self.assertEqual(Decimal(str(report[key])), Decimal(str(expected)), key)
 
 
 class WeightedAverageTests(TestCase):

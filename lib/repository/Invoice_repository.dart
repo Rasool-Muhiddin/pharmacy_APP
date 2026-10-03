@@ -72,6 +72,12 @@ class InvoiceRepository {
     required Map<String, dynamic> invoice,
     required List<Map<String, dynamic>> items,
   }) async {
+    // خصم سالب = لا بيع (أوفلاين وأونلاين)، قبل أي كتابة أو طلب شبكة.
+    final discount = (invoice['discount'] as num?)?.toDouble() ?? 0;
+    if (discount < 0) {
+      throw const InvoiceRepositoryException('لا يمكن إتمام البيع: قيمة الخصم سالبة.');
+    }
+
     if (!isOnlineMode) {
       await _db.completeSale(invoice: invoice, items: items);
       return invoice;
@@ -82,7 +88,6 @@ class InvoiceRepository {
     }
     await _assertOnlineWritable();
 
-    final discount = (invoice['discount'] as num).toDouble();
     final apiItems = items
         .map((item) => {
               'medicine_id': item['medicine_id'],

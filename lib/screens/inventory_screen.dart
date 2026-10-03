@@ -8,6 +8,7 @@ import '../services/medicine_api_service.dart';
 import '../services/warehouse_api_service.dart';
 import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
+import '../widgets/unsaved_changes_guard.dart';
 import 'package:sqflite/sqflite.dart';
 
 class InventoryScreen extends StatefulWidget {
@@ -605,6 +606,18 @@ void _openAddMedicineDialog() {
     final shelfCtrl = TextEditingController();
     String selectedCategory = 'tablet';
 
+    // أي حقل عُبّئ أو تغيّر عن قيمته الابتدائية = عمل غير محفوظ يُسأل عنه قبل الإغلاق.
+    bool isDirty() =>
+        barcodeCtrl.text.trim().isNotEmpty ||
+        tradeCtrl.text.trim().isNotEmpty ||
+        scientificCtrl.text.trim().isNotEmpty ||
+        qtyCtrl.text.trim() != '0' ||
+        buyPriceCtrl.text.trim() != '0' ||
+        sellPriceCtrl.text.trim() != '0' ||
+        expiryCtrl.text.trim().isNotEmpty ||
+        shelfCtrl.text.trim().isNotEmpty ||
+        selectedCategory != 'tablet';
+
     InputDecoration buildInputDecoration({
       String? hintText,
       required IconData prefixIcon,
@@ -669,7 +682,12 @@ void _openAddMedicineDialog() {
 
     showDialog(
       context: context,
-      builder: (ctx) => StatefulBuilder(
+      // يعترض الإلغاء وEsc والنقر خارج النافذة ما دامت هناك بيانات غير محفوظة.
+      builder: (ctx) => UnsavedChangesGuard(
+        isDirty: isDirty,
+        message: 'لم يتم حفظ العنصر، هل تريد الخروج بدون حفظ؟',
+        leaveLabel: 'خروج بدون حفظ',
+        child: StatefulBuilder(
         builder: (context, setDialogState) {
           return AlertDialog(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -903,7 +921,8 @@ void _openAddMedicineDialog() {
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                   padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                 ),
-                onPressed: () => Navigator.pop(ctx),
+                // maybePop (لا pop) كي يمر عبر UnsavedChangesGuard.
+                onPressed: () => Navigator.maybePop(ctx),
                 child: const Text('إلغاء', style: TextStyle(color: Colors.black87)),
               ),
               ElevatedButton(
@@ -982,6 +1001,7 @@ void _openAddMedicineDialog() {
             ],
           );
         },
+      ),
       ),
     );
   }

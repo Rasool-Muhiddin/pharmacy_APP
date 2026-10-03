@@ -4,6 +4,8 @@ import '../database/db_helper.dart'; // تأكد من صحة مسار الملف
 import '../repository/invoice_repository.dart';
 import '../repository/medicine_repository.dart';
 import '../repository/warehouse_repository.dart';
+import '../utils/invoice_discount.dart';
+import '../widgets/unsaved_changes_guard.dart';
 
 class PosScreen extends StatefulWidget {
   final int pharmacyId;
@@ -36,16 +38,52 @@ class _PosScreenState extends State<PosScreen> {
   // _loadInitialData ويُستخدم لكل من قائمة الأصناف والبحث بالباركود.
   int? _mainWarehouseId;
 
-  String _discountType = 'amount'; // 'amount' (مبلغ) أو 'percent' (%)
+  String _discountType = InvoiceDiscount.amount; // مبلغ أو نسبة (%) — أعداد صحيحة فقط
   bool _showSuggestions = false;
   bool _isLoading = false;
   bool _isCheckingOut = false;
   String _searchPlaceholder = '🔍 مرر الباركود أو ابحث بالاسم التجاري/العلمي/الباركود...';
 
+  // حارس المغادرة من MainLayout (الشريط الجانبي/تسجيل الخروج) أثناء فاتورة غير مكتملة.
+  LeaveGuardController? _leaveGuard;
+
   @override
   void initState() {
     super.initState();
     _loadInitialData();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final guard = LeaveGuardScope.maybeOf(context);
+    if (guard != _leaveGuard) {
+      _leaveGuard?.detach(_confirmLeave);
+      _leaveGuard = guard?..attach(_confirmLeave);
+    }
+  }
+
+  @override
+  void dispose() {
+    _leaveGuard?.detach(_confirmLeave);
+    _searchController.dispose();
+    _discountController.dispose();
+    _searchFocusNode.dispose();
+    super.dispose();
+  }
+
+  /// فاتورة جارية: صنف واحد على الأقل أو خصم مُدخل. بعد إتمام البيع تُفرَّغ
+  /// السلة ويعود الخصم إلى 0 فلا يُسأل المستخدم.
+  bool get _hasUnsavedInvoice =>
+      _cartItems.isNotEmpty || (int.tryParse(_discountController.text.trim()) ?? 0) != 0;
+
+  Future<bool?> _confirmLeave() async {
+    if (!_hasUnsavedInvoice || !mounted) return null;
+    return confirmDiscardChanges(
+      context,
+      message: 'الفاتورة غير مكتملة، هل تريد فعلاً الخروج؟',
+      leaveLabel: 'خروج',
+    );
   }
 
 // تحميل أدوية الفرع وسجل الفواتير من قاعدة البيانات مباشرة
@@ -105,16 +143,13 @@ class _PosScreenState extends State<PosScreen> {
     return _cartItems.fold(0.0, (sum, item) => sum + (item['total_price'] as double));
   }
 
-  double get _appliedDiscount {
-    double val = double.tryParse(_discountController.text) ?? 0.0;
-    if (_discountType == 'percent') {
-      if (val > 100) val = 100;
-      return (_subtotal * val) / 100;
-    } else {
-      if (val > _subtotal) val = _subtotal;
-      return val;
-    }
-  }
+  // خصم الفاتورة: أعداد صحيحة فقط، النسبة ≤ 100 والمبلغ ≤ المجموع، والناتج
+  // مقرَّب نصف-للأعلى لخانتين (نفس القيمة أوفلاين وأونلاين).
+  double get _appliedDiscount => InvoiceDiscount.compute(
+        subtotal: _subtotal,
+        type: _discountType,
+        input: _discountController.text,
+      );
 
   double get _grandTotal {
     double total = _subtotal - _appliedDiscount;
@@ -308,9 +343,9 @@ class _PosScreenState extends State<PosScreen> {
           'pharmacy_id': widget.pharmacyId,
           'invoice_number': invoiceNum,
           'cashier_id': widget.userId,
-          'total_amount': _subtotal,
+          'total_amount': DatabaseHelper.roundMoney(_subtotal),
           'discount': _appliedDiscount,
-          'final_amount': _grandTotal,
+          'final_amount': DatabaseHelper.roundMoney(_grandTotal),
           'created_at': DateTime.now().toIso8601String(),
           'is_refunded': 0,
         };
@@ -335,7 +370,7 @@ class _PosScreenState extends State<PosScreen> {
       setState(() {
         _cartItems.clear();
         _discountController.text = '0';
-        _discountType = 'amount';
+        _discountType = InvoiceDiscount.amount;
       });
 
       _loadInitialData();
@@ -658,6 +693,7 @@ class _PosScreenState extends State<PosScreen> {
                                       child: TextField(
                                         controller: _discountController,
                                         keyboardType: TextInputType.number,
+                                        inputFormatters: InvoiceDiscount.inputFormatters,
                                         decoration: const InputDecoration(
                                           labelText: 'قيمة الخصم',
                                           isDense: true,
@@ -673,8 +709,8 @@ class _PosScreenState extends State<PosScreen> {
                                         initialValue: _discountType,
                                         decoration: const InputDecoration(isDense: true, border: OutlineInputBorder()),
                                         items: const [
-                                          DropdownMenuItem(value: 'amount', child: Text('د.ع')),
-                                          DropdownMenuItem(value: 'percent', child: Text('%')),
+                                          DropdownMenuItem(value: InvoiceDiscount.amount, child: Text('د.ع')),
+                                          DropdownMenuItem(value: InvoiceDiscount.percent, child: Text('%')),
                                         ],
                                         onChanged: (val) {
                                           if (val != null) setState(() => _discountType = val);

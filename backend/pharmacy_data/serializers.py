@@ -1,3 +1,5 @@
+from decimal import ROUND_HALF_UP, Decimal
+
 from django.db.models import Sum
 from rest_framework import serializers
 
@@ -251,11 +253,26 @@ class CheckoutItemInputSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
 
 
+class RoundingDecimalField(serializers.DecimalField):
+    """
+    DecimalField يقرّب الخانات العشرية الزائدة (حسب rounding) بدل رفضها.
+    DRF يتحقق من عدد الخانات (validate_precision) قبل التقريب، فـ rounding وحده
+    لا يمنع الخطأ 400 — هنا يُقرَّب أولاً ثم يُتحقق. min_value وغيره يبقى كما هو.
+    """
+
+    def validate_precision(self, value):
+        if self.decimal_places is not None and value.is_finite():
+            value = value.quantize(Decimal(1).scaleb(-self.decimal_places), rounding=self.rounding)
+        return super().validate_precision(value)
+
+
 class CheckoutInputSerializer(serializers.Serializer):
     """بيانات الدخل لـ /api/invoices/checkout/ فقط — ليست موديل."""
 
-    discount = serializers.DecimalField(
-        max_digits=12, decimal_places=2, min_value=0, required=False, default=0
+    # خصم على مستوى الفاتورة فقط. نسخ التطبيق الأقدم قد ترسل خصماً نسبياً بأكثر
+    # من خانتين (156.875) فيُقرَّب نصف-للأعلى بدل رفض البيع؛ السالب يُرفض دائماً.
+    discount = RoundingDecimalField(
+        max_digits=12, decimal_places=2, min_value=0, rounding=ROUND_HALF_UP, required=False, default=0
     )
     items = CheckoutItemInputSerializer(many=True)
 

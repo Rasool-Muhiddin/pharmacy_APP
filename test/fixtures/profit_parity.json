@@ -1,0 +1,61 @@
+{
+  "description": "Shared by test/profit_tracking_test.dart (DatabaseHelper.getProfitSummary) and backend/pharmacy_data/tests.py (_profit_summary via /api/reports/summary/). Both must produce exactly `expected` for the same data. All rows dated today.",
+  "medicines": {
+    "A": {"avg_cost": 400},
+    "B": {"avg_cost": 300},
+    "C": {"avg_cost": null}
+  },
+  "invoices": [
+    {
+      "note": "multi-line, amount discount spread proportionally: 3000 - 100 - 1100 = 1800",
+      "number": "INV-000001", "discount": 100, "is_refunded": false,
+      "items": [
+        {"medicine": "A", "quantity": 2, "unit_price": 1000, "unit_cost": 400},
+        {"medicine": "B", "quantity": 1, "unit_price": 1000, "unit_cost": 300}
+      ]
+    },
+    {
+      "note": "12% of 1255 = 150.60 (POS rounding); only the costed 1000 carries a share: 150.60*1000/1255 = 120 -> 1000 - 120 - 400 = 480",
+      "number": "INV-000002", "discount": 150.60, "is_refunded": false,
+      "items": [
+        {"medicine": "A", "quantity": 1, "unit_price": 1000, "unit_cost": 400},
+        {"medicine": "C", "quantity": 1, "unit_price": 255, "unit_cost": null}
+      ]
+    },
+    {
+      "note": "discount pushes the sale below cost: 1000 - 600 - 600 = -200",
+      "number": "INV-000003", "discount": 600, "is_refunded": false,
+      "items": [
+        {"medicine": "B", "quantity": 2, "unit_price": 500, "unit_cost": 300}
+      ]
+    },
+    {
+      "note": "refunded discounted invoice: excluded entirely",
+      "number": "INV-000004", "discount": 50, "is_refunded": true,
+      "items": [
+        {"medicine": "A", "quantity": 1, "unit_price": 1000, "unit_cost": 400}
+      ]
+    },
+    {
+      "note": "legacy negative discount (older offline app): share applied when != 0 on both sides: 1000 + 100 - 300 = 800",
+      "number": "INV-000005", "discount": -100, "is_refunded": false,
+      "items": [
+        {"medicine": "B", "quantity": 1, "unit_price": 1000, "unit_cost": 300}
+      ]
+    }
+  ],
+  "expenses": [250],
+  "damaged": [
+    {"medicine": "A", "quantity": 1, "total_cost": 400, "reason": "broken"},
+    {"medicine": "B", "quantity": 1, "total_cost": 300, "reason": "correction"},
+    {"medicine": "C", "quantity": 1, "total_cost": null, "reason": "broken"}
+  ],
+  "expected": {
+    "revenue": 5504.40,
+    "cost_of_goods_sold": 2400,
+    "gross_profit": 2880,
+    "damage_cost": 400,
+    "net_profit": 2230,
+    "items_without_cost": 1
+  }
+}

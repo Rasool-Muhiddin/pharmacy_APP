@@ -20,6 +20,7 @@ import '../screens/expenses_screen.dart';
 import '../screens/offline_migration_screen.dart';
 import '../services/migration_api_service.dart';
 import '../models/subscription_plan.dart';
+import '../widgets/unsaved_changes_guard.dart';
 import '../models/license_expiry.dart';
 import '../widgets/license_expiry_banner.dart';
 
@@ -51,6 +52,17 @@ class _MainLayoutState extends State<MainLayout> {
 
   // اسم الصيدلية المفتوحة حالياً
   String _pharmacyName = "";
+
+  // الشاشة الحالية تسجّل فيه فحص "عمل غير محفوظ" (مثلاً فاتورة POS)، ويُسأل
+  // قبل تبديل الشاشة من الشريط الجانبي أو تسجيل الخروج.
+  final LeaveGuardController _leaveGuard = LeaveGuardController();
+
+  Future<void> _selectPage(String title) async {
+    if (title == _currentPage) return;
+    final leave = await _leaveGuard.confirmLeave();
+    if (leave == false || !mounted) return;
+    setState(() => _currentPage = title);
+  }
 
   // خريطة أيقونات الأقسام
   final Map<String, IconData> _pageIcons = const {
@@ -211,11 +223,8 @@ class _MainLayoutState extends State<MainLayout> {
               currentPage: _currentPage,
               isOwner: widget.isOwner, 
               entitlements: widget.entitlements,
-              onItemSelected: (selectedTitle) {
-                setState(() {
-                  _currentPage = selectedTitle;
-                });
-              },
+              onItemSelected: _selectPage,
+              beforeLeave: _leaveGuard.confirmLeave,
             ),
 
             // 2. الهيدر ومحتوى الشاشة المعروضة
@@ -233,7 +242,10 @@ class _MainLayoutState extends State<MainLayout> {
 
                   // الشاشة النشطة
                   Expanded(
-                    child: _buildScreenContent(),
+                    child: LeaveGuardScope(
+                      controller: _leaveGuard,
+                      child: _buildScreenContent(),
+                    ),
                   ),
                 ],
               ),

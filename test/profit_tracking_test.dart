@@ -1,7 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pharmacy_app/database/db_helper.dart';
+import 'package:pharmacy_app/repository/Invoice_repository.dart';
+import 'package:pharmacy_app/utils/invoice_discount.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'id_strategy_test.dart' show createV8Schema, seedMixedV8;
@@ -270,6 +273,97 @@ void main() {
     expect((med['batches'] as List).map((b) => b['quantity']), [8, 5]);
     expect(((payload['invoices'] as List).single['items'] as List).single['unit_cost'], 600);
     expect((payload['damaged_medicines'] as List).single['total_cost'], 600);
+  });
+
+  group('discounts', () {
+    test('negative discount = no sale, offline (DB and repository) and online (before any network call)', () async {
+      final db = await freshDb();
+      final id = await addMedicine(qty: 5);
+      await expectLater(sell(id, 1, price: 1000, discount: -10), throwsStateError);
+
+      final item = {'medicine_id': id, 'trade_name': 'Panadol', 'quantity': 1, 'unit_price': 1000.0, 'total_price': 1000.0};
+      for (final online in [false, true]) {
+        await expectLater(
+          InvoiceRepository.instance.checkout(
+            pharmacyId: pharmacyId,
+            isOnlineMode: online,
+            invoice: {
+              'pharmacy_id': pharmacyId, 'invoice_number': 'INV-000099', 'created_at': inDays(0),
+              'total_amount': 1000, 'discount': -10, 'final_amount': 1010,
+            },
+            items: [Map<String, dynamic>.from(item)],
+          ),
+          throwsA(isA<InvoiceRepositoryException>()
+              .having((e) => e.message, 'message', 'لا يمكن إتمام البيع: قيمة الخصم سالبة.')),
+        );
+      }
+      expect(await db.query('invoice'), isEmpty);
+      expect((await medicine(db, id))['quantity'], 5);
+    });
+
+    test('refunding a discounted invoice reverses exactly its own profit', () async {
+      final db = await freshDb();
+      final id = await addMedicine(qty: 10, buy: 400, sell: 1000);
+      await sell(id, 2, price: 1000, discount: 150, number: 'INV-000001');
+      final keep = (await report())['gross_profit']!;
+      expect(keep, 1050); // 2000 - 150 - 800
+      await sell(id, 3, price: 1000, discount: 75, number: 'INV-000002');
+      expect((await report())['gross_profit'], keep + 1725); // 3000 - 75 - 1200
+
+      final second = (await db.query('invoice', where: "invoice_number = 'INV-000002'")).single['id'] as int;
+      await helper.refundInvoice(second);
+      final r = await report();
+      expect(r['gross_profit'], keep);
+      expect(r['revenue'], 1850);
+    });
+
+    test('shared parity fixture: getProfitSummary gives exactly the numbers the server test expects', () async {
+      final fixture = jsonDecode(File('test/fixtures/profit_parity.json').readAsStringSync()) as Map<String, dynamic>;
+      final db = await freshDb();
+      final wh = await helper.ensureMainWarehouse(pharmacyId);
+      final today = inDays(0);
+
+      final medicineIds = <String, int>{};
+      for (final entry in (fixture['medicines'] as Map<String, dynamic>).entries) {
+        medicineIds[entry.key] = await db.insert('medicine', {
+          'pharmacy_id': pharmacyId, 'warehouse_id': wh, 'trade_name': entry.key, 'quantity': 0,
+          'avg_cost': (entry.value as Map)['avg_cost'],
+        });
+      }
+      for (final inv in (fixture['invoices'] as List).cast<Map<String, dynamic>>()) {
+        final items = (inv['items'] as List).cast<Map<String, dynamic>>();
+        final total = items.fold<num>(0, (sum, it) => sum + (it['unit_price'] as num) * (it['quantity'] as num));
+        final discount = inv['discount'] as num;
+        final invoiceId = await db.insert('invoice', {
+          'pharmacy_id': pharmacyId, 'invoice_number': inv['number'], 'created_at': '${today}T10:00:00',
+          'total_amount': total, 'discount': discount, 'final_amount': DatabaseHelper.roundMoney(total - discount),
+          'is_refunded': inv['is_refunded'] == true ? 1 : 0,
+        });
+        for (final it in items) {
+          await db.insert('invoice_item', {
+            'invoice_id': invoiceId, 'trade_name': it['medicine'], 'medicine_id': medicineIds[it['medicine']],
+            'quantity': it['quantity'], 'unit_price': it['unit_price'],
+            'total_price': (it['unit_price'] as num) * (it['quantity'] as num), 'unit_cost': it['unit_cost'],
+          });
+        }
+      }
+      for (final amount in (fixture['expenses'] as List).cast<num>()) {
+        await helper.addExpense({'pharmacy_id': pharmacyId, 'expense_type': 'x', 'expense_date': today, 'amount': amount});
+      }
+      for (final d in (fixture['damaged'] as List).cast<Map<String, dynamic>>()) {
+        await db.insert('damaged_medicine', {
+          'pharmacy_id': pharmacyId, 'medicine_id': medicineIds[d['medicine']], 'quantity_damaged': d['quantity'],
+          'total_cost': d['total_cost'], 'reason': d['reason'], 'damaged_at': today,
+        });
+      }
+
+      final summary = await helper.getProfitSummary(pharmacyId, start: today, end: today);
+      (fixture['expected'] as Map<String, dynamic>).forEach((key, expected) {
+        expect(summary[key], closeTo(expected as num, 0.0001), reason: key);
+      });
+      // خصم الفاتورة الثانية في الملف هو بالضبط ما تحسبه نقطة البيع لـ 12% من 1255.
+      expect(InvoiceDiscount.compute(subtotal: 1255, type: InvoiceDiscount.percent, input: '12'), 150.60);
+    });
   });
 
   test('v9 -> v10 upgrade: avg_cost from a positive buy_price, one batch per stocked medicine, unit_cost stays NULL', () async {

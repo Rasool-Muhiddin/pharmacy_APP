@@ -1040,7 +1040,8 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       revenue += (row['final_amount'] as num).toDouble();
       cogs += (row['cogs'] as num).toDouble();
       missing += (row['missing'] as num).toInt();
-      gross += costedTotal - (discount > 0 && total > 0 ? discount * costedTotal / total : 0);
+      // نفس الخادم: حصة الخصم تُطبَّق متى كان != 0 (حتى خصم سالب قديم).
+      gross += costedTotal - (discount != 0 && total > 0 ? discount * costedTotal / total : 0);
     }
     gross -= cogs;
 
@@ -2186,6 +2187,10 @@ Future<double> totalSalesToday(int pharmacyId) async {
     required Map<String, dynamic> invoice,
     required List<Map<String, dynamic>> items,
   }) async {
+    // خصم سالب = لا بيع (حماية أخيرة لأي مستدعٍ أوفلاين غير InvoiceRepository).
+    if (((invoice['discount'] as num?) ?? 0) < 0) {
+      throw StateError('لا يمكن إتمام البيع: قيمة الخصم سالبة.');
+    }
     final db = await database;
 
     await db.transaction((txn) async {

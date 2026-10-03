@@ -13,6 +13,7 @@ PurchaseInvoices (مع Payments/Returns متداخلة) → Invoices (مع Items
 عنصرها الأب، فلا حاجة لجدول تحويل معرّفات إلا للمخازن/الموردين/الأدوية.
 """
 
+import logging
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -38,6 +39,8 @@ from .models import (
     SupplierPayment,
     Warehouse,
 )
+
+logger = logging.getLogger(__name__)
 
 PAYLOAD_LIST_KEYS = (
     "warehouses", "suppliers", "medicines", "purchase_invoices",
@@ -318,13 +321,22 @@ def iter_offline_import(pharmacy, payload):
         invoices_created = 0
         invoice_items_created = 0
         for item in invoices_in:
+            discount = Decimal(str(item.get("discount") or 0))
+            if discount < 0:
+                # بيانات تاريخية من نسخ أقدم سمحت بخصم سالب: لا يمكن رفضها، فتُصفَّر
+                # (final_amount يبقى المبلغ المحصَّل فعلاً) ويُسجَّل ذلك.
+                logger.warning(
+                    "offline import: pharmacy %s invoice %s had negative discount %s; clamped to 0",
+                    pharmacy.pk, item.get("invoice_number"), discount,
+                )
+                discount = Decimal("0")
             invoice = Invoice.objects.create(
                 pharmacy=pharmacy,
                 invoice_number=item.get("invoice_number") or f"MIGRATED-{overall_done + 1}",
                 cashier=None,
                 cashier_name=item.get("cashier_name") or "",
                 total_amount=Decimal(str(item.get("total_amount") or 0)),
-                discount=Decimal(str(item.get("discount") or 0)),
+                discount=discount,
                 final_amount=Decimal(str(item.get("final_amount") or 0)),
                 created_at=_parse_datetime(item.get("created_at")) or timezone.now(),
                 is_refunded=bool(item.get("is_refunded") or False),

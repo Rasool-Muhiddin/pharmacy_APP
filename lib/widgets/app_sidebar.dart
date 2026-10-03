@@ -3,12 +3,16 @@ import 'package:google_fonts/google_fonts.dart';
 import '../screens/login_screen.dart';
 import '../services/desktop_auth_storage.dart';
 import '../models/subscription_plan.dart';
+import 'unsaved_changes_guard.dart';
 
 class AppSidebar extends StatelessWidget {
   final String currentPage;
   final bool isOwner;
   final SubscriptionEntitlements entitlements;
   final Function(String) onItemSelected;
+  // يُسأل قبل تسجيل الخروج عن عمل غير محفوظ في الشاشة الحالية (مثلاً فاتورة
+  // POS غير مكتملة) — راجع LeaveGuardController.
+  final LeaveCheck? beforeLeave;
 
 
   AppSidebar({
@@ -17,10 +21,38 @@ class AppSidebar extends StatelessWidget {
     this.isOwner = true,
     SubscriptionEntitlements? entitlements,
     required this.onItemSelected,
+    this.beforeLeave,
   }) : entitlements = entitlements ?? SubscriptionEntitlements.basic();
 
   static const Color primaryColor = Color(0xff1abc9c);
   static const Color secondaryColor = Color(0xff148f77);
+
+  /// تسجيل الخروج: إن وُجد عمل غير محفوظ يُسأل عنه أولاً؛ اختيار "خروج" هناك
+  /// يكفي كتأكيد (بلا نافذة ثانية)، وإلا تُعرض نافذة تأكيد الخروج المعتادة.
+  Future<void> _handleLogout(BuildContext context) async {
+    final leave = await beforeLeave?.call();
+    if (leave == false || !context.mounted) return;
+    if (leave == true) {
+      await _logout(context);
+    } else {
+      _showLogoutDialog(context);
+    }
+  }
+
+  Future<void> _logout(BuildContext context) async {
+    // امسح الجلسة المحفوظة أولاً - وإلا التطبيق يعيد تسجيل
+    // الدخول تلقائياً بالمرة الجاية اللي يفتح فيها.
+    await DesktopAuthStorage.instance.clearSession();
+
+    if (!context.mounted) return;
+
+    // العودة لشاشة AuthScreen وتصفير المسارات الشاشات المفتوحة
+    Navigator.pushAndRemoveUntil(
+      context,
+      MaterialPageRoute(builder: (context) => const AuthScreen()),
+      (route) => false,
+    );
+  }
 
   // نافذة تأكيد تسجيل الخروج
   void _showLogoutDialog(BuildContext context) {
@@ -61,19 +93,7 @@ class AppSidebar extends StatelessWidget {
               ),
               onPressed: () async {
                 Navigator.pop(ctx); // إغلاق النافذة
-
-                // امسح الجلسة المحفوظة أولاً - وإلا التطبيق يعيد تسجيل
-                // الدخول تلقائياً بالمرة الجاية اللي يفتح فيها.
-                await DesktopAuthStorage.instance.clearSession();
-
-                if (!context.mounted) return;
-
-                // العودة لشاشة AuthScreen وتصفير المسارات الشاشات المفتوحة
-                Navigator.pushAndRemoveUntil(
-                  context,
-                  MaterialPageRoute(builder: (context) => const AuthScreen()),
-                  (route) => false,
-                );
+                await _logout(context);
               },
               icon: const Icon(Icons.check_circle_outline, color: Colors.white, size: 18),
               label: Text(
@@ -254,7 +274,7 @@ class AppSidebar extends StatelessWidget {
               color: Colors.transparent,
               child: InkWell(
                 borderRadius: BorderRadius.circular(8),
-                onTap: () => _showLogoutDialog(context),
+                onTap: () => _handleLogout(context),
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
                   decoration: BoxDecoration(
