@@ -23,12 +23,14 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from desktop_api.permissions import ONLINE_PLAN_REQUIRED_MESSAGE, plan_allows_online
 
+from . import stock
 from .models import (
     DamagedMedicine,
     Expense,
     Invoice,
     InvoiceItem,
     Medicine,
+    MedicineBatch,
     PurchaseInvoice,
     PurchaseInvoiceReturn,
     StockTransfer,
@@ -115,6 +117,20 @@ def _parse_datetime(value):
     if d is not None:
         return timezone.make_aware(datetime.combine(d, datetime.min.time()))
     return None
+
+
+def _cost(value):
+    """كلفة اختيارية من الجهاز: None/فارغ/غير رقمي/<= 0 = غير معروفة."""
+    try:
+        cost = Decimal(str(value))
+    except Exception:
+        return None
+    return stock.to_cost(cost) if cost.is_finite() and cost > 0 else None
+
+
+def _money_or_none(value):
+    cost = _cost(value)
+    return stock.to_money(cost) if cost is not None else None
 
 
 def _parse_date(value):
@@ -227,7 +243,26 @@ def iter_offline_import(pharmacy, payload):
                 shelf_location=item.get("shelf_location") or "",
                 is_damaged=bool(item.get("is_damaged") or False),
                 barcode=barcode,
+                avg_cost=_cost(item.get("avg_cost")),
             )
+            # دفعات الصلاحية كما هي على الجهاز؛ عملاء أقدم بلا "batches" تُنشأ
+            # لهم دفعة واحدة بالكمية والصلاحية الحاليتين.
+            batches = item.get("batches")
+            if isinstance(batches, list):
+                for b in batches:
+                    qty = int(b.get("quantity") or 0)
+                    if qty > 0:
+                        MedicineBatch.objects.create(
+                            pharmacy=pharmacy,
+                            medicine=medicine,
+                            quantity=qty,
+                            expiry_date=_parse_date(b.get("expiry_date")),
+                            purchase_price=_cost(b.get("purchase_price")),
+                        )
+                stock.reconcile(medicine)
+                stock.refresh_stock(medicine)
+            else:
+                stock.create_initial_batch(medicine)
             local_id = item.get("local_id")
             if local_id is not None:
                 medicine_id_map[local_id] = medicine.id
@@ -308,6 +343,7 @@ def iter_offline_import(pharmacy, payload):
                     quantity=int(it.get("quantity") or 0),
                     unit_price=Decimal(str(it.get("unit_price") or 0)),
                     total_price=Decimal(str(it.get("total_price") or 0)),
+                    unit_cost=_cost(it.get("unit_cost")),
                 )
                 invoice_items_created += 1
 
@@ -329,6 +365,7 @@ def iter_offline_import(pharmacy, payload):
                 pharmacy=pharmacy,
                 medicine_id=server_medicine_id,
                 quantity_damaged=int(item.get("quantity_damaged") or 0),
+                total_cost=_money_or_none(item.get("total_cost")),
                 reason=item.get("reason") or "",
                 notes=item.get("notes") or "",
                 damaged_at=_parse_date(item.get("damaged_at")) or date.today(),

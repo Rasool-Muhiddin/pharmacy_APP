@@ -77,6 +77,28 @@ class MedicineApiService {
     );
   }
 
+  /// توريد ذرّي على الخادم (`POST /api/medicines/<id>/supply/`): متوسط كلفة
+  /// مرجّح + سعر بيع جديد + دفعة صلاحية، ويُرجع الدواء المحدَّث مع دفعاته.
+  /// [purchasePrice] null = يستخدم الخادم avg_cost الحالي.
+  Future<Map<String, dynamic>> supplyMedicine(
+    int id, {
+    required int quantity,
+    String? expiryDate,
+    double? purchasePrice,
+    required double salePrice,
+  }) {
+    return _send(
+      method: 'POST',
+      url: '$_baseUrl/medicines/$id/supply/',
+      body: {
+        'quantity': quantity,
+        if (expiryDate != null && expiryDate.isNotEmpty) 'expiry_date': expiryDate,
+        if (purchasePrice != null) 'purchase_price': purchasePrice.toStringAsFixed(4),
+        'sale_price': salePrice.toStringAsFixed(2),
+      },
+    );
+  }
+
   Future<void> deleteMedicine(int id) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
 

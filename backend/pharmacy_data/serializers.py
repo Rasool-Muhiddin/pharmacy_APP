@@ -7,6 +7,7 @@ from .models import (
     Invoice,
     InvoiceItem,
     Medicine,
+    MedicineBatch,
     PurchaseInvoice,
     StockTransfer,
     Supplier,
@@ -18,6 +19,26 @@ def _request_pharmacy(serializer):
     request = serializer.context.get("request")
     membership = getattr(getattr(request, "user", None), "pharmacymembership", None)
     return membership.pharmacy if membership is not None else None
+
+
+def _request_is_owner(serializer):
+    """الكلفة وسعر الشراء للمالك فقط؛ بلا طلب معروف (سياق ناقص) تُخفى احتياطاً."""
+    request = serializer.context.get("request")
+    membership = getattr(getattr(request, "user", None), "pharmacymembership", None)
+    return membership is not None and membership.is_owner
+
+
+class OwnerOnlyFieldsMixin:
+    """يحذف owner_only_fields من المخرجات لغير المالك."""
+
+    owner_only_fields = ()
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not _request_is_owner(self):
+            for field in self.owner_only_fields:
+                data.pop(field, None)
+        return data
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
@@ -69,11 +90,22 @@ class StockTransferInputSerializer(serializers.Serializer):
     notes = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
 
 
-class MedicineSerializer(serializers.ModelSerializer):
+class MedicineBatchSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
+    owner_only_fields = ("purchase_price",)
+
+    class Meta:
+        model = MedicineBatch
+        fields = ["id", "quantity", "expiry_date", "purchase_price", "created_at"]
+        read_only_fields = fields
+
+
+class MedicineSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
+    owner_only_fields = ("avg_cost", "buy_price")
     # اختياري عند الإنشاء (الافتراضي: المخزن الرئيسي، لتوافق عملاء Flutter
     # القدامى). لا يُغيَّر بعد الإنشاء — النقل بين المخازن حصراً عبر
     # /api/warehouses/transfer/ ليبقى له سجل وتبقى الكميات متسقة.
     warehouse = serializers.PrimaryKeyRelatedField(queryset=Warehouse.objects.none(), required=False)
+    batches = serializers.SerializerMethodField()
 
     class Meta:
         model = Medicine
@@ -86,6 +118,8 @@ class MedicineSerializer(serializers.ModelSerializer):
             "quantity",
             "buy_price",
             "sell_price",
+            "avg_cost",
+            "batches",
             "expiry_date",
             "shelf_location",
             "is_damaged",
@@ -94,7 +128,8 @@ class MedicineSerializer(serializers.ModelSerializer):
         ]
         # pharmacy لا يُرسَل من العميل إطلاقاً — يُحدَّد تلقائياً من صيدلية المستخدم المسجّل دخوله
         # (انظر MedicineViewSet.perform_create)، منعاً لأي محاولة لكتابة بيانات في صيدلية أخرى.
-        read_only_fields = ["id", "updated_at"]
+        # avg_cost يُحسب على الخادم فقط (التوريد/الإنشاء)، ولا يُقبل من العميل.
+        read_only_fields = ["id", "avg_cost", "updated_at"]
         # DRF يولّد تلقائياً مدقِّق فرادة من قيد (warehouse, barcode) يجعل
         # warehouse إلزامياً؛ الفحص نفسه مطبَّق يدوياً في validate() مع مراعاة
         # المخزن الرئيسي الافتراضي.
@@ -107,8 +142,20 @@ class MedicineSerializer(serializers.ModelSerializer):
         if pharmacy is not None:
             self.fields["warehouse"].queryset = Warehouse.objects.filter(pharmacy=pharmacy)
 
+    def get_batches(self, obj):
+        batches = [b for b in obj.batches.all() if b.quantity > 0]
+        return MedicineBatchSerializer(batches, many=True, context=self.context).data
+
     def validate_barcode(self, value):
         return (value or "").strip() or None
+
+    def update(self, instance, validated_data):
+        # الكمية والصلاحية بعد الإنشاء مشتقتان من الدفعات: تتغيران فقط عبر
+        # التوريد/البيع/الإتلاف/النقل. تُتجاهَل هنا (عملاء أقدم يرسلون expiry_date
+        # مع التعديل) كي لا ينكسر تطابق الكمية مع مجموع الدفعات.
+        validated_data.pop("quantity", None)
+        validated_data.pop("expiry_date", None)
+        return super().update(instance, validated_data)
 
     def validate(self, attrs):
         if self.instance is not None and "warehouse" in attrs and attrs["warehouse"].pk != self.instance.warehouse_id:
@@ -134,10 +181,12 @@ class MedicineSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class InvoiceItemSerializer(serializers.ModelSerializer):
+class InvoiceItemSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
+    owner_only_fields = ("unit_cost",)
+
     class Meta:
         model = InvoiceItem
-        fields = ["id", "medicine", "trade_name", "quantity", "unit_price", "total_price"]
+        fields = ["id", "medicine", "trade_name", "quantity", "unit_price", "total_price", "unit_cost"]
         read_only_fields = fields
 
 
@@ -175,6 +224,26 @@ class InvoiceSerializer(serializers.ModelSerializer):
         if obj.cashier is not None:
             return obj.cashier.get_full_name() or obj.cashier.username
         return obj.cashier_name or "بائع غير محدد"
+
+
+class SupplyInputSerializer(serializers.Serializer):
+    """بيانات الدخل لـ POST /api/medicines/<id>/supply/ فقط."""
+
+    quantity = serializers.IntegerField(min_value=1)
+    expiry_date = serializers.DateField(required=False, allow_null=True)
+    # اختياري: بدونه يُستخدم avg_cost الحالي (ويُرفض إن كانت الكلفة مجهولة).
+    purchase_price = serializers.DecimalField(max_digits=14, decimal_places=4, required=False, allow_null=True)
+    sale_price = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    def validate_purchase_price(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("سعر الشراء يجب أن يكون أكبر من صفر.")
+        return value
+
+    def validate_sale_price(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("سعر البيع يجب أن يكون أكبر من صفر.")
+        return value
 
 
 class CheckoutItemInputSerializer(serializers.Serializer):
@@ -298,7 +367,7 @@ class ExpenseSerializer(serializers.ModelSerializer):
         return value
 
 
-class DamagedMedicineSerializer(serializers.ModelSerializer):
+class DamagedMedicineSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
     """
     medicine مقبول ككتابة (معرّف الدواء)، لكن DamagedMedicineViewSet.create
     هي من تتحقق من ملكيته لصيدلية المستخدم وتخصم الكمية ذرّياً — نفس نمط
@@ -307,6 +376,7 @@ class DamagedMedicineSerializer(serializers.ModelSerializer):
     المحلي من نفس الاستجابة بلا طلب إضافي لجلب الدواء.
     """
 
+    owner_only_fields = ("total_cost",)
     medicine_new_quantity = serializers.SerializerMethodField()
 
     class Meta:
@@ -316,11 +386,12 @@ class DamagedMedicineSerializer(serializers.ModelSerializer):
             "medicine",
             "medicine_new_quantity",
             "quantity_damaged",
+            "total_cost",
             "reason",
             "notes",
             "damaged_at",
         ]
-        read_only_fields = ["id", "medicine_new_quantity", "damaged_at"]
+        read_only_fields = ["id", "medicine_new_quantity", "total_cost", "damaged_at"]
 
     def get_medicine_new_quantity(self, obj):
         return obj.medicine.quantity

@@ -49,6 +49,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
   double _totalSupplierDebt = 0.0;
   int _refundedInvoicesCount = 0;
 
+  // تقرير الربح (المالك فقط): revenue, cost_of_goods_sold, gross_profit,
+  // damage_cost, net_profit, items_without_cost. null = غير متاح (خادم أقدم).
+  Map<String, num>? _profit;
+
   // القوائم والجداول
   List<Map<String, dynamic>> _topSellingItems = [];
   List<Map<String, dynamic>> _stagnantMedicines = [];
@@ -133,6 +137,13 @@ Future<void> _loadReportDataOnline() async {
     _topSellingItems = List<Map<String, dynamic>>.from(data['top_selling_items'] as List);
     _stagnantMedicines = List<Map<String, dynamic>>.from(data['stagnant_medicines'] as List);
     _invoices = List<Map<String, dynamic>>.from(data['invoices'] as List);
+    _profit = data.containsKey('gross_profit')
+        ? {
+            for (final key in const ['revenue', 'cost_of_goods_sold', 'gross_profit', 'damage_cost', 'net_profit'])
+              key: num.tryParse(data[key].toString()) ?? 0,
+            'items_without_cost': (data['items_without_cost'] as num?) ?? 0,
+          }
+        : null;
     _isLoading = false;
   });
 }
@@ -179,14 +190,16 @@ Future<void> _loadReportDataOffline() async {
     // ودالة getExpiredMedicines المستخدمة بالداشبورد (نفس المعيار بالضبط).
     final String todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
+    // لكل دفعة صلاحية على حدة (بكلفة الدفعة، ثم متوسط الكلفة، ثم سعر الشراء).
     final expiredQuery = await db.rawQuery('''
-      SELECT COALESCE(SUM(quantity * buy_price), 0) AS expired_losses
-      FROM medicine
-      WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()}
-        AND is_damaged = 0 
-        AND quantity > 0 
-        AND date(expiry_date) >= date(?) AND date(expiry_date) <= date(?)
-        AND date(expiry_date) < date(?)
+      SELECT COALESCE(SUM(b.quantity * COALESCE(b.purchase_price, m.avg_cost, m.buy_price)), 0) AS expired_losses
+      FROM medicine_batch b
+      JOIN medicine m ON m.id = b.medicine_id
+      WHERE m.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('m.')}
+        AND m.is_damaged = 0
+        AND b.quantity > 0
+        AND date(b.expiry_date) >= date(?) AND date(b.expiry_date) <= date(?)
+        AND date(b.expiry_date) < date(?)
     ''', [widget.pharmacyId, startStr, endStr, todayStr]);
 
     // حساب خسائر التوالف المسجلة بالفترة المحددة
@@ -255,9 +268,12 @@ Future<void> _loadReportDataOffline() async {
       ORDER BY created_at DESC
     ''', [widget.pharmacyId, startStr, endStr]);
 
+    final profit = await DatabaseHelper.instance.getProfitSummary(widget.pharmacyId, start: startStr, end: endStr);
+
     if (!mounted) return;
 
     setState(() {
+      _profit = profit;
       _totalSales = cashInDrawer;
       _totalInvoicesCount = totalInvoicesCount;
       _totalDiscountsGiven = totalDiscounts;
@@ -902,6 +918,8 @@ Future<void> _loadReportDataOffline() async {
                         },
                       ),
                       const SizedBox(height: 30),
+                      _buildProfitSection(),
+                      const SizedBox(height: 30),
 
                       LayoutBuilder(
                         builder: (context, constraints) {
@@ -933,6 +951,57 @@ Future<void> _loadReportDataOffline() async {
                 ),
               ),
       ),
+    );
+  }
+
+  /// قسم الأرباح (الصفحة كلها حكر على المالك): نفس فترة التاريخ المختارة.
+  Widget _buildProfitSection() {
+    final profit = _profit;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('الأرباح', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF2D3748))),
+        const SizedBox(height: 12),
+        if (profit == null)
+          const Text('تقرير الأرباح غير متاح من الخادم الحالي. حدّث الخادم لعرضه.', style: TextStyle(color: Colors.grey))
+        else ...[
+          if ((profit['items_without_cost'] ?? 0) > 0) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF7ED),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFFFDBA74)),
+              ),
+              child: Text(
+                '${profit['items_without_cost']} صنفاً مباعاً بلا سعر كلفة — قد تكون الأرقام غير مكتملة.',
+                style: const TextStyle(color: Color(0xFF9A3412), fontWeight: FontWeight.bold, fontSize: 13),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+          LayoutBuilder(
+            builder: (context, constraints) {
+              double width = (constraints.maxWidth - 60) / 5;
+              if (constraints.maxWidth < 900) width = (constraints.maxWidth - 15) / 2;
+              final net = profit['net_profit'] ?? 0;
+              return Wrap(
+                spacing: 15,
+                runSpacing: 15,
+                children: [
+                  _buildKpiCard("الإيراد", AppFormatter.iqdWithCurrency(profit['revenue']), Icons.payments, const Color(0xFF3182CE), width),
+                  _buildKpiCard("كلفة البضاعة المباعة", AppFormatter.iqdWithCurrency(profit['cost_of_goods_sold']), Icons.inventory_2, const Color(0xFFDD6B20), width),
+                  _buildKpiCard("الربح الإجمالي", AppFormatter.iqdWithCurrency(profit['gross_profit']), Icons.trending_up, const Color(0xFF1ABC9C), width),
+                  _buildKpiCard("كلفة الإتلاف", AppFormatter.iqdWithCurrency(profit['damage_cost']), Icons.delete_forever, const Color(0xFFE53E3E), width),
+                  _buildKpiCard("صافي الربح\n(بعد المصاريف والإتلاف)", AppFormatter.iqdWithCurrency(net), Icons.calculate,
+                      net < 0 ? const Color(0xFFE53E3E) : const Color(0xFF38A169), width),
+                ],
+              );
+            },
+          ),
+        ],
+      ],
     );
   }
 

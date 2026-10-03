@@ -79,26 +79,13 @@ class _PosScreenState extends State<PosScreen> {
         pharmacyId: widget.pharmacyId,
         isOnlineMode: widget.isOnlineMode,
       );
-      final DateTime now = DateTime.now();
-      final DateTime today = DateTime(now.year, now.month, now.day);
-
       if (!mounted) return;
       setState(() {
-        // فلترة الأدوية: غير تالفة + كميتها > 0 + غير منتهية الصلاحية
+        // فلترة الأدوية: غير تالفة + لها كمية في دفعات غير منتهية الصلاحية
+        // (sellable_quantity؛ البيع يخصم منها بترتيب FEFO).
         _availableMedicines = meds.where((m) {
           final isNotDamaged = (m['is_damaged'] ?? 0) == 0;
-          final hasQuantity = (m['quantity'] ?? 0) > 0;
-
-          bool isNotExpired = true;
-          if (m['expiry_date'] != null && m['expiry_date'].toString().isNotEmpty) {
-            final expiry = DateTime.tryParse(m['expiry_date'].toString());
-            if (expiry != null) {
-              final expiryDateOnly = DateTime(expiry.year, expiry.month, expiry.day);
-              isNotExpired = !expiryDateOnly.isBefore(today);
-            }
-          }
-
-          return isNotDamaged && hasQuantity && isNotExpired;
+          return isNotDamaged && _sellableQty(m) > 0;
         }).toList();
 
         _recentInvoices = invoices;
@@ -177,26 +164,11 @@ class _PosScreenState extends State<PosScreen> {
 
       if (!mounted) return;
 
-      // تجهيز تاريخ اليوم للمقارنة
-      final DateTime now = DateTime.now();
-      final DateTime today = DateTime(now.year, now.month, now.day);
-
-      // فحص التاريخ للدواء الممسوح بالباركود
-      bool isNotExpired = true;
-      if (exactMatch != null && exactMatch['expiry_date'] != null && exactMatch['expiry_date'].toString().isNotEmpty) {
-        final expiry = DateTime.tryParse(exactMatch['expiry_date'].toString());
-        if (expiry != null) {
-          final expiryDateOnly = DateTime(expiry.year, expiry.month, expiry.day);
-          isNotExpired = !expiryDateOnly.isBefore(today);
-        }
-      }
-
-      // التحقق الشامل: الصيدلية + الكمية + عدم التلف + عدم انتهاء الصلاحية
+      // التحقق الشامل: الصيدلية + كمية صالحة (دفعات غير منتهية) + عدم التلف
       final isValid = exactMatch != null &&
           exactMatch['pharmacy_id'] == widget.pharmacyId &&
-          (exactMatch['quantity'] ?? 0) > 0 &&
-          (exactMatch['is_damaged'] ?? 0) == 0 &&
-          isNotExpired;
+          _sellableQty(exactMatch) > 0 &&
+          (exactMatch['is_damaged'] ?? 0) == 0;
 
       if (isValid) {
         _addMedicineToCart(exactMatch);
@@ -226,11 +198,16 @@ class _PosScreenState extends State<PosScreen> {
       _searchFocusNode.requestFocus();
     }
   }
+  /// الكمية القابلة للبيع فعلاً: مجموع الدفعات غير المنتهية (sellable_quantity
+  /// من DatabaseHelper)، مع الرجوع للكمية الكلية لصف لا يحملها.
+  int _sellableQty(Map<String, dynamic> medicine) =>
+      ((medicine['sellable_quantity'] ?? medicine['quantity'] ?? 0) as num).toInt();
+
   // --- 2. إضافة وتعديل عناصر السلة ---
   /// باركود الصنف يُحفظ في سطر السلة ليُعرض تحت اسمه في الفاتورة (سواء أُضيف
   /// بالماسح أو بالاسم) فيتأكد الصيدلي من الصنف المختار؛ لا يدخل في بيانات البيع.
   void _addMedicineToCart(Map<String, dynamic> medicine) {
-    int maxQty = medicine['quantity'] ?? 0;
+    int maxQty = _sellableQty(medicine);
     int medId = medicine['id'];
     final barcode = (medicine['barcode'] ?? '').toString().trim();
 
@@ -537,7 +514,7 @@ class _PosScreenState extends State<PosScreen> {
                                           separatorBuilder: (_, __) => const Divider(height: 1),
                                           itemBuilder: (context, index) {
                                             final med = _filteredSuggestions[index];
-                                            final int qty = med['quantity'] ?? 0;
+                                            final int qty = _sellableQty(med);
                                             final bool isLowStock = qty <= 5;
 
                                             return ListTile(

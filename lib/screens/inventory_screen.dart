@@ -7,6 +7,7 @@ import '../repository/warehouse_repository.dart';
 import '../services/medicine_api_service.dart';
 import '../services/warehouse_api_service.dart';
 import '../models/subscription_plan.dart';
+import '../utils/formatters.dart';
 import 'package:sqflite/sqflite.dart';
 
 class InventoryScreen extends StatefulWidget {
@@ -988,6 +989,10 @@ void _openAddMedicineDialog() {
 void _openSupplyDialog() {
   final addQtyCtrl = TextEditingController();
   final newExpiryCtrl = TextEditingController();
+  // سعر الشراء (للمالك فقط) وسعر البيع الموحّد الجديد، يُعبَّآن بقيم الصنف الحالية.
+  final purchasePriceCtrl = TextEditingController();
+  final salePriceCtrl = TextEditingController();
+  final showPurchasePrice = widget.isOwner;
   Map<String, dynamic>? selectedMedicine;
 
   // أسلوب تصميم موحد ومستقل للحقول (متناسق مع الهوية البرتقالية للتزويد)
@@ -1068,6 +1073,10 @@ void _openSupplyDialog() {
                     onSelected: (Map<String, dynamic> selection) {
                       setDialogState(() {
                         selectedMedicine = selection;
+                        final avgCost = (selection['avg_cost'] as num?)?.toDouble();
+                        purchasePriceCtrl.text = avgCost == null ? '' : _formatPriceInput(avgCost);
+                        final sellPrice = (selection['sell_price'] as num?)?.toDouble() ?? 0;
+                        salePriceCtrl.text = sellPrice > 0 ? _formatPriceInput(sellPrice) : '';
                       });
                     },
                     fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
@@ -1122,12 +1131,59 @@ void _openSupplyDialog() {
                   ),
                   const SizedBox(height: 12),
 
-                  // 3. حقل تاريخ الانتهاء الجديد
+                  // 3. سعر الشراء (المالك فقط) وسعر البيع
+                  if (showPurchasePrice) ...[
+                    TextField(
+                      controller: purchasePriceCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      onChanged: (_) => setDialogState(() {}),
+                      decoration: buildInputDecoration(
+                        labelText: selectedMedicine != null && selectedMedicine!['avg_cost'] == null
+                            ? 'سعر الشراء للوحدة * (مطلوب: كلفة الصنف غير معروفة)'
+                            : 'سعر الشراء للوحدة *',
+                        hintText: 'كلفة الوحدة في هذه الشحنة',
+                        prefixIcon: Icons.shopping_cart_outlined,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  TextField(
+                    controller: salePriceCtrl,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    onChanged: (_) => setDialogState(() {}),
+                    decoration: buildInputDecoration(
+                      labelText: 'سعر البيع للوحدة *',
+                      hintText: 'يُطبَّق على كل المخزون للمبيعات القادمة',
+                      prefixIcon: Icons.sell_outlined,
+                    ),
+                  ),
+                  // تحذير غير مانع: البيع بأقل من سعر الشراء.
+                  if (showPurchasePrice &&
+                      (double.tryParse(salePriceCtrl.text.trim()) ?? 0) > 0 &&
+                      (double.tryParse(salePriceCtrl.text.trim()) ?? 0) <
+                          (double.tryParse(purchasePriceCtrl.text.trim()) ?? 0)) ...[
+                    const SizedBox(height: 6),
+                    const Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Color(0xFFD97706), size: 16),
+                        SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            'تنبيه: سعر البيع أقل من سعر الشراء.',
+                            style: TextStyle(fontSize: 12, color: Color(0xFF92400E), fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+
+                  // 4. تاريخ انتهاء هذه الشحنة (دفعة صلاحية مستقلة)
                   TextField(
                     controller: newExpiryCtrl,
                     readOnly: true,
                     decoration: buildInputDecoration(
-                      labelText: 'تاريخ الانتهاء الجديد (اختياري)',
+                      labelText: 'تاريخ انتهاء هذه الشحنة (اختياري)',
                       hintText: 'انقر لاختيار التاريخ',
                       prefixIcon: Icons.calendar_month_outlined,
                     ),
@@ -1196,6 +1252,21 @@ void _openSupplyDialog() {
                   return;
                 }
 
+                // غير المالك لا يرى سعر الشراء: يُستخدم avg_cost الحالي تلقائياً (null).
+                double? purchasePrice;
+                if (showPurchasePrice) {
+                  purchasePrice = double.tryParse(purchasePriceCtrl.text.trim());
+                  if (purchasePrice == null || purchasePrice <= 0) {
+                    _showSnackBar('يرجى إدخال سعر شراء أكبر من صفر', Colors.red);
+                    return;
+                  }
+                }
+                final salePrice = double.tryParse(salePriceCtrl.text.trim());
+                if (salePrice == null || salePrice <= 0) {
+                  _showSnackBar('يرجى إدخال سعر بيع أكبر من صفر', Colors.red);
+                  return;
+                }
+
                 try {
                   await MedicineRepository.instance.supplyMedicine(
                     pharmacyId: widget.pharmacyId,
@@ -1203,6 +1274,8 @@ void _openSupplyDialog() {
                     medicineId: selectedMedicine!['id'],
                     addedQuantity: qtyToAdd,
                     newExpiryDate: newExpiryCtrl.text.trim().isEmpty ? null : newExpiryCtrl.text.trim(),
+                    purchasePrice: purchasePrice,
+                    salePrice: salePrice,
                   );
 
                   if (Navigator.canPop(ctx)) Navigator.pop(ctx);
@@ -1223,6 +1296,58 @@ void _openSupplyDialog() {
     ),
   );
 }
+  /// تفاصيل دفعات الصلاحية لصنف (للعرض فقط). سعر شراء الدفعة للمالك فقط.
+  Future<void> _showBatchesDialog(Map<String, dynamic> med) async {
+    final batches = await DatabaseHelper.instance.getMedicineBatches(med['id'] as int);
+    if (!mounted) return;
+    final today = DateTime.now();
+    final todayDate = DateTime(today.year, today.month, today.day);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('دفعات الصلاحية — ${med['trade_name']}', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        content: SizedBox(
+          width: 420,
+          child: batches.isEmpty
+              ? const Text('لا توجد كمية متوفرة حالياً.')
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final b in batches)
+                      Builder(builder: (context) {
+                        final expiry = DateTime.tryParse((b['expiry_date'] ?? '').toString());
+                        final expired = expiry != null && expiry.isBefore(todayDate);
+                        final price = b['purchase_price'] as num?;
+                        return ListTile(
+                          dense: true,
+                          leading: Icon(
+                            expired ? Icons.warning_amber_rounded : Icons.event_available_outlined,
+                            color: expired ? Colors.red : const Color(0xFF1ABC9C),
+                          ),
+                          title: Text(
+                            'الانتهاء: ${b['expiry_date'] ?? 'غير محدد'}${expired ? ' (منتهية)' : ''}',
+                            style: TextStyle(fontSize: 13, color: expired ? Colors.red : null),
+                          ),
+                          subtitle: widget.isOwner && price != null
+                              ? Text('سعر الشراء: ${AppFormatter.iqdWithCurrency(price)}', style: const TextStyle(fontSize: 12))
+                              : null,
+                          trailing: Text('${b['quantity']} قطعة', style: const TextStyle(fontWeight: FontWeight.bold)),
+                        );
+                      }),
+                  ],
+                ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق'))],
+      ),
+    );
+  }
+
+  /// قيمة سعر لحقل إدخال: بلا كسور زائدة (666.6667، 1250).
+  String _formatPriceInput(double value) {
+    if (value == value.roundToDouble()) return value.toStringAsFixed(0);
+    return value.toStringAsFixed(4).replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+  }
+
 // --- 3. تعديل بيانات الدواء ---
   void _openEditDialog(Map<String, dynamic> med) {
     final barcodeCtrl = TextEditingController(text: med['barcode'] ?? '');
@@ -1286,53 +1411,22 @@ void _openSupplyDialog() {
                     // --- التسعير والصلاحية ---
                     Row(
                       children: [
-                        Expanded(child: TextField(controller: buyPriceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر الشراء *'))),
+                        Expanded(child: TextField(controller: buyPriceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'آخر سعر شراء *'))),
                         const SizedBox(width: 10),
                         Expanded(child: TextField(controller: sellPriceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر البيع *'))),
                       ],
                     ),
                     const SizedBox(height: 10),
+                    // الصلاحية تُدار لكل شحنة (دفعة) عبر "تزويد شحنة"؛ هنا أقربها للعرض فقط.
                     TextField(
                       controller: expiryCtrl,
                       readOnly: true,
-                      decoration: InputDecoration(
-                        labelText: 'تاريخ الانتهاء *',
-                        hintText: 'انقر لاختيار التاريخ',
-                        prefixIcon: const Icon(Icons.calendar_month_outlined, color: Color(0xFF3182CE)),
-                        border: const OutlineInputBorder(),
+                      enabled: false,
+                      decoration: const InputDecoration(
+                        labelText: 'أقرب تاريخ انتهاء (حسب الشحنات)',
+                        prefixIcon: Icon(Icons.calendar_month_outlined, color: Color(0xFF3182CE)),
+                        border: OutlineInputBorder(),
                       ),
-                      onTap: () async {
-                        final DateTime now = DateTime.now();
-                        final DateTime initial =
-                            DateTime.tryParse(expiryCtrl.text.trim()) ?? now;
-
-                        final DateTime? pickedDate = await showDatePicker(
-                          context: context,
-                          initialDate: initial,
-                          firstDate: DateTime(now.year - 5),
-                          lastDate: DateTime(2040, 12, 31),
-                          builder: (context, child) {
-                            return Theme(
-                              data: Theme.of(context).copyWith(
-                                colorScheme: const ColorScheme.light(
-                                  primary: Color(0xFF3182CE),
-                                  onPrimary: Colors.white,
-                                  onSurface: Colors.black,
-                                ),
-                              ),
-                              child: child!,
-                            );
-                          },
-                        );
-
-                        if (pickedDate != null) {
-                          final String formattedDate =
-                              "${pickedDate.year}-${pickedDate.month.toString().padLeft(2, '0')}-${pickedDate.day.toString().padLeft(2, '0')}";
-                          setDialogState(() {
-                            expiryCtrl.text = formattedDate;
-                          });
-                        }
-                      },
                     ),
                   ],
                 ),
@@ -1355,7 +1449,6 @@ void _openSupplyDialog() {
                         'category': selectedCategory,
                         'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
                         'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
-                        'expiry_date': expiryCtrl.text.trim(),
                         'shelf_location': shelfCtrl.text.trim(),
                       },
                     );
@@ -1678,7 +1771,9 @@ void _openSupplyDialog() {
                                       columns: [
                                         const DataColumn(label: Text('اسم الدواء', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         const DataColumn(label: Text('الكمية', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        const DataColumn(label: Text('سعر الشراء', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
+                                        // الكلفة وسعر الشراء للمالك فقط.
+                                        if (widget.isOwner)
+                                          const DataColumn(label: Text('الكلفة (متوسط)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         const DataColumn(label: Text('سعر البيع', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         const DataColumn(label: Text('الصلاحية', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         const DataColumn(label: Text('الشكل الدوائي', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
@@ -1695,13 +1790,15 @@ void _openSupplyDialog() {
                                         String scientificName = med['scientific_name'] ?? '';
                                         String barcode = med['barcode'] ?? '';
 
-                                        String buyPriceStr = formatAmount(med['buy_price']);
+                                        final avgCost = med['avg_cost'] as num?;
+                                        String buyPriceStr = avgCost == null ? '-' : '${formatAmount(avgCost)} د.ع';
                                         String sellPriceStr = formatAmount(med['sell_price']);
 
                                         return DataRow(
                                           cells: [
-                                            // اسم الدواء والتفاصيل
+                                            // اسم الدواء والتفاصيل (النقر يعرض دفعات الصلاحية)
                                             DataCell(
+                                              onTap: () => _showBatchesDialog(med),
                                               Padding(
                                                 padding: const EdgeInsets.symmetric(vertical: 6.0),
                                                 child: Column(
@@ -1757,13 +1854,14 @@ void _openSupplyDialog() {
                                                 ),
                                               ),
                                             ),
-                                            // سعر الشراء
-                                            DataCell(
-                                              Text(
-                                                '$buyPriceStr د.ع',
-                                                style: TextStyle(fontSize: 13, color: Colors.grey.shade800),
+                                            // متوسط الكلفة (المالك فقط)
+                                            if (widget.isOwner)
+                                              DataCell(
+                                                Text(
+                                                  buyPriceStr,
+                                                  style: TextStyle(fontSize: 13, color: Colors.grey.shade800),
+                                                ),
                                               ),
-                                            ),
                                             // سعر البيع
                                             DataCell(
                                               Text(
@@ -1771,8 +1869,18 @@ void _openSupplyDialog() {
                                                 style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1ABC9C)),
                                               ),
                                             ),
-                                            // الصلاحية
-                                            DataCell(Text(med['expiry_date'] ?? '-', style: const TextStyle(fontSize: 13))),
+                                            // الصلاحية: أقرب دفعة؛ النقر يعرض كل الدفعات
+                                            DataCell(
+                                              onTap: () => _showBatchesDialog(med),
+                                              Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Text(med['expiry_date'] ?? '-', style: const TextStyle(fontSize: 13)),
+                                                  const SizedBox(width: 4),
+                                                  Icon(Icons.layers_outlined, size: 14, color: Colors.grey.shade500),
+                                                ],
+                                              ),
+                                            ),
                                             // الشكل الدوائي
                                             DataCell(Text(categoryLabel, style: const TextStyle(fontSize: 13))),
                                             // الرف

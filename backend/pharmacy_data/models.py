@@ -64,9 +64,15 @@ class Medicine(models.Model):
     trade_name = models.CharField(max_length=200)
     scientific_name = models.CharField(max_length=200, blank=True, default="")
     category = models.CharField(max_length=120, blank=True, default="")
+    # مجموع كميات MedicineBatch دائماً (يحافظ عليه pharmacy_data.stock).
     quantity = models.IntegerField(default=0)
+    # آخر سعر شراء مُدخل (للعرض فقط). كلفة الربح هي avg_cost.
     buy_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     sell_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # متوسط الكلفة المرجّح، يُعاد حسابه مع كل توريد (stock.supply). 4 خانات
+    # عشرية كي لا يتراكم خطأ التقريب في كلفة البضاعة المباعة. NULL = غير معروف.
+    avg_cost = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
+    # أقرب تاريخ انتهاء بين الدفعات المتوفرة (مشتق، يحافظ عليه stock.refresh_stock).
     expiry_date = models.DateField(null=True, blank=True)
     shelf_location = models.CharField(max_length=120, blank=True, default="")
     is_damaged = models.BooleanField(default=False)
@@ -104,6 +110,28 @@ class Medicine(models.Model):
         if self.warehouse_id is None and self.pharmacy_id is not None:
             self.warehouse = Warehouse.main_for(self.pharmacy_id)
         super().save(*args, **kwargs)
+
+
+class MedicineBatch(models.Model):
+    """
+    دفعة صلاحية مخفية عن المستخدم (يقابل جدول medicine_batch المحلي). البيع
+    والإتلاف والنقل تخصم منها بترتيب FEFO (الأقرب انتهاءً أولاً)، ومجموع
+    كمياتها = Medicine.quantity دائماً. تُدار حصراً عبر pharmacy_data.stock.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="medicine_batches")
+    medicine = models.ForeignKey(Medicine, on_delete=models.CASCADE, related_name="batches")
+    quantity = models.PositiveIntegerField()
+    expiry_date = models.DateField(null=True, blank=True)
+    purchase_price = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["expiry_date", "id"]
+        indexes = [models.Index(fields=["medicine", "expiry_date"])]
+
+    def __str__(self):
+        return f"{self.medicine_id} x{self.quantity} ({self.expiry_date})"
 
 
 class StockTransfer(models.Model):
@@ -207,6 +235,9 @@ class InvoiceItem(models.Model):
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     total_price = models.DecimalField(max_digits=12, decimal_places=2)
+    # لقطة من Medicine.avg_cost وقت البيع (يضبطها الخادم فقط، لا تُقبل من
+    # العميل ولا تتغير بعدها). NULL = مبيعات قديمة بلا كلفة معروفة.
+    unit_cost = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
 
     class Meta:
         constraints = [
@@ -323,6 +354,8 @@ class DamagedMedicine(models.Model):
     # PROTECT: نفس منطق InvoiceItem.medicine — يمنع حذف دواء له سجل إتلاف.
     medicine = models.ForeignKey(Medicine, on_delete=models.PROTECT, related_name="damaged_records")
     quantity_damaged = models.PositiveIntegerField()
+    # كلفة الإتلاف = الكمية × avg_cost وقت الإتلاف (NULL إن كانت الكلفة مجهولة).
+    total_cost = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
     reason = models.CharField(max_length=32, blank=True, default="")
     notes = models.CharField(max_length=255, blank=True, default="")
     # كان auto_now_add؛ حُوِّل إلى default قابل للتجاوز لنفس سبب Invoice.created_at:

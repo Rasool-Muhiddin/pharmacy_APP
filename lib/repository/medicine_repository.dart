@@ -99,26 +99,28 @@ class MedicineRepository {
     return _localRowById(id);
   }
 
-  /// زيادة كمية دواء موجود (شحنة توريد جديدة)، مع تحديث اختياري لتاريخ الصلاحية.
+  /// توريد شحنة: متوسط كلفة مرجّح، سعر بيع موحّد جديد، ودفعة صلاحية جديدة.
+  /// [purchasePrice] null = يُستخدم avg_cost الحالي (حالة غير المالك).
   ///
-  /// ⚠️ أونلاين: هذه قراءة-ثم-كتابة (read-modify-write) وليست عملية ذرية على
-  /// السيرفر — لا يوجد endpoint مخصص للزيادة النسبية بعد، فنحسب الكمية
-  /// الجديدة من آخر قيمة معروفة في الكاش المحلي ثم نرسلها كقيمة مطلقة. لو
-  /// عدّل جهاز آخر نفس الدواء بين قراءتك وحفظك، قد تُفقد إحدى الزيادتين.
-  /// مقبول حالياً لأن تزامن العرض بين الأجهزة يدوي أصلاً (لا واقعية بديلة
-  /// بلا endpoint ذري على الخادم)، لكن يستحق أن يُبنى لاحقاً كخطوة عرضة أقل.
+  /// أونلاين: طلب واحد ذرّي على الخادم (`POST /medicines/<id>/supply/` داخل
+  /// transaction + select_for_update) بدل قراءة-ثم-كتابة الكمية المطلقة
+  /// القديمة التي كانت تُفقد إحدى زيادتين متزامنتين.
   Future<Map<String, dynamic>> supplyMedicine({
     required int pharmacyId,
     required bool isOnlineMode,
     required int medicineId,
     required int addedQuantity,
     String? newExpiryDate,
+    double? purchasePrice,
+    required double salePrice,
   }) async {
     if (!isOnlineMode) {
       await _db.supplyMedicine(
         medicineId: medicineId,
         addedQuantity: addedQuantity,
         newExpiryDate: newExpiryDate,
+        purchasePrice: purchasePrice,
+        salePrice: salePrice,
       );
       return _localRowById(medicineId);
     }
@@ -126,15 +128,13 @@ class MedicineRepository {
     _assertServerRecord(medicineId);
     await _assertOnlineWritable();
 
-    final current = await _localRowById(medicineId);
-    final newQuantity = (current['quantity'] as int) + addedQuantity;
-
-    final payload = <String, dynamic>{'quantity': newQuantity};
-    if (newExpiryDate != null && newExpiryDate.isNotEmpty) {
-      payload['expiry_date'] = newExpiryDate;
-    }
-
-    final updated = await _api.updateMedicine(medicineId, payload);
+    final updated = await _api.supplyMedicine(
+      medicineId,
+      quantity: addedQuantity,
+      expiryDate: newExpiryDate,
+      purchasePrice: purchasePrice,
+      salePrice: salePrice,
+    );
     await _db.upsertMedicineFromServer(
       pharmacyId: pharmacyId,
       serverData: updated,
@@ -178,44 +178,16 @@ class MedicineRepository {
       'notes': notes ?? '',
     });
 
-    // الخادم يُعيد medicine_new_quantity ضمن نفس الاستجابة، فنحدّث كاش
-    // المخزون المحلي مباشرة بلا طلب إضافي لجلب الدواء نفسه.
-    final newQuantity = created['medicine_new_quantity'];
-    if (newQuantity is num) {
-      await _db.upsertMedicineFromServer(
-        pharmacyId: pharmacyId,
-        serverData: {..._localCacheRowRaw(await _localRowById(medicineId)), 'quantity': newQuantity},
-      );
-    }
-
     await _db.upsertDamagedMedicineFromServer(
       pharmacyId: pharmacyId,
       serverData: created,
     );
 
-    return _localRowById(medicineId);
-  }
+    // الخادم خصم الكمية من الدفعات (FEFO)؛ نُحدّث كاش المخزون كاملاً (مع
+    // الدفعات) بنفس نمط البيع الأونلاين بدل تعديل الكمية وحدها محلياً.
+    await getMedicines(pharmacyId: pharmacyId, isOnlineMode: true);
 
-  /// يحوّل صف الكاش المحلي (قد يحتوي حقولاً إضافية كـ last_synced_at) إلى
-  /// شكل مقبول لـ upsertMedicineFromServer، بنفس مفاتيح استجابة السيرفر —
-  /// نحتاجه هنا لأن استجابة damaged-medicines لا تعيد كامل صف الدواء، بل
-  /// الكمية الجديدة فقط.
-  Map<String, dynamic> _localCacheRowRaw(Map<String, dynamic> row) {
-    return {
-      'id': row['id'],
-      // بدونه يُعاد الصنف في الكاش إلى المخزن الرئيسي (القيمة الاحتياطية).
-      'warehouse': row['warehouse_id'],
-      'trade_name': row['trade_name'],
-      'scientific_name': row['scientific_name'],
-      'category': row['category'],
-      'buy_price': row['buy_price'],
-      'sell_price': row['sell_price'],
-      'expiry_date': row['expiry_date'],
-      'shelf_location': row['shelf_location'],
-      'is_damaged': row['is_damaged'],
-      'barcode': row['barcode'],
-      'updated_at': DateTime.now().toIso8601String(),
-    };
+    return _localRowById(medicineId);
   }
 
   Future<void> deleteMedicine({

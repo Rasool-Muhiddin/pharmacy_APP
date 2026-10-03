@@ -19,6 +19,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from desktop_api.models import DesktopLicense, Pharmacy, PharmacyMembership
+from pharmacy_data import stock
 from pharmacy_data.models import Medicine
 
 DEMO_MEDICINES = [
@@ -74,11 +75,12 @@ class Command(BaseCommand):
         )
         today = timezone.localdate()
         for i, (trade, sci, cat, qty, buy, sell) in enumerate(DEMO_MEDICINES):
-            Medicine.objects.create(
+            medicine = Medicine.objects.create(
                 pharmacy=pharmacy, trade_name=trade, scientific_name=sci, category=cat,
                 quantity=qty, buy_price=Decimal(buy), sell_price=Decimal(sell),
                 expiry_date=today + timedelta(days=200 + i * 45), barcode=f"DEMO-{i + 1:04d}",
             )
+            stock.create_initial_batch(medicine)
 
         self.stdout.write(self.style.SUCCESS("تم تجهيز بيئة العرض:"))
         self.stdout.write(f"  رمز التفعيل : {license.activation_code}")

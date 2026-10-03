@@ -110,7 +110,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 9,
+    version: 10,
     onConfigure: (db) async {
       // ترقيات v7 و v9 تعيد بناء جداول (medicine/invoice: DROP + RENAME) وتنقل
       // معرّفات صفوف تشير إليها جداول أخرى. PRAGMA foreign_keys لا يمكن تغييره
@@ -205,10 +205,12 @@ Future<void> _onCreate(Database db, int version) async {
       is_damaged INTEGER DEFAULT 0,
       barcode TEXT,
       last_synced_at TEXT,
+      avg_cost REAL,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
       FOREIGN KEY(warehouse_id) REFERENCES warehouses(id)
     )
   ''');
+  await _createMedicineBatchTable(db);
 
   // 5. جدول الموردين (المذاخر)
   await db.execute('''
@@ -235,6 +237,7 @@ Future<void> _onCreate(Database db, int version) async {
       quantity INTEGER NOT NULL,
       unit_price REAL NOT NULL,
       total_price REAL NOT NULL,
+      unit_cost REAL,
       FOREIGN KEY(invoice_id) REFERENCES invoice(id) ON DELETE CASCADE,
       FOREIGN KEY(medicine_id) REFERENCES medicine(id)
     )
@@ -250,6 +253,7 @@ Future<void> _onCreate(Database db, int version) async {
       reason TEXT,
       notes TEXT,
       damaged_at TEXT NOT NULL,
+      total_cost REAL,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
       FOREIGN KEY(medicine_id) REFERENCES medicine(id)
     )
@@ -609,6 +613,43 @@ Future<void> _onUpgrade(
   if (oldVersion < 9) {
     await _upgradeToSeparateIdRanges(db);
   }
+
+  if (oldVersion < 10) {
+    await _upgradeToCostAndBatches(db);
+  }
+}
+
+/// v10: تتبّع الربح — avg_cost للدواء، unit_cost لسطر البيع، total_cost
+/// للإتلاف، ودفعات صلاحية مخفية (medicine_batch). سعر شراء 0 يعني "غير
+/// معروف" فيبقى avg_cost NULL. unit_cost للمبيعات السابقة يبقى NULL (لا تخمين).
+Future<void> _upgradeToCostAndBatches(DatabaseExecutor db) async {
+  await db.execute('ALTER TABLE medicine ADD COLUMN avg_cost REAL;');
+  await db.execute('ALTER TABLE invoice_item ADD COLUMN unit_cost REAL;');
+  await db.execute('ALTER TABLE damaged_medicine ADD COLUMN total_cost REAL;');
+  await _createMedicineBatchTable(db);
+  await db.execute('UPDATE medicine SET avg_cost = buy_price WHERE buy_price > 0;');
+  await db.rawInsert('''
+    INSERT INTO medicine_batch (medicine_id, quantity, expiry_date, purchase_price, created_at)
+    SELECT id, quantity, NULLIF(expiry_date, ''), avg_cost, ? FROM medicine WHERE quantity > 0
+  ''', [DateTime.now().toIso8601String()]);
+}
+
+/// دفعات الصلاحية المخفية: مجموع quantity = medicine.quantity دائماً.
+/// server_id: معرّف الدفعة على الخادم لصفوف كاش الأونلاين (NULL للمحلية).
+Future<void> _createMedicineBatchTable(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE medicine_batch(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      medicine_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL CHECK(quantity >= 0),
+      expiry_date TEXT,
+      purchase_price REAL,
+      created_at TEXT NOT NULL,
+      server_id INTEGER,
+      FOREIGN KEY(medicine_id) REFERENCES medicine(id) ON DELETE CASCADE
+    )
+  ''');
+  await db.execute('CREATE INDEX idx_medicine_batch_medicine ON medicine_batch(medicine_id, expiry_date);');
 }
 
 /// v9: فصل نطاق معرّفات الصفوف المحلية عن معرّفات الخادم (راجع localIdBase).
@@ -743,47 +784,296 @@ Future<Map<String, dynamic>?> getPharmacy(int id) async {
 // (عمود NOT NULL الآن) - مرّر ensureMainWarehouse(pharmacyId) كقيمة
 // افتراضية من شاشة الإضافة العادية، أو معرّف المخزن الثاني إن كانت
 // الإضافة صراحة لمخزن ثانوي.
+//
+// avg_cost الأولي = سعر الشراء (إن كان > 0، وإلا يبقى NULL = غير معروف)،
+// والكمية الأولية تصبح أول دفعة صلاحية.
 Future<int> insertMedicine(Map<String, dynamic> medicine) async {
   final db = await database;
-  return await db.insert(
-    'medicine',
-    medicine,
-    conflictAlgorithm: ConflictAlgorithm.abort,
-  );
+  return db.transaction((txn) async {
+    final row = Map<String, dynamic>.from(medicine);
+    final expiry = (row['expiry_date'] as String?)?.trim();
+    row['expiry_date'] = (expiry == null || expiry.isEmpty) ? null : expiry;
+    final buyPrice = (row['buy_price'] as num?)?.toDouble() ?? 0;
+    if (row['avg_cost'] == null && buyPrice > 0) row['avg_cost'] = roundCost(buyPrice);
+    final id = await txn.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.abort);
+    final quantity = (row['quantity'] as num?)?.toInt() ?? 0;
+    if (quantity > 0) {
+      await txn.insert('medicine_batch', {
+        'medicine_id': id,
+        'quantity': quantity,
+        'expiry_date': row['expiry_date'],
+        'purchase_price': row['avg_cost'],
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    }
+    return id;
+  });
 }
 
 // جميع أدوية الصيدلية. warehouseId اختياري: مرّره لتقييد النتيجة بمخزن
 // واحد فقط (مثلاً POS يمرر دائماً المخزن الرئيسي - راجع
 // WarehouseRepository.getMainWarehouseId) - بدونه تُعاد أصناف كل مخازن
 // الصيدلية معاً (لشاشة الجرد العامة).
+//
+// كل صف يحمل sellable_quantity: الكمية في الدفعات غير المنتهية (ما يمكن
+// بيعه فعلاً؛ البيع يخصم منها بترتيب FEFO).
 Future<List<Map<String, dynamic>>> getMedicines(int pharmacyId, {int? warehouseId}) async {
   final db = await database;
-  if (warehouseId != null) {
-    return await db.query(
-      'medicine',
-      where: 'pharmacy_id = ? AND warehouse_id = ? AND ${originFilter()}',
-      whereArgs: [pharmacyId, warehouseId],
-      orderBy: 'trade_name COLLATE NOCASE ASC',
-    );
-  }
-  return await db.query(
-    'medicine',
-    where: 'pharmacy_id = ? AND ${originFilter()}',
-    whereArgs: [pharmacyId],
-    orderBy: 'trade_name COLLATE NOCASE ASC',
-  );
+  return db.rawQuery('''
+    SELECT medicine.*, $sellableQuantitySql
+    FROM medicine
+    WHERE pharmacy_id = ? ${warehouseId != null ? 'AND warehouse_id = ?' : ''} AND ${originFilter()}
+    ORDER BY trade_name COLLATE NOCASE ASC
+  ''', [pharmacyId, if (warehouseId != null) warehouseId]);
 }
 
 // تعديل دواء
+//
+// الكمية والصلاحية مشتقتان من الدفعات (تتغيران فقط بالتوريد/البيع/الإتلاف/
+// النقل)، وavg_cost يحسبه التوريد — تُتجاهل هنا كما في MedicineSerializer.
 Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   final db = await database;
+  final values = Map<String, dynamic>.from(medicine)
+    ..remove('quantity')
+    ..remove('expiry_date')
+    ..remove('avg_cost');
   return await db.update(
     'medicine',
-    medicine,
+    values,
     where: 'id = ?',
     whereArgs: [id],
   );
 }
+
+  //====================================================
+  // متوسط الكلفة + دفعات الصلاحية المخفية (نفس pharmacy_data/stock.py)
+  //
+  // medicine.quantity = مجموع medicine_batch.quantity دائماً، وexpiry_date
+  // = أقرب انتهاء بين الدفعات المتوفرة. كل تغيير للمخزون يمر من هنا داخل
+  // معاملة: البيع FEFO من الدفعات غير المنتهية، والإتلاف/النقل FEFO من كلها.
+  //====================================================
+
+  /// الكلفة بـ4 خانات عشرية (كي لا يتراكم خطأ التقريب في كلفة البضاعة المباعة).
+  static double? roundCost(num? value) => value == null ? null : (value * 10000).round() / 10000;
+
+  static double roundMoney(num value) => (value * 100).round() / 100;
+
+  static double weightedAverageCost({
+    required int oldQty,
+    required double? oldAvg,
+    required int newQty,
+    required double newCost,
+  }) {
+    if (oldQty <= 0 || oldAvg == null) return roundCost(newCost)!;
+    return roundCost((oldQty * oldAvg + newQty * newCost) / (oldQty + newQty))!;
+  }
+
+  static const String _sellableBatch =
+      "(b.expiry_date IS NULL OR b.expiry_date = '' OR date(b.expiry_date) >= date('now', 'localtime'))";
+
+  /// عمود sellable_quantity لاستعلام على جدول medicine (بلا اسم مستعار). دواء
+  /// بلا أي دفعة (كاش من خادم أقدم) يُقيَّم بصلاحيته المجمّعة كما في السابق.
+  static const String sellableQuantitySql = '''
+    CASE WHEN EXISTS (SELECT 1 FROM medicine_batch b WHERE b.medicine_id = medicine.id)
+      THEN (SELECT COALESCE(SUM(b.quantity), 0) FROM medicine_batch b
+            WHERE b.medicine_id = medicine.id AND $_sellableBatch)
+      ELSE CASE WHEN medicine.expiry_date IS NULL OR medicine.expiry_date = ''
+                  OR date(medicine.expiry_date) >= date('now', 'localtime')
+             THEN medicine.quantity ELSE 0 END
+    END AS sellable_quantity''';
+
+  Future<Map<String, Object?>> _medicineRow(DatabaseExecutor txn, int medicineId) async {
+    final rows = await txn.query('medicine', where: 'id = ?', whereArgs: [medicineId], limit: 1);
+    if (rows.isEmpty) throw StateError('الصنف غير موجود.');
+    return rows.first;
+  }
+
+  /// يعيد ضبط quantity وexpiry_date المشتقّين من الدفعات.
+  Future<void> _refreshMedicineStock(DatabaseExecutor txn, int medicineId) async {
+    final rows = await txn.rawQuery('''
+      SELECT COALESCE(SUM(quantity), 0) AS total,
+             MIN(NULLIF(expiry_date, '')) AS nearest
+      FROM medicine_batch WHERE medicine_id = ? AND quantity > 0
+    ''', [medicineId]);
+    final total = (rows.first['total'] as num).toInt();
+    await txn.update(
+      'medicine',
+      {'quantity': total, if (total > 0) 'expiry_date': rows.first['nearest']},
+      where: 'id = ?',
+      whereArgs: [medicineId],
+    );
+  }
+
+  /// كمية غير مغطاة بدفعات (صف أقدم/معدَّل يدوياً) تُعطى دفعة بالفرق كي لا تُفقد.
+  Future<void> _reconcileBatches(DatabaseExecutor txn, Map<String, Object?> medicine) async {
+    final medicineId = medicine['id'] as int;
+    final covered = Sqflite.firstIntValue(await txn.rawQuery(
+          'SELECT COALESCE(SUM(quantity), 0) FROM medicine_batch WHERE medicine_id = ?',
+          [medicineId],
+        )) ??
+        0;
+    final quantity = (medicine['quantity'] as num?)?.toInt() ?? 0;
+    if (quantity > covered) {
+      final expiry = (medicine['expiry_date'] as String?)?.trim();
+      await txn.insert('medicine_batch', {
+        'medicine_id': medicineId,
+        'quantity': quantity - covered,
+        'expiry_date': (expiry == null || expiry.isEmpty) ? null : expiry,
+        'purchase_price': medicine['avg_cost'],
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    }
+  }
+
+  Future<void> _addBatch(
+    DatabaseExecutor txn, {
+    required int medicineId,
+    required int quantity,
+    String? expiryDate,
+    double? purchasePrice,
+  }) async {
+    await txn.insert('medicine_batch', {
+      'medicine_id': medicineId,
+      'quantity': quantity,
+      'expiry_date': (expiryDate == null || expiryDate.trim().isEmpty) ? null : expiryDate.trim(),
+      'purchase_price': roundCost(purchasePrice),
+      'created_at': DateTime.now().toIso8601String(),
+    });
+    await _refreshMedicineStock(txn, medicineId);
+  }
+
+  /// يخصم [quantity] بترتيب FEFO (الأقرب انتهاءً أولاً، بلا تاريخ أخيراً) مع
+  /// التقسيم بين الدفعات، ويحذف المستنفدة. [sellableOnly] (البيع) يتجاهل
+  /// الدفعات المنتهية. يرجع الأجزاء المأخوذة (لنقلها كما هي بين المخازن).
+  Future<List<Map<String, Object?>>> _deductFefo(
+    DatabaseExecutor txn,
+    int medicineId,
+    int quantity, {
+    required bool sellableOnly,
+  }) async {
+    final medicine = await _medicineRow(txn, medicineId);
+    await _reconcileBatches(txn, medicine);
+    final batches = await txn.rawQuery('''
+      SELECT * FROM medicine_batch b
+      WHERE b.medicine_id = ? AND b.quantity > 0 ${sellableOnly ? 'AND $_sellableBatch' : ''}
+      ORDER BY (b.expiry_date IS NULL OR b.expiry_date = '') ASC, b.expiry_date ASC, b.id ASC
+    ''', [medicineId]);
+
+    var remaining = quantity;
+    final taken = <Map<String, Object?>>[];
+    for (final batch in batches) {
+      if (remaining == 0) break;
+      final batchQty = batch['quantity'] as int;
+      final part = batchQty < remaining ? batchQty : remaining;
+      taken.add({'quantity': part, 'expiry_date': batch['expiry_date'], 'purchase_price': batch['purchase_price']});
+      remaining -= part;
+      if (part == batchQty) {
+        await txn.delete('medicine_batch', where: 'id = ?', whereArgs: [batch['id']]);
+      } else {
+        await txn.update('medicine_batch', {'quantity': batchQty - part}, where: 'id = ?', whereArgs: [batch['id']]);
+      }
+    }
+    if (remaining > 0) {
+      throw StateError(sellableOnly
+          ? 'الكمية الصالحة (غير المنتهية) من ${medicine['trade_name']} غير كافية.'
+          : 'الكمية المتوفرة من ${medicine['trade_name']} غير كافية.');
+    }
+    await _refreshMedicineStock(txn, medicineId);
+    return taken;
+  }
+
+  /// إرجاع: الكمية تعود لأبعد دفعة انتهاءً، أو لدفعة جديدة إن لم توجد.
+  /// avg_cost لا يتغير.
+  Future<void> _restoreToLatestBatch(DatabaseExecutor txn, int medicineId, int quantity) async {
+    final medicine = await _medicineRow(txn, medicineId);
+    await _reconcileBatches(txn, medicine);
+    final latest = await txn.rawQuery('''
+      SELECT id, quantity FROM medicine_batch WHERE medicine_id = ?
+      ORDER BY (expiry_date IS NULL OR expiry_date = '') ASC, expiry_date DESC, id DESC
+      LIMIT 1
+    ''', [medicineId]);
+    if (latest.isNotEmpty) {
+      await txn.update(
+        'medicine_batch',
+        {'quantity': (latest.first['quantity'] as int) + quantity},
+        where: 'id = ?',
+        whereArgs: [latest.first['id']],
+      );
+      await _refreshMedicineStock(txn, medicineId);
+    } else {
+      await _addBatch(
+        txn,
+        medicineId: medicineId,
+        quantity: quantity,
+        expiryDate: medicine['expiry_date'] as String?,
+        purchasePrice: (medicine['avg_cost'] as num?)?.toDouble(),
+      );
+    }
+  }
+
+  /// تقرير الربح للفترة [start]..[end] (YYYY-MM-DD)، نفس _profit_summary في الخادم:
+  ///   revenue = صافي الفواتير غير المسترجعة.
+  ///   cost_of_goods_sold = Σ(unit_cost × الكمية) للأسطر ذات الكلفة المعروفة.
+  ///   gross_profit = Σ(إجمالي السطر − كلفته) − حصة تلك الأسطر من خصم فاتورتها.
+  ///   net_profit = gross_profit − المصاريف − كلفة الإتلاف (بلا "تصحيح إدخال").
+  /// الأسطر بلا unit_cost (مبيعات قديمة) تُستبعد وتُعدّ في items_without_cost.
+  Future<Map<String, num>> getProfitSummary(int pharmacyId, {required String start, required String end}) async {
+    final db = await database;
+    final invoices = await db.rawQuery('''
+      SELECT i.id, i.final_amount, i.total_amount, i.discount,
+             COALESCE(SUM(CASE WHEN ii.unit_cost IS NOT NULL THEN ii.total_price END), 0) AS costed_total,
+             COALESCE(SUM(CASE WHEN ii.unit_cost IS NOT NULL THEN ii.unit_cost * ii.quantity END), 0) AS cogs,
+             COALESCE(SUM(CASE WHEN ii.id IS NOT NULL AND ii.unit_cost IS NULL THEN 1 ELSE 0 END), 0) AS missing
+      FROM invoice i
+      LEFT JOIN invoice_item ii ON ii.invoice_id = i.id
+      WHERE i.pharmacy_id = ? AND ${originFilter('i.')} AND i.is_refunded = 0
+        AND date(i.created_at) >= date(?) AND date(i.created_at) <= date(?)
+      GROUP BY i.id
+    ''', [pharmacyId, start, end]);
+
+    double revenue = 0, cogs = 0, gross = 0;
+    int missing = 0;
+    for (final row in invoices) {
+      final costedTotal = (row['costed_total'] as num).toDouble();
+      final total = (row['total_amount'] as num).toDouble();
+      final discount = (row['discount'] as num).toDouble();
+      revenue += (row['final_amount'] as num).toDouble();
+      cogs += (row['cogs'] as num).toDouble();
+      missing += (row['missing'] as num).toInt();
+      gross += costedTotal - (discount > 0 && total > 0 ? discount * costedTotal / total : 0);
+    }
+    gross -= cogs;
+
+    final expenses = (await db.rawQuery('''
+      SELECT COALESCE(SUM(amount), 0) AS total FROM expense
+      WHERE pharmacy_id = ? AND ${originFilter()} AND date(expense_date) >= date(?) AND date(expense_date) <= date(?)
+    ''', [pharmacyId, start, end])).first['total'] as num;
+    final damageCost = (await db.rawQuery('''
+      SELECT COALESCE(SUM(total_cost), 0) AS total FROM damaged_medicine
+      WHERE pharmacy_id = ? AND ${originFilter()} AND total_cost IS NOT NULL AND reason != 'correction'
+        AND date(damaged_at) >= date(?) AND date(damaged_at) <= date(?)
+    ''', [pharmacyId, start, end])).first['total'] as num;
+
+    return {
+      'revenue': roundMoney(revenue),
+      'cost_of_goods_sold': roundMoney(cogs),
+      'gross_profit': roundMoney(gross),
+      'damage_cost': roundMoney(damageCost),
+      'net_profit': roundMoney(gross - expenses - damageCost),
+      'items_without_cost': missing,
+    };
+  }
+
+  /// دفعات الصنف المتوفرة (الأقرب انتهاءً أولاً) — لعرض تفاصيلها عند النقر.
+  Future<List<Map<String, dynamic>>> getMedicineBatches(int medicineId) async {
+    final db = await database;
+    return db.rawQuery('''
+      SELECT * FROM medicine_batch
+      WHERE medicine_id = ? AND quantity > 0
+      ORDER BY (expiry_date IS NULL OR expiry_date = '') ASC, expiry_date ASC, id ASC
+    ''', [medicineId]);
+  }
+
 // حذف دواء
   Future<int> deleteMedicine(int id) async {
     final db = await database;
@@ -1007,37 +1297,61 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         );
       }
 
+      // الدفعات تنتقل كما هي (FEFO من المصدر بصلاحيتها وسعر شرائها)، وavg_cost
+      // للهدف يُرجَّح بكلفة المصدر — نفس WarehouseViewSet.transfer.
+      final sourceAvg = (source['avg_cost'] as num?)?.toDouble();
+      final moved = await _deductFefo(txn, sourceMedicineId, quantity, sellableOnly: false);
+
+      int targetId;
       if (destMatch.isNotEmpty) {
-        await txn.rawUpdate(
-          'UPDATE medicine SET quantity = quantity + ? WHERE id = ?',
-          [quantity, destMatch.first['id']],
-        );
+        final target = destMatch.first;
+        targetId = target['id'] as int;
+        await _reconcileBatches(txn, target);
+        if (sourceAvg != null) {
+          await txn.update(
+            'medicine',
+            {
+              'avg_cost': weightedAverageCost(
+                oldQty: (target['quantity'] as num).toInt(),
+                oldAvg: (target['avg_cost'] as num?)?.toDouble(),
+                newQty: quantity,
+                newCost: sourceAvg,
+              ),
+            },
+            where: 'id = ?',
+            whereArgs: [targetId],
+          );
+        }
       } else {
-        await txn.insert('medicine', {
+        targetId = await txn.insert('medicine', {
           'pharmacy_id': sourcePharmacyId,
           'warehouse_id': toWarehouseId,
           'trade_name': source['trade_name'],
           'scientific_name': source['scientific_name'],
           'category': source['category'],
-          'quantity': quantity,
+          'quantity': 0,
           'buy_price': source['buy_price'],
           'sell_price': source['sell_price'],
+          'avg_cost': sourceAvg,
           'expiry_date': source['expiry_date'],
           'shelf_location': source['shelf_location'],
           'is_damaged': 0,
           'barcode': barcode.isNotEmpty ? barcode : null,
         });
       }
+      for (final part in moved) {
+        await txn.insert('medicine_batch', {
+          'medicine_id': targetId,
+          'quantity': part['quantity'],
+          'expiry_date': part['expiry_date'],
+          'purchase_price': part['purchase_price'],
+          'created_at': DateTime.now().toIso8601String(),
+        });
+      }
+      await _refreshMedicineStock(txn, targetId);
 
-      final remaining = currentQty - quantity;
-      if (remaining > 0 || await _isMedicineReferenced(txn, sourceMedicineId)) {
-        await txn.update(
-          'medicine',
-          {'quantity': remaining},
-          where: 'id = ?',
-          whereArgs: [sourceMedicineId],
-        );
-      } else {
+      final sourceAfter = await _medicineRow(txn, sourceMedicineId);
+      if ((sourceAfter['quantity'] as int) == 0 && !await _isMedicineReferenced(txn, sourceMedicineId)) {
         await txn.delete('medicine', where: 'id = ?', whereArgs: [sourceMedicineId]);
       }
 
@@ -1137,6 +1451,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   Future<void> _removeCachedMedicine(DatabaseExecutor txn, int medicineId) async {
     if (await _isMedicineReferenced(txn, medicineId)) {
       await txn.update('medicine', {'quantity': 0}, where: 'id = ?', whereArgs: [medicineId]);
+      await txn.delete('medicine_batch', where: 'medicine_id = ?', whereArgs: [medicineId]);
     } else {
       await txn.delete('medicine', where: 'id = ?', whereArgs: [medicineId]);
     }
@@ -1175,8 +1490,11 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
 
     // ⚠️ warehouse_id عمود NOT NULL منذ v7: كان غائباً هنا فكان
     // INSERT OR IGNORE يتجاهل كل صف بصمت ولا يُحفظ أي دواء أونلاين في الكاش.
-    await db.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
-    await db.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+    await db.transaction((txn) async {
+      await txn.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
+      await txn.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+      await _replaceCachedBatches(txn, row['id'] as int, serverData);
+    });
   }
 
   /// يستبدل كامل كاش المخزون المحلي بقائمة كاملة قادمة من السيرفر (بعد
@@ -1209,6 +1527,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
 
         await txn.insert('medicine', row, conflictAlgorithm: ConflictAlgorithm.ignore);
         await txn.update('medicine', row, where: 'id = ?', whereArgs: [row['id']]);
+        await _replaceCachedBatches(txn, row['id'] as int, item);
       }
 
       final cached = await txn.query(
@@ -1253,7 +1572,37 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       'is_damaged': item['is_damaged'] == true ? 1 : 0,
       'barcode': item['barcode'] as String?,
       'last_synced_at': syncedAt,
+      // للمالك فقط (الخادم يحذفه لغير المالك) — غيابه = غير معروف.
+      'avg_cost': _parseServerDecimalOrNull(item['avg_cost']),
     };
+  }
+
+  /// يستبدل دفعات صف كاش بنسخة الخادم (إن أرسلها؛ خادم أقدم بلا "batches"
+  /// لا يمس شيئاً ويعمل الصف بصلاحيته المجمّعة كما في السابق).
+  Future<void> _replaceCachedBatches(DatabaseExecutor txn, int medicineId, Map<String, dynamic> item) async {
+    final batches = item['batches'];
+    if (batches is! List) return;
+    await txn.delete('medicine_batch', where: 'medicine_id = ?', whereArgs: [medicineId]);
+    for (final raw in batches) {
+      if (raw is! Map) continue;
+      final quantity = (raw['quantity'] as num?)?.toInt() ?? 0;
+      if (quantity <= 0) continue;
+      await txn.insert('medicine_batch', {
+        'medicine_id': medicineId,
+        'quantity': quantity,
+        'expiry_date': raw['expiry_date'] as String?,
+        'purchase_price': _parseServerDecimalOrNull(raw['purchase_price']),
+        'created_at': (raw['created_at'] as String?) ?? DateTime.now().toIso8601String(),
+        'server_id': (raw['id'] as num?)?.toInt(),
+      });
+    }
+  }
+
+  double? _parseServerDecimalOrNull(dynamic value) {
+    if (value == null) return null;
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value);
+    return null;
   }
 
   /// أسعار DRF (DecimalField) تصل كنص "500.00" غالباً، أحياناً كرقم — تُقبل
@@ -1346,6 +1695,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
           'quantity': (rawItem['quantity'] as num).toInt(),
           'unit_price': _parseServerDecimal(rawItem['unit_price']),
           'total_price': _parseServerDecimal(rawItem['total_price']),
+          'unit_cost': _parseServerDecimalOrNull(rawItem['unit_cost']),
         });
       }
     }
@@ -1379,13 +1729,10 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   /// من أي شاشة جديدة.
   Future<Map<String, dynamic>?> getMedicineByBarcode(String barcode, {int? warehouseId}) async {
     final db = await database;
-    final result = await db.query(
-      'medicine',
-      where: warehouseId != null
-          ? 'barcode = ? AND warehouse_id = ? AND ${originFilter()}'
-          : 'barcode = ? AND ${originFilter()}',
-      whereArgs: warehouseId != null ? [barcode, warehouseId] : [barcode],
-    );
+    final result = await db.rawQuery('''
+      SELECT medicine.*, $sellableQuantitySql FROM medicine
+      WHERE barcode = ? ${warehouseId != null ? 'AND warehouse_id = ?' : ''} AND ${originFilter()}
+    ''', [barcode, if (warehouseId != null) warehouseId]);
     if (result.isEmpty) return null;
     return result.first;
   }
@@ -1440,15 +1787,30 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     final limitDate = DateTime(now.year, now.month, now.day).add(Duration(days: daysAhead));
     final limitDateOnly = limitDate.toIso8601String().split('T').first;
 
+    // 🆕 لكل دفعة على حدة: صف لكل دفعة منتهية/موشكة بكميتها وتاريخها هي.
+    // دواء بلا دفعات (كاش من خادم أقدم) يُقيَّم بصلاحيته المجمّعة كالسابق.
     return await db.rawQuery('''
-      SELECT * FROM medicine
-      WHERE pharmacy_id = ?
-        AND ${originFilter()}
-        AND quantity > 0
-        AND expiry_date IS NOT NULL AND expiry_date != ''
-        AND date(expiry_date) < date(?)
+      SELECT m.id, m.pharmacy_id, m.warehouse_id, m.trade_name, m.scientific_name, m.category,
+             b.quantity AS quantity, m.buy_price, m.sell_price, b.expiry_date AS expiry_date,
+             m.shelf_location, m.is_damaged, m.barcode
+      FROM medicine_batch b
+      JOIN medicine m ON m.id = b.medicine_id
+      WHERE m.pharmacy_id = ? AND ${originFilter('m.')}
+        AND b.quantity > 0
+        AND b.expiry_date IS NOT NULL AND b.expiry_date != ''
+        AND date(b.expiry_date) < date(?)
+      UNION ALL
+      SELECT m.id, m.pharmacy_id, m.warehouse_id, m.trade_name, m.scientific_name, m.category,
+             m.quantity, m.buy_price, m.sell_price, m.expiry_date,
+             m.shelf_location, m.is_damaged, m.barcode
+      FROM medicine m
+      WHERE m.pharmacy_id = ? AND ${originFilter('m.')}
+        AND m.quantity > 0
+        AND m.expiry_date IS NOT NULL AND m.expiry_date != ''
+        AND date(m.expiry_date) < date(?)
+        AND NOT EXISTS (SELECT 1 FROM medicine_batch x WHERE x.medicine_id = m.id)
       ORDER BY expiry_date ASC
-    ''', [pharmacyId, limitDateOnly]);
+    ''', [pharmacyId, limitDateOnly, pharmacyId, limitDateOnly]);
   }
 
   //====================================================
@@ -1573,6 +1935,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       'pharmacy_id': pharmacyId,
       'medicine_id': _serverId(serverData['medicine']),
       'quantity_damaged': serverData['quantity_damaged'] as int,
+      'total_cost': _parseServerDecimalOrNull(serverData['total_cost']),
       'reason': (serverData['reason'] as String?) ?? '',
       'notes': (serverData['notes'] as String?) ?? '',
       'damaged_at': serverData['damaged_at'] as String,
@@ -1597,6 +1960,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
           'pharmacy_id': pharmacyId,
           'medicine_id': _serverId(item['medicine']),
           'quantity_damaged': item['quantity_damaged'] as int,
+          'total_cost': _parseServerDecimalOrNull(item['total_cost']),
           'reason': (item['reason'] as String?) ?? '',
           'notes': (item['notes'] as String?) ?? '',
           'damaged_at': item['damaged_at'] as String,
@@ -1658,13 +2022,10 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         whereArgs: [invoiceId],
       );
 
-      // إعادة الكميات إلى المخزون
+      // إعادة الكميات إلى أبعد دفعة انتهاءً (avg_cost لا يتغير؛ الفاتورة
+      // المسترجعة تُستبعد من تقرير الربح بكلفتها الأصلية).
       for (final item in invoiceItems) {
-        await txn.rawUpdate('''
-          UPDATE medicine 
-          SET quantity = quantity + ? 
-          WHERE id = ?
-        ''', [item['quantity'], item['medicine_id']]);
+        await _restoreToLatestBatch(txn, item['medicine_id'] as int, item['quantity'] as int);
       }
 
       // تحديث حالة الفاتورة
@@ -1860,17 +2221,16 @@ Future<double> totalSalesToday(int pharmacyId) async {
         conflictAlgorithm: ConflictAlgorithm.abort,
       );
 
-      // 🟢 4. حفظ الأصناف المباعة وخصم كمياتها من المخزن
+      // 🟢 4. حفظ الأصناف المباعة وخصم كمياتها من الدفعات (FEFO، غير المنتهية فقط).
+      // unit_cost لقطة من avg_cost الحالي ولا تتغير بعدها أبداً.
       for (final item in items) {
+        final medicineId = item["medicine_id"] as int;
+        final medicine = await _medicineRow(txn, medicineId);
         item["invoice_id"] = invoiceId;
+        item["unit_cost"] = medicine['avg_cost'];
 
         await txn.insert("invoice_item", item);
-
-        await txn.rawUpdate('''
-          UPDATE medicine 
-          SET quantity = quantity - ? 
-          WHERE id = ?
-        ''', [item["quantity"], item["medicine_id"]]);
+        await _deductFefo(txn, medicineId, item["quantity"] as int, sellableOnly: true);
       }
     });
   }
@@ -1879,26 +2239,45 @@ Future<double> totalSalesToday(int pharmacyId) async {
   // عمليات إضافية خاصة بالمخزن والإتلاف (تكامل الشاشات)
   //====================================================
 
-  /// 1. تزويد شحنة لدواء موجود (زيادة الكمية + تحديث الاختياري لتاريخ الصلاحية)
+  /// 1. تزويد شحنة (معاملة واحدة، نفس stock.supply في الخادم):
+  /// avg_cost مرجّح، سعر بيع موحّد جديد لكل المخزون، ودفعة صلاحية جديدة.
+  /// [purchasePrice] null = يُستخدم avg_cost الحالي (ويُرفض إن كان مجهولاً).
   Future<void> supplyMedicine({
     required int medicineId,
     required int addedQuantity,
     String? newExpiryDate,
+    double? purchasePrice,
+    required double salePrice,
   }) async {
+    if (addedQuantity <= 0) throw StateError('الكمية المضافة يجب أن تكون أكبر من صفر.');
+    if (salePrice <= 0) throw StateError('سعر البيع يجب أن يكون أكبر من صفر.');
+    if (purchasePrice != null && purchasePrice <= 0) throw StateError('سعر الشراء يجب أن يكون أكبر من صفر.');
     final db = await database;
-    if (newExpiryDate != null && newExpiryDate.isNotEmpty) {
-      await db.rawUpdate('''
-        UPDATE medicine 
-        SET quantity = quantity + ?, expiry_date = ? 
-        WHERE id = ?
-      ''', [addedQuantity, newExpiryDate, medicineId]);
-    } else {
-      await db.rawUpdate('''
-        UPDATE medicine 
-        SET quantity = quantity + ? 
-        WHERE id = ?
-      ''', [addedQuantity, medicineId]);
-    }
+    await db.transaction((txn) async {
+      final medicine = await _medicineRow(txn, medicineId);
+      await _reconcileBatches(txn, medicine);
+      final oldAvg = (medicine['avg_cost'] as num?)?.toDouble();
+      final cost = purchasePrice ?? oldAvg;
+      if (cost == null) {
+        throw StateError('سعر الشراء مطلوب لأن كلفة هذا الصنف غير معروفة بعد.');
+      }
+      await txn.update(
+        'medicine',
+        {
+          'avg_cost': weightedAverageCost(
+            oldQty: (medicine['quantity'] as num).toInt(),
+            oldAvg: oldAvg,
+            newQty: addedQuantity,
+            newCost: cost,
+          ),
+          'buy_price': roundMoney(cost),
+          'sell_price': roundMoney(salePrice),
+        },
+        where: 'id = ?',
+        whereArgs: [medicineId],
+      );
+      await _addBatch(txn, medicineId: medicineId, quantity: addedQuantity, expiryDate: newExpiryDate, purchasePrice: cost);
+    });
   }
 
   /// 2. عملية إتلاف دواء متكاملة (خصم من المخزن + إضافة سجل في جدول التوالف في حركة واحدة)
@@ -1912,18 +2291,16 @@ Future<double> totalSalesToday(int pharmacyId) async {
     final db = await database;
 
     await db.transaction((txn) async {
-      // أ) خصم الكمية التالفة من المخزن الرئيسي
-      await txn.rawUpdate('''
-        UPDATE medicine 
-        SET quantity = quantity - ? 
-        WHERE id = ?
-      ''', [quantityToDamage, medicineId]);
+      // أ) خصم الكمية التالفة من الدفعات بترتيب FEFO (المنتهية أولاً بطبيعتها)
+      final avgCost = ((await _medicineRow(txn, medicineId))['avg_cost'] as num?)?.toDouble();
+      await _deductFefo(txn, medicineId, quantityToDamage, sellableOnly: false);
 
-      // ب) إضافة السجل في جدول التوالف مع التاريخ الحالي
+      // ب) إضافة السجل في جدول التوالف مع التاريخ الحالي وكلفته وقت الإتلاف
       await txn.insert("damaged_medicine", {
         "pharmacy_id": pharmacyId,
         "medicine_id": medicineId,
         "quantity_damaged": quantityToDamage,
+        "total_cost": avgCost == null ? null : roundMoney(quantityToDamage * avgCost),
         "reason": reason,
         "notes": notes ?? '',
         "damaged_at": DateTime.now().toIso8601String().split('T').first,
@@ -2392,8 +2769,10 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
 
   // 2. المخزون الكامل (كل صف بمرجع مخزنه المحلي)
   final medicines = await db.query('medicine', where: 'pharmacy_id = ? AND ${localOnly()}', whereArgs: [pharmacyId]);
-  final medicinesPayload = medicines
-      .map((m) => {
+  final medicinesPayload = <Map<String, dynamic>>[];
+  for (final m in medicines) {
+    final batches = await getMedicineBatches(m['id'] as int);
+    medicinesPayload.add({
             'local_id': m['id'],
             'local_warehouse_id': m['warehouse_id'],
             'trade_name': m['trade_name'],
@@ -2406,8 +2785,16 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
             'shelf_location': m['shelf_location'],
             'is_damaged': (m['is_damaged'] as int?) == 1,
             'barcode': m['barcode'],
-          })
-      .toList();
+            'avg_cost': m['avg_cost'],
+            'batches': batches
+                .map((b) => {
+                      'quantity': b['quantity'],
+                      'expiry_date': b['expiry_date'],
+                      'purchase_price': b['purchase_price'],
+                    })
+                .toList(),
+          });
+  }
 
   // 3. فواتير الشراء الكاملة + دفعاتها + مرتجعاتها (متداخلة داخل كل فاتورة)
   final purchaseInvoices = await db.query('purchase_invoice', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
@@ -2469,6 +2856,7 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
                 'quantity': it['quantity'],
                 'unit_price': it['unit_price'],
                 'total_price': it['total_price'],
+                'unit_cost': it['unit_cost'],
               })
           .toList(),
     });
@@ -2480,6 +2868,7 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
       .map((d) => {
             'local_medicine_id': d['medicine_id'],
             'quantity_damaged': d['quantity_damaged'],
+            'total_cost': d['total_cost'],
             'reason': d['reason'],
             'notes': d['notes'],
             'damaged_at': d['damaged_at'],

@@ -28,6 +28,7 @@ from .models import (
     Invoice,
     InvoiceItem,
     Medicine,
+    MedicineBatch,
     PurchaseInvoice,
     PurchaseInvoiceReturn,
     StockTransfer,
@@ -35,6 +36,7 @@ from .models import (
     SupplierPayment,
     Warehouse,
 )
+from . import stock
 from .offline_import import (
     error_message,
     has_existing_online_data,
@@ -51,6 +53,7 @@ from .serializers import (
     StockTransferInputSerializer,
     StockTransferSerializer,
     SupplierSerializer,
+    SupplyInputSerializer,
     SupplierSummarySerializer,
     WarehouseSerializer,
 )
@@ -74,7 +77,7 @@ class MedicineViewSet(viewsets.ModelViewSet):
         membership = getattr(self.request.user, "pharmacymembership", None)
         if membership is None:
             return Medicine.objects.none()
-        qs = Medicine.objects.filter(pharmacy=membership.pharmacy)
+        qs = Medicine.objects.filter(pharmacy=membership.pharmacy).prefetch_related("batches")
         warehouse_id = self.request.query_params.get("warehouse")
         if warehouse_id:
             if not str(warehouse_id).isdigit():
@@ -85,7 +88,37 @@ class MedicineViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         membership = self.request.user.pharmacymembership
         warehouse = serializer.validated_data.get("warehouse") or Warehouse.main_for(membership.pharmacy)
-        serializer.save(pharmacy=membership.pharmacy, warehouse=warehouse)
+        with transaction.atomic():
+            medicine = serializer.save(pharmacy=membership.pharmacy, warehouse=warehouse)
+            stock.create_initial_batch(medicine)
+
+    @action(detail=True, methods=["post"])
+    def supply(self, request, pk=None):
+        """
+        POST /api/medicines/<id>/supply/
+        body: {"quantity": 20, "expiry_date": "2027-01-31", "purchase_price": 750, "sale_price": 1250}
+
+        توريد ذرّي (يحل محل قراءة-ثم-كتابة القديمة في MedicineRepository):
+        متوسط كلفة مرجّح + سعر بيع موحّد جديد + دفعة صلاحية جديدة، على صف
+        مقفول. للمالك فقط (get_permissions: كل ما عدا list/retrieve).
+        """
+        data = SupplyInputSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        data = data.validated_data
+        with transaction.atomic():
+            try:
+                medicine = self.get_queryset().select_for_update().get(pk=pk)
+            except Medicine.DoesNotExist:
+                raise NotFound("الدواء غير موجود.")
+            stock.supply(
+                medicine,
+                quantity=data["quantity"],
+                expiry_date=data.get("expiry_date"),
+                purchase_price=data.get("purchase_price"),
+                sale_price=data["sale_price"],
+            )
+        medicine = self.get_queryset().get(pk=medicine.pk)
+        return Response(self.get_serializer(medicine).data)
 
 
 def _is_referenced(medicine):
@@ -212,8 +245,14 @@ class WarehouseViewSet(viewsets.ModelViewSet):
                     .first()
                 )
 
+            # الدفعات تنتقل كما هي (FEFO من المصدر، بصلاحيتها وسعر شرائها).
+            source_avg_cost = source.avg_cost
+            moved = stock.deduct_fefo(source, quantity, sellable_only=False)
             if target is not None:
-                Medicine.objects.filter(pk=target.pk).update(quantity=F("quantity") + quantity)
+                stock.reconcile(target)
+                if source_avg_cost is not None:
+                    target.avg_cost = stock.weighted_avg_cost(target.quantity, target.avg_cost, quantity, source_avg_cost)
+                    target.save(update_fields=["avg_cost", "updated_at"])
             else:
                 target = Medicine.objects.create(
                     pharmacy=pharmacy,
@@ -221,21 +260,28 @@ class WarehouseViewSet(viewsets.ModelViewSet):
                     trade_name=source.trade_name,
                     scientific_name=source.scientific_name,
                     category=source.category,
-                    quantity=quantity,
+                    quantity=0,
                     buy_price=source.buy_price,
                     sell_price=source.sell_price,
+                    avg_cost=source_avg_cost,
                     expiry_date=source.expiry_date,
                     shelf_location=source.shelf_location,
                     is_damaged=False,
                     barcode=barcode,
                 )
+            for expiry_date, purchase_price, part in moved:
+                MedicineBatch.objects.create(
+                    pharmacy=pharmacy,
+                    medicine=target,
+                    quantity=part,
+                    expiry_date=expiry_date,
+                    purchase_price=purchase_price,
+                )
+            stock.refresh_stock(target)
 
             source_warehouse = source.warehouse
-            remaining = source.quantity - quantity
             source_deleted = False
-            if remaining > 0 or _is_referenced(source):
-                Medicine.objects.filter(pk=source.pk).update(quantity=remaining)
-            else:
+            if source.quantity == 0 and not _is_referenced(source):
                 source.delete()
                 source_deleted = True
 
@@ -413,6 +459,8 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
                         "quantity": item["quantity"],
                         "unit_price": unit_price,
                         "total_price": total_price,
+                        # لقطة الكلفة من الخادم وقت البيع — لا تُقبل من العميل أبداً.
+                        "unit_cost": medicine.avg_cost,
                     }
                 )
 
@@ -438,13 +486,16 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
                     quantity=prepared["quantity"],
                     unit_price=prepared["unit_price"],
                     total_price=prepared["total_price"],
+                    unit_cost=prepared["unit_cost"],
                 )
-                Medicine.objects.filter(pk=prepared["medicine"].pk).update(
-                    quantity=F("quantity") - prepared["quantity"]
-                )
+                # FEFO من الدفعات غير المنتهية فقط (لا يُباع منتهي الصلاحية).
+                stock.deduct_fefo(prepared["medicine"], prepared["quantity"], sellable_only=True)
 
         invoice.refresh_from_db()
-        return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+        return Response(
+            InvoiceSerializer(invoice, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["post"])
     def refund(self, request, pk=None):
@@ -470,16 +521,18 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
             if invoice.is_refunded:
                 raise ValidationError("هذه الفاتورة مسترجعة بالفعل.")
 
-            for item in invoice.items.select_related("medicine"):
-                Medicine.objects.filter(pk=item.medicine_id).update(
-                    quantity=F("quantity") + item.quantity
-                )
+            # الكمية تعود لأبعد دفعة انتهاءً؛ avg_cost لا يتغير، والربح يُعكس
+            # تلقائياً لأن الفاتورة المسترجعة تُستبعد من التقرير بكلفتها الأصلية.
+            medicine_ids = [item.medicine_id for item in invoice.items.all()]
+            locked = {m.pk: m for m in Medicine.objects.select_for_update().filter(pk__in=medicine_ids)}
+            for item in invoice.items.all():
+                stock.restore_to_latest(locked[item.medicine_id], item.quantity)
 
             invoice.is_refunded = True
             invoice.save(update_fields=["is_refunded", "updated_at"])
 
         invoice.refresh_from_db()
-        return Response(InvoiceSerializer(invoice).data)
+        return Response(InvoiceSerializer(invoice, context=self.get_serializer_context()).data)
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
@@ -824,12 +877,17 @@ class DamagedMedicineViewSet(
                     f"الكمية المطلوب إتلافها ({quantity}) أكبر من المتوفر فعلياً ({medicine.quantity})."
                 )
 
-            Medicine.objects.filter(pk=medicine.pk).update(quantity=F("quantity") - quantity)
+            # FEFO من كل الدفعات (المنتهية أولاً بطبيعتها)، والكلفة لقطة من avg_cost.
+            stock.deduct_fefo(medicine, quantity, sellable_only=False)
+            total_cost = (
+                stock.to_money(Decimal(quantity) * medicine.avg_cost) if medicine.avg_cost is not None else None
+            )
 
             record = DamagedMedicine.objects.create(
                 pharmacy=membership.pharmacy,
                 medicine=medicine,
                 quantity_damaged=quantity,
+                total_cost=total_cost,
                 reason=data.get("reason", ""),
                 notes=data.get("notes", ""),
             )
@@ -839,6 +897,58 @@ class DamagedMedicineViewSet(
         return Response(
             self.get_serializer(record).data, status=status.HTTP_201_CREATED
         )
+
+
+def _profit_summary(pharmacy, start, end, total_expenses):
+    """
+    تقرير الربح (للمالك فقط عبر ReportsViewSet):
+      الإيراد = صافي الفواتير غير المسترجعة في الفترة.
+      كلفة البضاعة = Σ(unit_cost × الكمية) للأسطر ذات الكلفة المعروفة.
+      الربح الإجمالي = Σ(إجمالي السطر − كلفته) − حصة تلك الأسطر من خصم فاتورتها.
+      صافي الربح = الربح الإجمالي − المصاريف − كلفة الإتلاف في الفترة (بلا "تصحيح إدخال").
+    الأسطر بلا unit_cost (مبيعات قديمة) تُستبعد من الربح وتُعدّ في items_without_cost.
+    الفواتير المسترجعة مستبعدة كلياً، فيُعكس ربحها بكلفتها الأصلية.
+    """
+    invoices = Invoice.objects.filter(
+        pharmacy=pharmacy,
+        is_refunded=False,
+        created_at__date__gte=start,
+        created_at__date__lte=end,
+    ).prefetch_related("items")
+
+    revenue = cogs = gross = Decimal("0")
+    items_without_cost = 0
+    for invoice in invoices:
+        revenue += invoice.final_amount
+        costed_total = Decimal("0")
+        for item in invoice.items.all():
+            if item.unit_cost is None:
+                items_without_cost += 1
+                continue
+            costed_total += item.total_price
+            cogs += item.unit_cost * item.quantity
+        discount_share = (
+            invoice.discount * costed_total / invoice.total_amount
+            if invoice.discount and invoice.total_amount > 0
+            else Decimal("0")
+        )
+        gross += costed_total - discount_share
+    gross -= cogs
+
+    # "تصحيح إدخال" ليس خسارة فعلية (نفس استبعاده في total_damage_losses).
+    damage_cost = DamagedMedicine.objects.filter(
+        pharmacy=pharmacy, damaged_at__gte=start, damaged_at__lte=end, total_cost__isnull=False
+    ).exclude(reason="correction").aggregate(total=Coalesce(Sum("total_cost"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)))["total"]
+
+    net = gross - total_expenses - damage_cost
+    return {
+        "revenue": stock.to_money(revenue),
+        "cost_of_goods_sold": stock.to_money(cogs),
+        "gross_profit": stock.to_money(gross),
+        "damage_cost": stock.to_money(damage_cost),
+        "net_profit": stock.to_money(net),
+        "items_without_cost": items_without_cost,
+    }
 
 
 class ReportsViewSet(viewsets.ViewSet):
@@ -928,16 +1038,23 @@ class ReportsViewSet(viewsets.ViewSet):
 
         # خسائر الأدوية المنتهية: نفس معيار الشاشة الحالية بالضبط — منتهية
         # فعلياً (قبل اليوم الحالي)، لا مجرد الوصول لتاريخ الانتهاء نفسه.
-        expired_losses = Medicine.objects.filter(
+        # لكل دفعة على حدة (صلاحية الدفعة، لا صلاحية الدواء المجمّعة).
+        expired_losses = MedicineBatch.objects.filter(
             pharmacy=pharmacy,
-            is_damaged=False,
+            medicine__is_damaged=False,
             quantity__gt=0,
             expiry_date__gte=start,
             expiry_date__lte=end,
             expiry_date__lt=today,
         ).aggregate(
             total=Coalesce(
-                Sum(F("quantity") * F("buy_price")), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)
+                Sum(
+                    F("quantity")
+                    * Coalesce("purchase_price", "medicine__avg_cost", "medicine__buy_price",
+                               output_field=DecimalField(max_digits=14, decimal_places=4))
+                ),
+                Value(0),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
             )
         )["total"]
 
@@ -994,10 +1111,13 @@ class ReportsViewSet(viewsets.ViewSet):
             )
         )
 
+        profit = _profit_summary(pharmacy, start, end, total_expenses)
+
         return Response(
             {
                 "start": start.isoformat(),
                 "end": end.isoformat(),
+                **profit,
                 "total_sales": sales_summary["total_cash_in_drawer"],
                 "total_invoices_count": sales_summary["total_count"],
                 "total_discounts_given": sales_summary["total_discounts"],
