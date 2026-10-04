@@ -302,7 +302,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                   LayoutBuilder(builder: (context, constraints) {
                     final width = constraints.maxWidth > 700 ? (constraints.maxWidth - 16) / 2 : constraints.maxWidth;
                     return Wrap(spacing: 16, runSpacing: 16, children: [
-                      _summaryCard('مصروفات اليوم', '${_moneyFormat.format(_total)} د.ع', Icons.payments_outlined, const Color(0xFFE53E3E), width),
+                      _summaryCard('إجمالي مصروفات الفترة', '${_moneyFormat.format(_total)} د.ع', Icons.payments_outlined, const Color(0xFFE53E3E), width),
                       _summaryCard('عدد المصروفات', '${_expenses.length} عملية', Icons.receipt_long_outlined, const Color(0xFF1ABC9C), width),
                     ]);
                   }),

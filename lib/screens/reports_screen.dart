@@ -983,17 +983,17 @@ Future<void> _loadReportDataOffline() async {
           ],
           LayoutBuilder(
             builder: (context, constraints) {
-              double width = (constraints.maxWidth - 60) / 5;
-              if (constraints.maxWidth < 900) width = (constraints.maxWidth - 15) / 2;
+              // ثلاث بطاقات: صف واحد على الشاشات العريضة، وتحت بعضها بعرض كامل على
+              // الضيقة (نفس حد 800 في القسم العلوي) بدل بطاقة يتيمة في صف ثانٍ.
+              // الإيراد وكلفة الإتلاف معروضان أعلاه فلا يتكرران هنا.
+              final width = constraints.maxWidth < 800 ? constraints.maxWidth : (constraints.maxWidth - 30) / 3;
               final net = profit['net_profit'] ?? 0;
               return Wrap(
                 spacing: 15,
                 runSpacing: 15,
                 children: [
-                  _buildKpiCard("الإيراد", AppFormatter.iqdWithCurrency(profit['revenue']), Icons.payments, const Color(0xFF3182CE), width),
                   _buildKpiCard("كلفة البضاعة المباعة", AppFormatter.iqdWithCurrency(profit['cost_of_goods_sold']), Icons.inventory_2, const Color(0xFFDD6B20), width),
                   _buildKpiCard("الربح الإجمالي", AppFormatter.iqdWithCurrency(profit['gross_profit']), Icons.trending_up, const Color(0xFF1ABC9C), width),
-                  _buildKpiCard("كلفة الإتلاف", AppFormatter.iqdWithCurrency(profit['damage_cost']), Icons.delete_forever, const Color(0xFFE53E3E), width),
                   _buildKpiCard("صافي الربح\n(بعد المصاريف والإتلاف)", AppFormatter.iqdWithCurrency(net), Icons.calculate,
                       net < 0 ? const Color(0xFFE53E3E) : const Color(0xFF38A169), width),
                 ],

@@ -356,11 +356,9 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     serializer_class = InvoiceSerializer
-    # القراءة والبيع (checkout) للمالك والموظف، أما الإرجاع (refund) فللمالك فقط.
-    def get_permissions(self):
-        if self.action == "refund":
-            return [IsActiveOnlineOwner()]
-        return [IsActiveOnlineMember()]
+    # القراءة والبيع (checkout) والإرجاع (refund) للمالك والموظف — نفس سلوك
+    # الوضع الأوفلاين وشاشتي نقطة البيع وسجل المبيعات.
+    permission_classes = [IsActiveOnlineMember]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)

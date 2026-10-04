@@ -406,7 +406,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  // قسم الأدوية منتهية الصلاحية أو الموشكة على الانتهاء (خلال 30 يوماً)
+  // قسم الأدوية منتهية الصلاحية أو الموشكة على الانتهاء (خلال 90 يوماً)
   Widget _buildExpiredAlertSection() {
     return AlertBox(
       title: "تحذيرات الصلاحية",
@@ -415,7 +415,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: _expiredMedicines.isEmpty
           ? _buildEmptyState(
               icon: Icons.verified_rounded,
-              message: 'لا توجد أدوية منتهية أو موشكة على الانتهاء خلال 30 يوماً',
+              message: 'لا توجد أدوية منتهية أو موشكة على الانتهاء خلال 90 يوماً',
               color: const Color(0xFF27AE60),
             )
           : CustomTable(

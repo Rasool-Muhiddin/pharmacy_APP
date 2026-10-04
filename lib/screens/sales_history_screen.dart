@@ -330,7 +330,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                     ),
 
                     // زر استرجاع الفاتورة
-                    if (!isRefunded && widget.isOwner) ...[
+                    if (!isRefunded) ...[
                       const SizedBox(height: 20),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.end,

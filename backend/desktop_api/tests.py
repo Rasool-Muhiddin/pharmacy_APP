@@ -62,13 +62,14 @@ class AccessControlTests(TestCase):
     def test_login_without_cloudflare_header(self):
         self.assertTrue(self.login("owner"))
 
-    def test_staff_can_read_and_sell_but_not_manage(self):
+    def test_staff_can_read_sell_and_refund_but_not_manage(self):
         self.assertEqual(self.get("/api/medicines/", self.staff_token).status_code, 200)
         self.assertEqual(self.get("/api/invoices/", self.staff_token).status_code, 200)
         checkout = self.post("/api/invoices/checkout/", {"items": [{"medicine_id": self.medicine.id, "quantity": 1}]}, self.staff_token)
         self.assertEqual(checkout.status_code, 201, checkout.content)
         invoice_id = checkout.json()["id"]
-        self.assertEqual(self.post("/api/invoices/%d/refund/" % invoice_id, {}, self.staff_token).status_code, 403)
+        refund = self.post("/api/invoices/%d/refund/" % invoice_id, {}, self.staff_token)
+        self.assertEqual(refund.status_code, 200, refund.content)
         self.assertEqual(self.post("/api/medicines/", {"trade_name": "B"}, self.staff_token).status_code, 403)
         self.assertEqual(self.client.delete(f"/api/medicines/{self.medicine.id}/", HTTP_AUTHORIZATION=f"Token {self.staff_token}").status_code, 403)
         for path in ("/api/reports/summary/", "/api/expenses/", "/api/suppliers/", "/api/damaged-medicines/", "/api/migration/status/"):
