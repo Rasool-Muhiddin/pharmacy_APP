@@ -104,7 +104,6 @@ double _num(dynamic v) => v is num ? v.toDouble() : double.tryParse(v?.toString(
 
 class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
   late final List<_ReturnLine> _lines = widget.items.map(_ReturnLine.new).toList();
-  final _notes = TextEditingController();
   DateTime _date = DateTime.now();
   bool _saving = false;
   String? _error;
@@ -114,11 +113,10 @@ class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
     for (final line in _lines) {
       line.dispose();
     }
-    _notes.dispose();
     super.dispose();
   }
 
-  bool _isDirty() => _lines.any((l) => l.selected) || _notes.text.trim().isNotEmpty;
+  bool _isDirty() => _lines.any((l) => l.selected);
 
   double get _totalCredit => _lines.fold(0.0, (s, l) => s + l.credit);
 
@@ -158,7 +156,6 @@ class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
               'unit_price': line.isFree ? 0 : line.enteredPrice,
             },
         ],
-        notes: _notes.text.trim(),
         returnDate: _date,
       );
       if (mounted) Navigator.of(context).pop(true); // pop (لا maybePop) بعد الحفظ
@@ -384,14 +381,6 @@ class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
             runSpacing: 10,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              SizedBox(
-                width: 320,
-                child: TextField(
-                  controller: _notes,
-                  onChanged: (_) => setState(() {}),
-                  decoration: _decoration('ملاحظات (اختياري)'),
-                ),
-              ),
               SizedBox(
                 width: 170,
                 child: InkWell(

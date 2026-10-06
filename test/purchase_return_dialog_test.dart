@@ -123,7 +123,7 @@ void main() {
     expect(result, isNull);
 
     await tester.enterText(field('الكمية المسترجعة').first, '4');
-    await tester.enterText(field('ملاحظات (اختياري)'), 'كرتون تالف');
+    expect(field('ملاحظات (اختياري)'), findsNothing); // الملاحظات أُزيلت من الواجهة
     await tester.tap(find.text('حفظ الاسترجاع'));
     await settleIo(tester);
     expect(result, isTrue);
@@ -132,7 +132,7 @@ void main() {
       final db = await helper.database;
       final ret = (await db.query('purchase_invoice_return')).single;
       // 4 × 900 = 3600: 1000 تسدّد المتبقي، والفائض 2600 رصيد لصالح الصيدلية.
-      expect([ret['amount_returned'], ret['excess_credit'], ret['notes']], [3600, 2600, 'كرتون تالف']);
+      expect([ret['amount_returned'], ret['excess_credit']], [3600, 2600]);
       expect((await db.query('purchase_invoice_return_item')).map((r) => [r['trade_name'], r['quantity'], r['credit_amount']]),
           [['Panadol', 4, 3600], ['Gift', 3, 0]]);
       final supplier = (await helper.getSuppliersWithFinancials(1)).single;
