@@ -640,14 +640,11 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
     return withBalance;
   }
 
-  /// نص عمود "البيان" لكل حركة. يعتمد على حقل الملاحظات (notes) عند توفره
-  /// لتمييز الحركات المتشابهة (مثل أكثر من دفعة على نفس الفاتورة)، بدلاً
-  /// من عرض نفس الجملة الثابتة لكل الدفعات/الاسترجاعات (وهو سبب ظهور نص
-  /// مكرر بالضبط في التصميم القديم).
+  /// نص عمود "البيان" لكل حركة. الملاحظات أُزيلت من الواجهة (تبقى في القاعدة/API
+  /// فقط)، فالبيان من نوع الحركة ومرجعها.
   String _statementDescription(Map<String, dynamic> row) {
     final type = row['transaction_type']?.toString() ?? '';
     final reference = row['reference']?.toString().trim() ?? '';
-    final notes = row['notes']?.toString().trim() ?? '';
 
     switch (type) {
       case 'invoice':
@@ -656,16 +653,16 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
         }
         return 'فاتورة رقم $reference';
       case 'payment':
-        return notes.isNotEmpty ? notes : 'دفعة نقدية للمذخر';
+        return 'دفعة نقدية للمذخر';
       case 'return':
         final items = row['items'] is List ? (row['items'] as List).length : 0;
         final base = reference.isNotEmpty ? reference : 'استرجاع بضاعة للمذخر';
         final withItems = items > 0 ? '$base ($items صنف)' : base;
-        return notes.isNotEmpty ? '$withItems — $notes' : withItems;
+        return withItems;
       case 'credit_applied':
         return '$reference: ${_formatAmount(_number(row['amount']))} د.ع';
       case 'refund':
-        return notes.isNotEmpty ? 'استلام أموال من المذخر — $notes' : 'استلام أموال من المذخر';
+        return 'استلام أموال من المذخر';
       default:
         return reference.isEmpty ? '-' : reference;
     }
@@ -1213,7 +1210,6 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
     Map<String, dynamic> invoice,
   ) async {
     final amountController = TextEditingController();
-    final notesController = TextEditingController();
     final invoiceId = invoice['id'] as int;
     final remaining = _number(invoice['remaining_amount']);
 
@@ -1241,16 +1237,6 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
               ),
               keyboardType: const TextInputType.numberWithOptions(decimal: true),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: notesController,
-              decoration: InputDecoration(
-                labelText: 'ملاحظات (اختياري)',
-                labelStyle: const TextStyle(color: textSecondary),
-                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: borderCol), borderRadius: BorderRadius.circular(10)),
-                focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: primary, width: 2), borderRadius: BorderRadius.circular(10)),
-              ),
-            ),
           ],
         ),
         actions: [
@@ -1272,7 +1258,6 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
                     supplierId: supplierId,
                     purchaseInvoiceId: invoiceId,
                     amount: amount,
-                    notes: notesController.text,
                   );
 
                   if (ctx.mounted) Navigator.pop(ctx, true);
@@ -1828,7 +1813,6 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
     double availableCredit,
   ) async {
     final amountController = TextEditingController(text: availableCredit.toStringAsFixed(availableCredit % 1 == 0 ? 0 : 2));
-    final notesController = TextEditingController();
     var date = DateTime.now();
     String? error;
     var saving = false;
@@ -1872,11 +1856,6 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
                       child: Text(_formatDate(date.toIso8601String())),
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: notesController,
-                    decoration: const InputDecoration(labelText: 'ملاحظات (اختياري)', border: OutlineInputBorder()),
-                  ),
                   if (error != null) ...[
                     const SizedBox(height: 10),
                     Text(error!, style: const TextStyle(color: danger, fontWeight: FontWeight.w600)),
@@ -1910,7 +1889,6 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
                             isOnlineMode: widget.isOnlineMode,
                             supplierId: supplierId,
                             amount: amount,
-                            notes: notesController.text,
                             receivedDate: date,
                           );
                           if (ctx.mounted) Navigator.pop(ctx);

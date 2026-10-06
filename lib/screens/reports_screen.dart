@@ -1,3 +1,4 @@
+import '../models/medicine_categories.dart';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
@@ -1189,7 +1190,7 @@ Future<void> _loadReportDataOffline() async {
                           ),
                           Padding(
                             padding: const EdgeInsets.all(10),
-                            child: Text((med['category'] ?? "-").toString(), style: const TextStyle(color: Color(0xFF4A5568), fontSize: 12)),
+                            child: Text(medicineCategoryLabel(med['category']), style: const TextStyle(color: Color(0xFF4A5568), fontSize: 12)),
                           ),
                         ],
                       );

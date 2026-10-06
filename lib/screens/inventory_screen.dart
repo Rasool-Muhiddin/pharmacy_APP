@@ -6,6 +6,7 @@ import '../repository/medicine_repository.dart';
 import '../repository/warehouse_repository.dart';
 import '../services/medicine_api_service.dart';
 import '../services/warehouse_api_service.dart';
+import '../models/medicine_categories.dart';
 import '../models/purchase_list.dart';
 import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
@@ -52,20 +53,8 @@ class _InventoryScreenState extends State<InventoryScreen> {
     return main['id'] as int;
   }
 
-  final Map<String, String> _categories = {
-    'tablet': 'حبوب / كبسول',
-    'injection': 'حقن / فيال / أمبول',
-    'syrup': 'شراب / معلق',
-    'cream_ointment_gel': 'مرهم / كريم / جل',
-    'drops_eye_ear': 'قطرات عين / أذن',
-    'suppository': 'تحاميل / لبوس',
-    'drops_oral': 'قطرات فموية',
-    'powder_sachet': 'بودرة / فوار',
-    'inhaler_nebulizer': 'استنشاق / نيبولايزر',
-    'drops_nasal': 'قطرات / بخاخ الأنف',
-    'oral_care': 'مستحضرات فموية / عناية بالفم',
-    'topical_solution': 'محاليل / غسولات موضعية',
-  };
+  // الأشكال الدوائية من المصدر المشترك (المخزون + التقارير).
+  final Map<String, String> _categories = medicineCategories;
 
   final Map<String, String> _damageReasons = {
     'broken': 'كسر وضرر',
@@ -687,8 +676,9 @@ class _InventoryScreenState extends State<InventoryScreen> {
     final buyPriceCtrl = TextEditingController(text: med['buy_price'].toString());
     final sellPriceCtrl = TextEditingController(text: med['sell_price'].toString());
     final expiryCtrl = TextEditingController(text: med['expiry_date'] ?? '');
+    // موقع الرف مخفي من الواجهة؛ قيمته الحالية تُرسل كما هي عند الحفظ.
     final shelfCtrl = TextEditingController(text: med['shelf_location'] ?? '');
-    String selectedCategory = med['category'] ?? '';
+    String selectedCategory = (med['category'] ?? '').toString();
 
     showDialog(
       context: context,
@@ -724,14 +714,17 @@ class _InventoryScreenState extends State<InventoryScreen> {
                       children: [
                         Expanded(
                           child: DropdownButtonFormField<String>(
-                            initialValue: _categories.containsKey(selectedCategory) ? selectedCategory : _categories.keys.first,
+                            initialValue: selectedCategory.isEmpty ? _categories.keys.first : selectedCategory,
                             decoration: const InputDecoration(labelText: 'الشكل الدوائي'),
-                            items: _categories.entries.map((e) => DropdownMenuItem<String>(value: e.key, child: Text(e.value))).toList(),
+                            items: [
+                              ..._categories.entries.map((e) => DropdownMenuItem<String>(value: e.key, child: Text(e.value))),
+                              // قيمة قديمة غير موجودة بالقائمة تبقى كما هي (لا تُستبدل بصمت عند الحفظ).
+                              if (selectedCategory.isNotEmpty && !_categories.containsKey(selectedCategory))
+                                DropdownMenuItem<String>(value: selectedCategory, child: Text(selectedCategory)),
+                            ],
                             onChanged: (val) => setDialogState(() => selectedCategory = val!),
                           ),
                         ),
-                        const SizedBox(width: 10),
-                        Expanded(child: TextField(controller: shelfCtrl, decoration: const InputDecoration(labelText: 'موقع الرف'))),
                       ],
                     ),
 
@@ -1096,14 +1089,13 @@ class _InventoryScreenState extends State<InventoryScreen> {
                                         const DataColumn(label: Text('سعر البيع', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         const DataColumn(label: Text('الصلاحية', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         const DataColumn(label: Text('الشكل الدوائي', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        const DataColumn(label: Text('الرف', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                         if (widget.isOwner)
                                           const DataColumn(label: Text('الإجراءات', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
                                       ],
                                       rows: _medicines.map((med) {
                                         int qty = med['quantity'] ?? 0;
                                         bool isLowStock = qty <= 5;
-                                        String categoryLabel = _categories[med['category']] ?? med['category'] ?? 'غير محدد';
+                                        String categoryLabel = medicineCategoryLabel(med['category']);
 
                                         String tradeName = med['trade_name'] ?? '';
                                         String scientificName = med['scientific_name'] ?? '';
@@ -1202,15 +1194,6 @@ class _InventoryScreenState extends State<InventoryScreen> {
                                             ),
                                             // الشكل الدوائي
                                             DataCell(Text(categoryLabel, style: const TextStyle(fontSize: 13))),
-                                            // الرف
-                                            DataCell(
-                                              Text(
-                                                (med['shelf_location'] != null && med['shelf_location'].toString().trim().isNotEmpty)
-                                                    ? med['shelf_location']
-                                                    : '-',
-                                                style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
-                                              ),
-                                            ),
                                             // أزرار الإجراءات التفاعلية
                                             if (widget.isOwner)
                                               DataCell(

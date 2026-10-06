@@ -490,7 +490,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       borderRadius: BorderRadius.circular(6),
                     ),
                     child: Text(
-                      '${med.quantity} عبوة',
+                      '${med.quantity} قطعة',
                       style: GoogleFonts.tajawal(
                         color: const Color(0xFFD35400),
                         fontWeight: FontWeight.bold,
