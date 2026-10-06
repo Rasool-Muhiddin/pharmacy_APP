@@ -98,6 +98,7 @@ void main() {
     await tester.enterText(field('المذخر * (ابحث أو اكتب اسماً جديداً)'), 'مذخر الشفاء');
     await tester.pump();
     expect(find.text('مذخر جديد — سيُنشأ عند الحفظ'), findsOneWidget);
+    expect(field('هاتف المذخر (اختياري)'), findsNothing); // أُزيل من الواجهة
     await tester.enterText(field('رقم فاتورة المذخر *'), 'F-1');
 
     // الصنف 1: موجود في المخزن (نفس الاسم) + بونص.
@@ -105,6 +106,8 @@ void main() {
     await tester.testTextInput.receiveAction(TextInputAction.next);
     await tester.pumpAndSettle();
     expect(find.text('صنف موجود'), findsOneWidget);
+    expect(field('موقع الرف'), findsNothing); // أُزيل من الواجهة
+    expect(find.text('أخرى'), findsNothing); // القائمة مغلقة؛ الخيارات الجديدة تُختبر عبر medicineCategories
     await tester.enterText(field('الكمية المدفوعة *'), '10');
     await tester.enterText(field('بونص (مجاني)'), '2');
     await tester.enterText(field('سعر الشراء *'), '1000');

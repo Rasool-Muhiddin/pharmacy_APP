@@ -78,7 +78,6 @@ class _Line {
   final name = TextEditingController();
   final barcode = TextEditingController();
   final scientific = TextEditingController();
-  final shelf = TextEditingController();
   final quantity = TextEditingController();
   final bonus = TextEditingController();
   final buyPrice = TextEditingController();
@@ -92,7 +91,6 @@ class _Line {
   final expiryFocus = FocusNode();
   final barcodeFocus = FocusNode();
   final scientificFocus = FocusNode();
-  final shelfFocus = FocusNode();
   final key = GlobalKey();
   String category = 'tablet';
   bool isFree = false;
@@ -108,7 +106,7 @@ class _Line {
   bool get isBlank => !committed && name.text.trim().isEmpty;
 
   void dispose() {
-    for (final c in [name, barcode, scientific, shelf, quantity, bonus, buyPrice, sellPrice, expiry]) {
+    for (final c in [name, barcode, scientific, quantity, bonus, buyPrice, sellPrice, expiry]) {
       c.dispose();
     }
     for (final f in [
@@ -120,7 +118,6 @@ class _Line {
       expiryFocus,
       barcodeFocus,
       scientificFocus,
-      shelfFocus,
     ]) {
       f.dispose();
     }
@@ -143,7 +140,6 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
   String? _suppliersError;
   Map<String, dynamic>? _selectedSupplier;
   final _supplierName = TextEditingController();
-  final _supplierPhone = TextEditingController();
   final _invoiceNumber = TextEditingController();
   final _paidNow = TextEditingController();
   DateTime _invoiceDate = DateTime.now();
@@ -187,7 +183,6 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
       line.dispose();
     }
     _supplierName.dispose();
-    _supplierPhone.dispose();
     _invoiceNumber.dispose();
     _paidNow.dispose();
     _scroll.dispose();
@@ -302,7 +297,6 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
         // بيانات الصنف الموجود للعرض؛ سعر البيع الحالي اقتراح قابل للتعديل.
         line.barcode.text = (existing['barcode'] ?? '').toString();
         line.scientific.text = (existing['scientific_name'] ?? '').toString();
-        line.shelf.text = (existing['shelf_location'] ?? '').toString();
         final category = existing['category']?.toString();
         if (category != null && widget.categories.containsKey(category)) line.category = category;
         final sell = (existing['sell_price'] as num?)?.toDouble() ?? 0;
@@ -387,7 +381,8 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
       'barcode': line.barcode.text.trim(),
       'scientific_name': line.scientific.text.trim(),
       'category': line.category,
-      'shelf_location': line.shelf.text.trim(),
+      // موقع الرف أُزيل من الواجهة؛ الحقل يبقى في القاعدة/API ويُرسل فارغاً.
+      'shelf_location': '',
       'is_free': isFree,
       'quantity': isFree ? 0 : (_parseNum(line.quantity.text)?.toInt() ?? 0),
       'bonus_quantity': _isSupplierList ? (_parseNum(line.bonus.text)?.toInt() ?? 0) : 0,
@@ -466,7 +461,6 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           items: items,
           supplierId: _selectedSupplier?['id'] as int?,
           supplierName: _selectedSupplier == null ? _supplierName.text.trim() : null,
-          supplierPhone: _selectedSupplier == null ? _supplierPhone.text.trim() : null,
           paidAmount: _round2(paid),
         );
       } else {
@@ -649,20 +643,10 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
             runSpacing: 12,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              // مفاتيح ثابتة: ظهور حقل الهاتف بعد أول حرف من اسم مذخر جديد لا
-              // يُزيح عناصر الحقول التالية (كان رقم الفاتورة يُربط بالحقل الخطأ).
+              // مفاتيح ثابتة: تغيّر عناصر الرأس (مذخر مختار/جديد، الوضع) لا يربط
+              // حقل رقم الفاتورة بعنصر حقل آخر.
               if (_isSupplierList) ...[
                 SizedBox(key: const ValueKey('supplier'), width: 280, child: _buildSupplierField()),
-                if (_selectedSupplier == null && _supplierName.text.trim().isNotEmpty)
-                  SizedBox(
-                    key: const ValueKey('supplier-phone'),
-                    width: 170,
-                    child: TextField(
-                      controller: _supplierPhone,
-                      keyboardType: TextInputType.phone,
-                      decoration: _decoration('هاتف المذخر (اختياري)', Icons.phone_outlined),
-                    ),
-                  ),
                 SizedBox(
                   key: const ValueKey('invoice-number'),
                   width: 190,
@@ -1029,7 +1013,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
             focusNode: line.scientificFocus,
             enabled: !existing,
             textInputAction: TextInputAction.next,
-            onSubmitted: (_) => line.shelfFocus.requestFocus(),
+            onSubmitted: (_) => _finishLine(line),
             decoration: _decoration('الاسم العلمي', Icons.science_outlined),
           ),
         ),
@@ -1044,17 +1028,6 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
                 .map((e) => DropdownMenuItem(value: e.key, child: Text(e.value, overflow: TextOverflow.ellipsis)))
                 .toList(),
             onChanged: existing ? null : (v) => setState(() => line.category = v ?? line.category),
-          ),
-        ),
-        SizedBox(
-          width: 150,
-          child: TextField(
-            controller: line.shelf,
-            focusNode: line.shelfFocus,
-            enabled: !existing,
-            textInputAction: TextInputAction.done,
-            onSubmitted: (_) => _finishLine(line),
-            decoration: _decoration('موقع الرف', Icons.grid_view_outlined),
           ),
         ),
         if (existing)
