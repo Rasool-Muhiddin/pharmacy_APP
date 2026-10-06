@@ -5,12 +5,12 @@ import '../database/db_helper.dart';
 import '../repository/medicine_repository.dart';
 import '../repository/warehouse_repository.dart';
 import '../services/medicine_api_service.dart';
-import '../services/warehouse_api_service.dart';
 import '../models/medicine_categories.dart';
 import '../models/purchase_list.dart';
 import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
 import 'purchase_list_dialog.dart';
+import '../widgets/medicine_dialogs.dart';
 
 class InventoryScreen extends StatefulWidget {
   final int pharmacyId;
@@ -56,14 +56,6 @@ class _InventoryScreenState extends State<InventoryScreen> {
   // الأشكال الدوائية من المصدر المشترك (المخزون + التقارير).
   final Map<String, String> _categories = medicineCategories;
 
-  final Map<String, String> _damageReasons = {
-    'broken': 'كسر وضرر',
-    'spoiled': 'سوء خزن',
-    'withdrawn': 'سحب وزاري',
-    'correction': 'تصحيح إدخال (خطأ كمية)',
-    'other': 'أسباب أخرى',
-  };
-
   @override
   void initState() {
     super.initState();
@@ -106,39 +98,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
     );
   }
 
-  // تحويل رسائل خطأ قاعدة البيانات الخام (طويلة وتقنية) إلى سبب مباشر
-  // ومفهوم للصيدلي، بدل عرض نص الاستثناء الكامل بالـ SnackBar
-  String _friendlyDbErrorMessage(Object error) {
-    final text = error.toString();
-
-    if (text.contains('UNIQUE constraint failed') && text.contains('barcode')) {
-      return 'هذا الباركود مستخدم مسبقاً لدواء آخر بالمخزن. تحقق من الرقم أو اتركه فارغاً.';
-    }
-    if (text.contains('NOT NULL constraint failed')) {
-      return 'يوجد حقل إلزامي فارغ، يرجى تعبئة كل الحقول المطلوبة (*).';
-    }
-    if (text.contains('CHECK constraint failed')) {
-      return 'إحدى القيم المُدخَلة غير صحيحة (مثل كمية أو سعر سالب).';
-    }
-    if (text.contains('FOREIGN KEY constraint failed')) {
-      return 'لا يمكن تنفيذ هذا الإجراء لوجود بيانات أخرى مرتبطة بهذا الدواء.';
-    }
-
-    return 'حدث خطأ غير متوقع، يرجى المحاولة مرة أخرى.';
-  }
-
-  // رسائل MedicineRepositoryException/MedicineApiException جاهزة بالعربية
-  // أصلاً من مصدرها (انظر medicine_repository.dart وmedicine_api_service.dart)
-  // فتُعرض كما هي، بعكس أخطاء sqflite الخام التي تحتاج _friendlyDbErrorMessage.
-  String _friendlyWriteErrorMessage(Object error) {
-    if (error is MedicineRepositoryException ||
-        error is MedicineApiException ||
-        error is WarehouseRepositoryException ||
-        error is WarehouseApiException) {
-      return error.toString();
-    }
-    return _friendlyDbErrorMessage(error);
-  }
+  String _friendlyWriteErrorMessage(Object error) => friendlyWriteErrorMessage(error);
 
   // --- تحميل أدوية المخزن الحالية من قاعدة البيانات ---
   Future<void> _loadMedicines() async {
@@ -669,221 +629,22 @@ class _InventoryScreenState extends State<InventoryScreen> {
   }
 
 // --- 3. تعديل بيانات الدواء ---
-  void _openEditDialog(Map<String, dynamic> med) {
-    final barcodeCtrl = TextEditingController(text: med['barcode'] ?? '');
-    final tradeCtrl = TextEditingController(text: med['trade_name']);
-    final scientificCtrl = TextEditingController(text: med['scientific_name'] ?? '');
-    final buyPriceCtrl = TextEditingController(text: med['buy_price'].toString());
-    final sellPriceCtrl = TextEditingController(text: med['sell_price'].toString());
-    final expiryCtrl = TextEditingController(text: med['expiry_date'] ?? '');
-    // موقع الرف مخفي من الواجهة؛ قيمته الحالية تُرسل كما هي عند الحفظ.
-    final shelfCtrl = TextEditingController(text: med['shelf_location'] ?? '');
-    String selectedCategory = (med['category'] ?? '').toString();
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            title: const Row(
-              children: [
-                Icon(Icons.edit_note, color: Color(0xFF3182CE)),
-                SizedBox(width: 8),
-                Text('تعديل بيانات الدواء', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              ],
-            ),
-            content: SingleChildScrollView(
-              child: SizedBox(
-                width: 450,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // --- بيانات الهوية ---
-                    TextField(controller: tradeCtrl, decoration: const InputDecoration(labelText: 'الاسم التجاري *')),
-                    const SizedBox(height: 10),
-                    TextField(controller: scientificCtrl, decoration: const InputDecoration(labelText: 'الاسم العلمي')),
-                    const SizedBox(height: 10),
-                    TextField(controller: barcodeCtrl, decoration: const InputDecoration(labelText: 'الباركود')),
-
-                    const SizedBox(height: 18),
-                    Divider(color: Colors.grey.shade300),
-                    const SizedBox(height: 8),
-
-                    // --- التصنيف والموقع ---
-                    Row(
-                      children: [
-                        Expanded(
-                          child: DropdownButtonFormField<String>(
-                            initialValue: selectedCategory.isEmpty ? _categories.keys.first : selectedCategory,
-                            decoration: const InputDecoration(labelText: 'الشكل الدوائي'),
-                            items: [
-                              ..._categories.entries.map((e) => DropdownMenuItem<String>(value: e.key, child: Text(e.value))),
-                              // قيمة قديمة غير موجودة بالقائمة تبقى كما هي (لا تُستبدل بصمت عند الحفظ).
-                              if (selectedCategory.isNotEmpty && !_categories.containsKey(selectedCategory))
-                                DropdownMenuItem<String>(value: selectedCategory, child: Text(selectedCategory)),
-                            ],
-                            onChanged: (val) => setDialogState(() => selectedCategory = val!),
-                          ),
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 18),
-                    Divider(color: Colors.grey.shade300),
-                    const SizedBox(height: 8),
-
-                    // --- التسعير والصلاحية ---
-                    Row(
-                      children: [
-                        Expanded(child: TextField(controller: buyPriceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'آخر سعر شراء *'))),
-                        const SizedBox(width: 10),
-                        Expanded(child: TextField(controller: sellPriceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر البيع *'))),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    // الصلاحية تُدار لكل دفعة عبر "إضافة قائمة مذخر"؛ هنا أقربها للعرض فقط.
-                    TextField(
-                      controller: expiryCtrl,
-                      readOnly: true,
-                      enabled: false,
-                      decoration: const InputDecoration(
-                        labelText: 'أقرب تاريخ انتهاء (حسب الشحنات)',
-                        prefixIcon: Icon(Icons.calendar_month_outlined, color: Color(0xFF3182CE)),
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF3182CE)),
-                onPressed: () async {
-                  try {
-                    await MedicineRepository.instance.updateMedicine(
-                      pharmacyId: widget.pharmacyId,
-                      isOnlineMode: widget.isOnlineMode,
-                      id: med['id'],
-                      data: {
-                        'barcode': barcodeCtrl.text.trim().isEmpty ? null : barcodeCtrl.text.trim(),
-                        'trade_name': tradeCtrl.text.trim(),
-                        'scientific_name': scientificCtrl.text.trim(),
-                        'category': selectedCategory,
-                        'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
-                        'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
-                        'shelf_location': shelfCtrl.text.trim(),
-                      },
-                    );
-                    if (Navigator.canPop(ctx)) Navigator.pop(ctx);
-                    if (mounted) {
-                      _loadMedicines();
-                      _showSnackBar('تم حفظ التعديلات بنجاح', Colors.green);
-                    }
-                  } catch (e) {
-                    if (!mounted) return;
-                    _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
-                  }
-                },
-                child: const Text('حفظ التعديلات', style: TextStyle(color: Colors.white)),
-              ),
-            ],
-          );
-        },
-      ),
-    );
+  Future<void> _openEditDialog(Map<String, dynamic> med) async {
+    final saved = await showMedicineEditDialog(context, med: med, pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);
+    if (saved && mounted) {
+      _loadMedicines();
+      _showSnackBar('تم حفظ التعديلات بنجاح', Colors.green);
+    }
   }
 
   // --- 4. الإتلاف الجزئي ---
-  void _openDamageDialog(Map<String, dynamic> med) {
-    int currentQty = med['quantity'];
-    final damageQtyCtrl = TextEditingController(text: currentQty.toString());
-    final notesCtrl = TextEditingController();
-    String selectedReason = 'broken';
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            title: const Row(
-              children: [
-                Icon(Icons.warning_amber_rounded, color: Color(0xFFE53E3E)),
-                SizedBox(width: 8),
-                Text('نقل لقائمة التوالف', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFFE53E3E))),
-              ],
-            ),
-            content: SizedBox(
-              width: 400,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('الدواء المستهدف: ${med['trade_name']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                  const SizedBox(height: 6),
-                  Text('الكمية المتوفرة حالياً: $currentQty قطعة', style: const TextStyle(color: Colors.grey)),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: damageQtyCtrl,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(labelText: 'الكمية المراد إتلافها *'),
-                  ),
-                  const SizedBox(height: 12),
-                  DropdownButtonFormField<String>(
-                    initialValue: selectedReason,
-                    decoration: const InputDecoration(labelText: 'سبب الإتلاف *'),
-                    items: _damageReasons.entries.map((e) => DropdownMenuItem<String>(value: e.key, child: Text(e.value))).toList(),
-                    onChanged: (val) => setDialogState(() => selectedReason = val!),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: notesCtrl,
-                    maxLines: 2,
-                    decoration: const InputDecoration(labelText: 'ملاحظات إضافية (اختياري)'),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE53E3E)),
-                onPressed: () async {
-                  int qtyToDamage = int.tryParse(damageQtyCtrl.text) ?? 0;
-                  if (qtyToDamage <= 0 || qtyToDamage > currentQty) {
-                    _showSnackBar('يرجى إدخال كمية صحيحة لا تتجاوز المتاح ($currentQty)', Colors.red);
-                    return;
-                  }
-
-                  try {
-                    await MedicineRepository.instance.damageMedicine(
-                      pharmacyId: widget.pharmacyId,
-                      isOnlineMode: widget.isOnlineMode,
-                      medicineId: med['id'],
-                      quantityToDamage: qtyToDamage,
-                      reason: selectedReason,
-                      notes: notesCtrl.text.trim(),
-                    );
-                    if (Navigator.canPop(ctx)) Navigator.pop(ctx);
-                    if (mounted) {
-                      _loadMedicines();
-                      _showSnackBar('تم نقل الكمية بنجاح إلى جدول التوالف', Colors.orange);
-                    }
-                  } catch (e) {
-                    if (!mounted) return;
-                    _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
-                  }
-                },
-                child: const Text('تأكيد الإتلاف', style: TextStyle(color: Colors.white)),
-              ),
-            ],
-          );
-        },
-      ),
-    );
+  Future<void> _openDamageDialog(Map<String, dynamic> med) async {
+    final done = await showMedicineDamageDialog(context, med: med, pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);
+    if (done && mounted) {
+      _loadMedicines();
+      _showSnackBar('تم نقل الكمية بنجاح إلى جدول التوالف', Colors.orange);
+    }
   }
-
   // --- 5. الحذف النهائي ---
   void _confirmDeleteMedicine(Map<String, dynamic> med) {
     showDialog(
@@ -907,7 +668,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
                   isOnlineMode: widget.isOnlineMode,
                   id: med['id'],
                 );
-                if (Navigator.canPop(ctx)) Navigator.pop(ctx);
+                if (ctx.mounted && Navigator.canPop(ctx)) Navigator.pop(ctx);
                 if (mounted) {
                   _loadMedicines();
                   _showSnackBar('تم حذف الدواء بنجاح من المخزن', Colors.red);
@@ -1094,7 +855,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
                                       ],
                                       rows: _medicines.map((med) {
                                         int qty = med['quantity'] ?? 0;
-                                        bool isLowStock = qty <= 5;
+                                        bool isLowStock = qty <= kLowStockThreshold;
                                         String categoryLabel = medicineCategoryLabel(med['category']);
 
                                         String tradeName = med['trade_name'] ?? '';

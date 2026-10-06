@@ -141,7 +141,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     DropdownButtonFormField<String>(
-                      value: selectedType,
+                      initialValue: selectedType,
                       decoration: const InputDecoration(labelText: 'نوع المصروف'),
                       items: _types.map((type) => DropdownMenuItem(value: type, child: Text(type))).toList(),
                       onChanged: (value) => setDialogState(() => selectedType = value ?? _types.first),
@@ -329,7 +329,7 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
     padding: const EdgeInsets.all(22),
     decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(10), border: Border.all(color: const Color(0xFFEDF2F7))),
     child: LayoutBuilder(builder: (context, constraints) {
-      final typeSelector = DropdownButtonFormField<String?>(value: _selectedType, decoration: const InputDecoration(labelText: 'نوع المصروف', filled: true, fillColor: Colors.white, border: OutlineInputBorder()), items: [const DropdownMenuItem<String?>(value: null, child: Text('كل الأنواع')), ..._types.map((type) => DropdownMenuItem<String?>(value: type, child: Text(type)))], onChanged: (value) => setState(() => _selectedType = value));
+      final typeSelector = DropdownButtonFormField<String?>(initialValue: _selectedType, decoration: const InputDecoration(labelText: 'نوع المصروف', filled: true, fillColor: Colors.white, border: OutlineInputBorder()), items: [const DropdownMenuItem<String?>(value: null, child: Text('كل الأنواع')), ..._types.map((type) => DropdownMenuItem<String?>(value: type, child: Text(type)))], onChanged: (value) => setState(() => _selectedType = value));
       final searchButton = ElevatedButton.icon(onPressed: _loadExpenses, icon: const Icon(Icons.filter_alt_outlined, size: 18), label: const Text('بحث وتصفية'), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF3182CE), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 17), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(7))));
 
       if (constraints.maxWidth >= 850) {

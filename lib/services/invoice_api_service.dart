@@ -63,6 +63,10 @@ class InvoiceApiService {
     return results;
   }
 
+  /// GET /api/invoices/{id}/ — فاتورة واحدة بأصنافها (نافذة تفاصيل الفاتورة في
+  /// التقارير أونلاين، بدل مزامنة كل سجل المبيعات محلياً).
+  Future<Map<String, dynamic>> fetchInvoice(int id) => _get(url: '$_baseUrl/invoices/$id/');
+
   /// POST /api/invoices/checkout/
   /// items: [{'medicine_id': ..., 'quantity': ...}, ...] فقط — سعر كل صنف
   /// ورقم الفاتورة يُحدَّدان من السيرفر دائماً (انظر
@@ -81,7 +85,7 @@ class InvoiceApiService {
     );
   }
 
-  /// POST /api/invoices/<id>/refund/
+  /// POST `/api/invoices/<id>/refund/`
   Future<Map<String, dynamic>> refundInvoice(int id) {
     return _send(
       method: 'POST',

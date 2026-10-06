@@ -36,7 +36,7 @@ from .models import (
     SupplierPayment,
     Warehouse,
 )
-from . import purchase_list, purchase_returns, stock, supplier_ledger
+from . import purchase_list, purchase_returns, reports, stock, supplier_ledger
 from .offline_import import (
     error_message,
     has_existing_online_data,
@@ -1022,7 +1022,7 @@ class DamagedMedicineViewSet(
 
 def _profit_summary(pharmacy, start, end, total_expenses):
     """
-    تقرير الربح (للمالك فقط عبر ReportsViewSet):
+    تقرير الربح (للمالك فقط عبر ReportsViewSet) — الصيغ في reports.py:
       الإيراد = صافي الفواتير غير المسترجعة في الفترة.
       كلفة البضاعة = Σ(unit_cost × الكمية) للأسطر ذات الكلفة المعروفة.
       الربح الإجمالي = Σ(إجمالي السطر − كلفته) − حصة تلك الأسطر من خصم فاتورتها.
@@ -1030,45 +1030,15 @@ def _profit_summary(pharmacy, start, end, total_expenses):
     الأسطر بلا unit_cost (مبيعات قديمة) تُستبعد من الربح وتُعدّ في items_without_cost.
     الفواتير المسترجعة مستبعدة كلياً، فيُعكس ربحها بكلفتها الأصلية.
     """
-    invoices = Invoice.objects.filter(
-        pharmacy=pharmacy,
-        is_refunded=False,
-        created_at__date__gte=start,
-        created_at__date__lte=end,
-    ).prefetch_related("items")
-
-    revenue = cogs = gross = Decimal("0")
-    items_without_cost = 0
-    for invoice in invoices:
-        revenue += invoice.final_amount
-        costed_total = Decimal("0")
-        for item in invoice.items.all():
-            if item.unit_cost is None:
-                items_without_cost += 1
-                continue
-            costed_total += item.total_price
-            cogs += item.unit_cost * item.quantity
-        discount_share = (
-            invoice.discount * costed_total / invoice.total_amount
-            if invoice.discount and invoice.total_amount > 0
-            else Decimal("0")
-        )
-        gross += costed_total - discount_share
-    gross -= cogs
-
-    # "تصحيح إدخال" ليس خسارة فعلية (نفس استبعاده في total_damage_losses).
-    damage_cost = DamagedMedicine.objects.filter(
-        pharmacy=pharmacy, damaged_at__gte=start, damaged_at__lte=end, total_cost__isnull=False
-    ).exclude(reason="correction").aggregate(total=Coalesce(Sum("total_cost"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)))["total"]
-
-    net = gross - total_expenses - damage_cost
+    profit = reports.profit_figures(pharmacy, start, end)
+    damage_cost = reports.damage_total(pharmacy, start, end)
     return {
-        "revenue": stock.to_money(revenue),
-        "cost_of_goods_sold": stock.to_money(cogs),
-        "gross_profit": stock.to_money(gross),
-        "damage_cost": stock.to_money(damage_cost),
-        "net_profit": stock.to_money(net),
-        "items_without_cost": items_without_cost,
+        "revenue": profit["revenue"],
+        "cost_of_goods_sold": profit["cost_of_goods_sold"],
+        "gross_profit": profit["gross_profit"],
+        "damage_cost": damage_cost,
+        "net_profit": stock.to_money(profit["gross_profit"] - total_expenses - damage_cost),
+        "items_without_cost": profit["items_without_cost"],
     }
 
 
@@ -1098,7 +1068,7 @@ class ReportsViewSet(viewsets.ViewSet):
         نفس الافتراضي المستخدم في reports_screen.dart (آخر 30 يوماً) إن لم
         يُمرَّر start/end. صيغة الإدخال ISO: YYYY-MM-DD.
         """
-        today = date.today()
+        today = reports.today()
         start_raw = request.query_params.get("start")
         end_raw = request.query_params.get("end")
 
@@ -1118,7 +1088,7 @@ class ReportsViewSet(viewsets.ViewSet):
         membership = self._membership(request)
         pharmacy = membership.pharmacy
         start, end = self._date_range(request)
-        today = date.today()
+        today = reports.today()
 
         non_refunded_invoices = Invoice.objects.filter(
             pharmacy=pharmacy,
@@ -1172,17 +1142,8 @@ class ReportsViewSet(viewsets.ViewSet):
         )["total"]
 
         # خسائر التوالف: سجلات 'correction' مستبعدة لأنها تصحيح إدخال، لا خسارة فعلية.
-        damaged_losses = (
-            DamagedMedicine.objects.filter(pharmacy=pharmacy, damaged_at__gte=start, damaged_at__lte=end)
-            .exclude(reason="correction")
-            .aggregate(
-                total=Coalesce(
-                    Sum(F("quantity_damaged") * F("medicine__buy_price")),
-                    Value(0),
-                    output_field=DecimalField(max_digits=14, decimal_places=2),
-                )
-            )["total"]
-        )
+        # نفس قاعدة الكلفة في تقرير الربح (total_cost ثم avg_cost ثم buy_price).
+        damaged_losses = reports.damage_total(pharmacy, start, end)
 
         top_selling_items = list(
             InvoiceItem.objects.filter(
@@ -1285,6 +1246,77 @@ class ReportsViewSet(viewsets.ViewSet):
 
         sellers_list = sorted(sellers.values(), key=lambda s: s["total_amount"], reverse=True)
         return Response({"start": start.isoformat(), "end": end.isoformat(), "sellers": sellers_list})
+
+    # ------------------------------------------------------------------
+    # شاشة التقارير الجديدة: قسم لكل نقطة نهاية (الصيغ في reports.py)،
+    # summary/shifts أعلاه باقيتان كما هما للنسخ الأقدم من التطبيق.
+    # ------------------------------------------------------------------
+
+    def _pharmacy(self, request):
+        return self._membership(request).pharmacy
+
+    def _section(self, request, fn, **kwargs):
+        start, end = self._date_range(request)
+        return Response(fn(self._pharmacy(request), start, end, **kwargs))
+
+    @action(detail=False, methods=["get"])
+    def kpis(self, request):
+        """المؤشرات الأربعة للفترة والفترة السابقة بنفس الطول + تنبيهات الوضع الحالي."""
+        return self._section(request, reports.kpis)
+
+    @action(detail=False, methods=["get"])
+    def trend(self, request):
+        return self._section(request, reports.trend)
+
+    @action(detail=False, methods=["get"])
+    def categories(self, request):
+        return self._section(request, reports.categories)
+
+    @action(detail=False, methods=["get"])
+    def hours(self, request):
+        return self._section(request, reports.hours)
+
+    @action(detail=False, methods=["get"])
+    def items(self, request):
+        return self._section(request, reports.items, sort=request.query_params.get("sort") or "qty")
+
+    @action(detail=False, methods=["get"])
+    def stagnant(self, request):
+        page, size = reports.page_params(request.query_params)
+        return self._section(request, reports.stagnant, page=page, page_size=size)
+
+    @action(detail=False, methods=["get"])
+    def inventory(self, request):
+        """الوضع الحالي للمخزون (غير مقيّد بالفترة)."""
+        try:
+            days = int(request.query_params.get("days") or reports.EXPIRY_ALERT_DAYS)
+        except ValueError:
+            raise ValidationError("days يجب أن يكون رقماً.")
+        if not 1 <= days <= 365:
+            raise ValidationError("days يجب أن يكون بين 1 و365.")
+        return Response(reports.inventory(self._pharmacy(request), days=days))
+
+    @action(detail=False, methods=["get"])
+    def purchases(self, request):
+        return self._section(request, reports.purchases)
+
+    @action(detail=False, methods=["get"])
+    def losses(self, request):
+        return self._section(request, reports.losses)
+
+    @action(detail=False, methods=["get"])
+    def invoices(self, request):
+        params = request.query_params
+        page, size = reports.page_params(params)
+        return self._section(
+            request, reports.invoices, page=page, page_size=size,
+            q=(params.get("q") or "").strip(), seller=(params.get("seller") or "").strip(),
+            refunded=params.get("refunded") in ("1", "true"),
+        )
+
+    @action(detail=False, methods=["get"])
+    def sellers(self, request):
+        return self._section(request, reports.sellers)
 
 
 class NDJSONRenderer(BaseRenderer):

@@ -768,7 +768,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
                 _refreshData();
 
                 if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
+                  ScaffoldMessenger.of(this.context).showSnackBar(
                     SnackBar(
                       content: Text('تمت إضافة المذخر "$name" بنجاح!'),
                       backgroundColor: success,
@@ -781,7 +781,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
                 debugPrintStack(stackTrace: stackTrace);
 
                 if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
+                  ScaffoldMessenger.of(this.context).showSnackBar(
                     SnackBar(
                       content: Text('حدث خطأ أثناء الإضافة: $e'),
                       backgroundColor: danger,
@@ -1273,7 +1273,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName, double availab
                   }
                 } catch (e) {
                   if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
+                    ScaffoldMessenger.of(this.context).showSnackBar(
                       SnackBar(content: Text('خطأ أثناء تسجيل الدفعة: $e'), backgroundColor: danger),
                     );
                   }

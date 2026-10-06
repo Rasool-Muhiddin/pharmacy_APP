@@ -17,11 +17,11 @@ class DamagedScreen extends StatefulWidget {
   final bool isOnlineMode;
 
   const DamagedScreen({
-    Key? key,
+    super.key,
     required this.pharmacyId,
     required this.isOnlineMode,
     this.isOwner = true,
-  }) : super(key: key);
+  });
 
   @override
   State<DamagedScreen> createState() => _DamagedScreenState();
@@ -201,7 +201,7 @@ class _DamagedScreenState extends State<DamagedScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         DropdownButtonFormField<int>(
-                          value: selectedMedicineId,
+                          initialValue: selectedMedicineId,
                           decoration: const InputDecoration(
                             labelText: "اختر الدواء *",
                             border: OutlineInputBorder(),
@@ -257,7 +257,7 @@ class _DamagedScreenState extends State<DamagedScreen> {
                         const SizedBox(height: 15),
 
                         DropdownButtonFormField<String>(
-                          value: selectedReason,
+                          initialValue: selectedReason,
                           decoration: const InputDecoration(
                             labelText: "سبب الإتلاف *",
                             border: OutlineInputBorder(),
@@ -439,7 +439,7 @@ class _DamagedScreenState extends State<DamagedScreen> {
                   borderRadius: BorderRadius.circular(8),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withOpacity(0.04),
+                      color: Colors.black.withValues(alpha: 0.04),
                       blurRadius: 10,
                       offset: const Offset(0, 4),
                     ),
@@ -495,7 +495,7 @@ class _DamagedScreenState extends State<DamagedScreen> {
         borderRadius: BorderRadius.circular(8),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.04),
+            color: Colors.black.withValues(alpha: 0.04),
             blurRadius: 10,
             offset: const Offset(0, 4),
           ),
@@ -675,6 +675,11 @@ class _DamagedScreenState extends State<DamagedScreen> {
       bgColor = const Color(0xFFEDF2F7);
       textColor = const Color(0xFF4A5568);
       icon = Icons.block_outlined;
+    } else if (normalized == 'expired') {
+      text = "انتهاء الصلاحية";
+      bgColor = const Color(0xFFFFFAF0);
+      textColor = const Color(0xFFC05621);
+      icon = Icons.event_busy_outlined;
     } else if (normalized == 'correction') {
       // 🟢 لا يُعتبر خسارة فعلية — لون محايد (رمادي مزرق) بدل درجات الأحمر/البنفسجي
       // المستخدمة لأسباب التلف الحقيقية، لتمييزه بصريًا في الجدول فورًا.

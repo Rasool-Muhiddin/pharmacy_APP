@@ -67,7 +67,7 @@ class SuppliersApiService {
     return _getList(url: '$_baseUrl/suppliers/summary/');
   }
 
-  /// GET /api/suppliers/<id>/statement/ — كشف حساب خام (فواتير + دفعات +
+  /// GET `/api/suppliers/<id>/statement/` — كشف حساب خام (فواتير + دفعات +
   /// استرجاعات)؛ الترتيب والرصيد التراكمي يُحسَبان في الشاشة عبر
   /// _computeRunningBalance تماماً كما مع db_helper محلياً.
   Future<List<Map<String, dynamic>>> fetchSupplierStatement(int supplierId) {

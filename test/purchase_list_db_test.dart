@@ -574,7 +574,7 @@ void main() {
       await raw.close();
 
       final db = await helper.database; // v10 -> v11
-      expect(await db.getVersion(), 12);
+      expect(await db.getVersion(), 13);
       final numbers = await db.query('purchase_invoice', columns: ['id', 'invoice_number', 'source', 'item_count'], orderBy: 'id');
       expect(numbers.map((r) => r['invoice_number']), ['7', '7-2', '7-3', '7-4', '7', '', '']);
       expect(numbers.every((r) => r['source'] == 'manual' && r['item_count'] == 0), isTrue);
@@ -610,7 +610,7 @@ void main() {
       await raw.close();
 
       final db = await helper.database;
-      expect(await db.getVersion(), 12);
+      expect(await db.getVersion(), 13);
       final columns = (await db.rawQuery('PRAGMA table_info(medicine_batch)')).map((c) => c['name']).toList();
       for (final column in ['source', 'supplier_id', 'purchase_invoice_id', 'supplier_name', 'invoice_number']) {
         expect(columns.where((c) => c == column), hasLength(1), reason: column);

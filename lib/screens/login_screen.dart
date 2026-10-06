@@ -267,6 +267,7 @@ class _AuthScreenState extends State<AuthScreen> {
       return;
     }
 
+    if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (_) => MainLayout(

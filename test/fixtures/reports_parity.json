@@ -1,0 +1,130 @@
+{
+  "description": "Shared by test/reports_local_service_test.dart (ReportsLocalService, offline SQLite) and backend/pharmacy_data/tests_reports.py (/api/reports/* endpoints). Both must produce exactly `expected` for the same data. All dates are offsets in days from today (Asia/Baghdad); the report period is [today-6, today], so the previous period is [today-13, today-7]. Medicine quantity = sum of its batches. Money is compared after rounding to 2 decimals.",
+  "period": {"start_offset": -6, "end_offset": 0},
+  "suppliers": ["S1", "S2"],
+  "sellers": ["Ali", "Sara"],
+  "medicines": {
+    "A": {"category": "tablet", "buy_price": 400, "avg_cost": 400, "sell_price": 1000,
+          "batches": [{"quantity": 20, "expiry_offset": 365, "purchase_price": 400, "supplier": "S1"}]},
+    "B": {"category": "syrup", "buy_price": 300, "avg_cost": 300, "sell_price": 250,
+          "batches": [{"quantity": 4, "expiry_offset": 20, "purchase_price": 300, "supplier": "S2"}]},
+    "C": {"category": "", "buy_price": 100, "avg_cost": null, "sell_price": 500,
+          "batches": [{"quantity": 3, "expiry_offset": -10, "purchase_price": null, "supplier": null}]},
+    "D": {"category": "injection", "buy_price": 1000, "avg_cost": 1000, "sell_price": 1500,
+          "batches": [{"quantity": 10, "expiry_offset": 200, "purchase_price": 900, "supplier": "S1"}]},
+    "E": {"category": "tablet", "buy_price": 50, "avg_cost": 50, "sell_price": 100, "batches": []}
+  },
+  "invoices": [
+    {"number": "INV-000001", "day_offset": 0, "hour": 10, "seller": "Ali", "discount": 100, "is_refunded": false,
+     "items": [
+       {"medicine": "A", "quantity": 2, "unit_price": 1000, "unit_cost": 400},
+       {"medicine": "B", "quantity": 1, "unit_price": 1000, "unit_cost": 300}
+     ]},
+    {"number": "INV-000002", "day_offset": -1, "hour": 18, "seller": "Sara", "discount": 0, "is_refunded": false,
+     "items": [
+       {"medicine": "A", "quantity": 1, "unit_price": 1000, "unit_cost": 400},
+       {"medicine": "C", "quantity": 1, "unit_price": 500, "unit_cost": null}
+     ]},
+    {"number": "INV-000003", "day_offset": -2, "hour": 10, "seller": "Ali", "discount": 0, "is_refunded": true,
+     "items": [
+       {"medicine": "A", "quantity": 1, "unit_price": 1000, "unit_cost": 400}
+     ]},
+    {"number": "INV-000004", "day_offset": -8, "hour": 12, "seller": "Ali", "discount": 0, "is_refunded": false,
+     "items": [
+       {"medicine": "A", "quantity": 1, "unit_price": 1000, "unit_cost": 400},
+       {"medicine": "E", "quantity": 2, "unit_price": 100, "unit_cost": 50},
+       {"medicine": "D", "quantity": 1, "unit_price": 1500, "unit_cost": 1000}
+     ]}
+  ],
+  "expenses": [
+    {"type": "rent", "amount": 250, "day_offset": -1},
+    {"type": "electricity", "amount": 100, "day_offset": -3},
+    {"type": "rent", "amount": 200, "day_offset": -9}
+  ],
+  "damaged": [
+    {"medicine": "A", "quantity": 1, "total_cost": 400, "reason": "broken", "day_offset": -1},
+    {"medicine": "B", "quantity": 1, "total_cost": null, "reason": "expired", "day_offset": -2},
+    {"medicine": "A", "quantity": 1, "total_cost": 400, "reason": "correction", "day_offset": -1}
+  ],
+  "purchase_invoices": [
+    {"supplier": "S1", "number": "P1", "day_offset": -2, "total": 5000,
+     "payments": [{"amount": 1000, "day_offset": -2}, {"amount": 1000, "day_offset": -1}],
+     "returns": [{"amount": 500, "day_offset": -1}]},
+    {"supplier": "S2", "number": "P2", "day_offset": -10, "total": 1000, "payments": [], "returns": []}
+  ],
+  "expected": {
+    "kpis": {
+      "current": {
+        "gross_sales": 4500, "discounts": 100, "net_sales": 4400, "invoices_count": 2,
+        "discounted_invoices_count": 1, "refunded_count": 1, "refunded_value": 1000,
+        "cost_of_goods_sold": 1500, "gross_profit": 2400, "uncosted_revenue": 500, "items_without_cost": 1,
+        "expenses": 350, "damage_cost": 700, "net_profit": 1350
+      },
+      "previous": {
+        "gross_sales": 2700, "discounts": 0, "net_sales": 2700, "invoices_count": 1,
+        "discounted_invoices_count": 0, "refunded_count": 0, "refunded_value": 0,
+        "cost_of_goods_sold": 1500, "gross_profit": 1200, "uncosted_revenue": 0, "items_without_cost": 0,
+        "expenses": 200, "damage_cost": 0, "net_profit": 1000
+      },
+      "alerts": {
+        "below_cost_count": 1, "expiring_days": 30, "expiring_count": 1, "expiring_value": 1200,
+        "expired_count": 1, "expired_value": 300, "low_stock_count": 4, "out_of_stock_count": 1
+      }
+    },
+    "trend": {
+      "bucket": "day",
+      "points_by_offset": {"-6": [0, 0], "-5": [0, 0], "-4": [0, 0], "-3": [0, 0], "-2": [0, 0], "-1": [1500, 600], "0": [2900, 1800]}
+    },
+    "categories": [
+      {"category": "tablet", "net_sales": 2933.33, "quantity": 3},
+      {"category": "syrup", "net_sales": 966.67, "quantity": 1},
+      {"category": "", "net_sales": 500, "quantity": 1}
+    ],
+    "hours": {"10": [1, 2900], "18": [1, 1500]},
+    "items": {
+      "qty": ["A", "B", "C"],
+      "revenue": ["A", "B", "C"],
+      "profit": ["A", "B", "C"],
+      "rows": {
+        "A": {"quantity": 3, "revenue": 2933.33, "cost": 1200, "profit": 1733.33, "uncosted_quantity": 0},
+        "B": {"quantity": 1, "revenue": 966.67, "cost": 300, "profit": 666.67, "uncosted_quantity": 0},
+        "C": {"quantity": 1, "revenue": 500, "cost": 0, "profit": 0, "uncosted_quantity": 1}
+      },
+      "below_cost": [{"medicine": "B", "cost": 300, "sell_price": 250, "loss_per_unit": 50, "quantity": 4}]
+    },
+    "stagnant": {
+      "count": 1, "total_value": 9000,
+      "results": [{"medicine": "D", "quantity": 10, "stock_value": 9000, "category": "injection", "last_sale_offset": -8}]
+    },
+    "inventory": {
+      "days": 30,
+      "stock_cost_value": 18500, "stock_sell_value": 37500, "expected_profit": 19000,
+      "expiring": [{"medicine": "B", "quantity": 4, "value": 1200, "supplier_name": "S2", "expiry_offset": 20}],
+      "expiring_value": 1200,
+      "expired": [{"medicine": "C", "quantity": 3, "value": 300, "supplier_name": "", "expiry_offset": -10}],
+      "expired_value": 300,
+      "low_stock": ["E", "C", "B", "D"]
+    },
+    "purchases": {
+      "purchases_total": 5000, "invoices_count": 1, "returns_total": 500, "payments_total": 2000, "refunds_received": 0,
+      "by_supplier": [{"name": "S1", "invoices_count": 1, "total": 5000, "returns": 500}],
+      "total_debt": 3500, "total_credit": 0,
+      "top_debtors": [{"name": "S1", "debt": 2500}, {"name": "S2", "debt": 1000}]
+    },
+    "losses": {
+      "expenses_total": 350,
+      "expenses_by_type": [{"type": "rent", "total": 250, "count": 1}, {"type": "electricity", "total": 100, "count": 1}],
+      "damage_total": 700,
+      "damage_by_reason": [{"reason": "broken", "total": 400, "quantity": 1, "count": 1}, {"reason": "expired", "total": 300, "quantity": 1, "count": 1}],
+      "expired_recorded": 300,
+      "expired_not_disposed_value": 300
+    },
+    "invoices": {
+      "all": {"count": 2, "total_amount": 4400, "numbers": ["INV-000001", "INV-000002"]},
+      "seller_ali": {"count": 1, "numbers": ["INV-000001"]},
+      "search_000002": {"count": 1, "numbers": ["INV-000002"]},
+      "refunded": {"count": 1, "numbers": ["INV-000003"]}
+    },
+    "sellers": [{"seller_name": "Ali", "invoices_count": 1, "net_sales": 2900}, {"seller_name": "Sara", "invoices_count": 1, "net_sales": 1500}]
+  }
+}

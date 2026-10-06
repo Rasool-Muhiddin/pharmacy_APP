@@ -15,7 +15,9 @@ class ReportsApiException implements Exception {
   String toString() => message;
 }
 
-/// يستهلك /api/reports/summary/ و/api/reports/shifts/ — كل التجميع (SUM,
+/// يستهلك /api/reports/* (summary/shifts للنسخ الأقدم، وأقسام شاشة التقارير
+/// الجديدة: kpis, trend, categories, hours, items, stagnant, inventory,
+/// purchases, losses, invoices, sellers) — كل التجميع (SUM,
 /// COUNT, GROUP BY) يحدث على السيرفر (ReportsViewSet في الباك اند)، فهذه
 /// الخدمة لا تُرسل سوى معاملَي start/end وتُعيد الـJSON كما هو دون أي حساب
 /// إضافي على العميل.
@@ -49,6 +51,21 @@ class ReportsApiService {
     return _get(endpoint: 'shifts', start: start, end: end);
   }
 
+  /// قسم من أقسام شاشة التقارير: /api/reports/<section>/?start&end&...
+  /// [start]/[end] اختياريان (inventory وضع حالي بلا فترة).
+  Future<Map<String, dynamic>> fetchSection(
+    String section, {
+    DateTime? start,
+    DateTime? end,
+    Map<String, String> params = const {},
+  }) {
+    return _getQuery(endpoint: section, query: {
+      if (start != null) 'start': _formatDate(start),
+      if (end != null) 'end': _formatDate(end),
+      ...params,
+    });
+  }
+
   String _formatDate(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
@@ -64,9 +81,15 @@ class ReportsApiService {
     required String endpoint,
     required DateTime start,
     required DateTime end,
+  }) {
+    return _getQuery(endpoint: endpoint, query: {'start': _formatDate(start), 'end': _formatDate(end)});
+  }
+
+  Future<Map<String, dynamic>> _getQuery({
+    required String endpoint,
+    required Map<String, String> query,
   }) async {
-    final url =
-        '$_baseUrl/reports/$endpoint/?start=${_formatDate(start)}&end=${_formatDate(end)}';
+    final url = Uri.parse('$_baseUrl/reports/$endpoint/').replace(queryParameters: query.isEmpty ? null : query).toString();
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
 
     try {

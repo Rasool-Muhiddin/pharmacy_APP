@@ -3,11 +3,15 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'dart:convert';
 import 'dart:io'; 
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter/services.dart' show rootBundle;
 
 import '../models/purchase_list.dart';
 import '../models/purchase_return.dart';
+
+/// حد "المخزون المنخفض": الصنف بكمية <= هذا الحد يُعدّ شحيحاً (نقطة البيع،
+/// المخزون، لوحة التحكم، تنبيهات التقارير). نفس LOW_STOCK_THRESHOLD في pharmacy_data/reports.py.
+const int kLowStockThreshold = 10;
 
 class DatabaseHelper {
   DatabaseHelper._();
@@ -113,7 +117,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 12,
+    version: 13,
     onConfigure: (db) async {
       // ترقيات v7 و v9 تعيد بناء جداول (medicine/invoice: DROP + RENAME) وتنقل
       // معرّفات صفوف تشير إليها جداول أخرى. PRAGMA foreign_keys لا يمكن تغييره
@@ -343,6 +347,7 @@ Future<void> _onCreate(Database db, int version) async {
   await db.execute('CREATE INDEX idx_trade_name ON medicine(trade_name);');
   await db.execute('CREATE INDEX idx_scientific_name ON medicine(scientific_name);');
   await _createInvoiceIndexes(db);
+  await _createReportIndexes(db);
   await db.execute('CREATE INDEX idx_purchase_invoice_supplier ON purchase_invoice(supplier_id);');
   await _createPurchaseInvoiceNumberIndex(db);
   await db.execute('CREATE INDEX idx_supplier_payment_supplier ON supplier_payment(supplier_id);');
@@ -395,6 +400,17 @@ Future<void> _createInvoiceIndexes(DatabaseExecutor db) async {
     CREATE UNIQUE INDEX idx_invoice_number_server
     ON invoice(pharmacy_id, invoice_number) WHERE id < $localIdBase
   ''');
+}
+
+/// v13: فهارس شاشة التقارير — كل استعلاماتها مقيّدة بالصيدلية ونطاق تاريخ
+/// (created_at >= بداية اليوم الأول AND < بداية اليوم التالي للأخير)، أو تجمع
+/// أسطر الفواتير حسب الفاتورة/الدواء.
+Future<void> _createReportIndexes(DatabaseExecutor db) async {
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_invoice_pharmacy_date ON invoice(pharmacy_id, created_at);');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_invoice_item_invoice ON invoice_item(invoice_id);');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_invoice_item_medicine ON invoice_item(medicine_id);');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_damaged_pharmacy_date ON damaged_medicine(pharmacy_id, damaged_at);');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_purchase_invoice_pharmacy_date ON purchase_invoice(pharmacy_id, created_at);');
 }
 
 /// يضبط عدّاد AUTOINCREMENT لكل جدول مشترك بحيث يكون أي معرّف محلي جديد
@@ -621,6 +637,10 @@ Future<void> _onUpgrade(
 
   if (oldVersion < 12) {
     await _upgradeToSupplierCredit(db);
+  }
+
+  if (oldVersion < 13) {
+    await _createReportIndexes(db);
   }
 }
 
@@ -1118,6 +1138,11 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
 
   static double roundMoney(num value) => (value * 100).round() / 100;
 
+  /// كلفة سجل إتلاف (dm) بدوائه (m، LEFT JOIN): total_cost المسجّلة، وإلا
+  /// الكمية × (avg_cost ثم buy_price). قاعدة واحدة لصافي الربح وتقرير الخسائر.
+  static const String damageCostSql =
+      'COALESCE(dm.total_cost, dm.quantity_damaged * COALESCE(m.avg_cost, m.buy_price, 0))';
+
   static double weightedAverageCost({
     required int oldQty,
     required double? oldAvg,
@@ -1328,10 +1353,13 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       SELECT COALESCE(SUM(amount), 0) AS total FROM expense
       WHERE pharmacy_id = ? AND ${originFilter()} AND date(expense_date) >= date(?) AND date(expense_date) <= date(?)
     ''', [pharmacyId, start, end])).first['total'] as num;
+    // كلفة الإتلاف: المسجّلة وقت الإتلاف، وإلا الكمية × (avg_cost ثم buy_price) —
+    // نفس damageCostSql وreports.DAMAGE_COST في الخادم.
     final damageCost = (await db.rawQuery('''
-      SELECT COALESCE(SUM(total_cost), 0) AS total FROM damaged_medicine
-      WHERE pharmacy_id = ? AND ${originFilter()} AND total_cost IS NOT NULL AND reason != 'correction'
-        AND date(damaged_at) >= date(?) AND date(damaged_at) <= date(?)
+      SELECT COALESCE(SUM($damageCostSql), 0) AS total
+      FROM damaged_medicine dm LEFT JOIN medicine m ON m.id = dm.medicine_id
+      WHERE dm.pharmacy_id = ? AND ${originFilter('dm.')} AND COALESCE(dm.reason, '') != 'correction'
+        AND date(dm.damaged_at) >= date(?) AND date(dm.damaged_at) <= date(?)
     ''', [pharmacyId, start, end])).first['total'] as num;
 
     return {
@@ -2053,7 +2081,7 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   // الأدوية منخفضة المخزون
   //====================================================
 
-  Future<List<Map<String, dynamic>>> getLowStockMedicines(int pharmacyId, {int limit = 5}) async {
+  Future<List<Map<String, dynamic>>> getLowStockMedicines(int pharmacyId, {int limit = kLowStockThreshold}) async {
     final db = await database;
     return await db.query(
       'medicine',
@@ -2670,7 +2698,7 @@ Future<double> totalSalesToday(int pharmacyId) async {
       }
       await batch.commit(noResult: true);
     } catch (e) {
-      print("خطأ في تحميل قاموس الأدوية: $e");
+      debugPrint("خطأ في تحميل قاموس الأدوية: $e");
     }
   }
 

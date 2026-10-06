@@ -31,7 +31,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
   static const Color darkText = Color(0xFF1E293B);
   static const Color mutedText = Color(0xFF64748B);
   static const Color bgColor = Color(0xFFF4F7FB);
-  static const Color cardBorder = Color(0xFFEDF2F7);
 
   bool _isLoading = true;
 
@@ -90,7 +89,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // 🆕 90 يوماً: فترة عملية تعطي الصيدلي وقتاً كافياً للتصرف
       // (إرجاع للمذخر، تخفيض سعر، أو سحب من الرف) قبل انتهاء الصلاحية فعلياً
       final expiredData = await db.getExpiredMedicines(widget.pharmacyId, daysAhead: 90);
-      final lowStockData = await db.getLowStockMedicines(widget.pharmacyId, limit: 10);
+      final lowStockData = await db.getLowStockMedicines(widget.pharmacyId);
 
       setState(() {
         _totalMedicines = medicinesCount;

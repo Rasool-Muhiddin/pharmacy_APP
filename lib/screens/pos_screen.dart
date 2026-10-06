@@ -630,7 +630,7 @@ class _PosScreenState extends State<PosScreen> {
                     itemBuilder: (context, index) {
                       final med = _filteredSuggestions[index];
                       final qty = _sellableQty(med);
-                      final lowStock = qty <= 5;
+                      final lowStock = qty <= kLowStockThreshold;
                       final barcode = (med['barcode'] ?? '').toString();
                       return ListTile(
                         dense: true,

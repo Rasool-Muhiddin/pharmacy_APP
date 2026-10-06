@@ -495,7 +495,7 @@ void main() {
       await raw.close();
 
       final db = await helper.database; // v11 -> v12
-      expect(await db.getVersion(), 12);
+      expect(await db.getVersion(), 13);
       final after = {for (final s in await helper.getSuppliersWithFinancials(1)) s['id'] as int: s};
       for (final sid in [1, 2, 3]) {
         expect((after[sid]!['balance'] as num).toDouble(), closeTo(before[sid]!, 0.001), reason: 'supplier $sid');
