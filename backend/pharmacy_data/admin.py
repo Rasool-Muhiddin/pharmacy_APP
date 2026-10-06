@@ -7,7 +7,11 @@ from .models import (
     InvoiceItem,
     Medicine,
     PurchaseInvoice,
+    PurchaseInvoiceItem,
     PurchaseInvoiceReturn,
+    PurchaseInvoiceReturnItem,
+    SupplierCreditApplication,
+    SupplierRefund,
     StockTransfer,
     Supplier,
     SupplierPayment,
@@ -55,16 +59,46 @@ class PurchaseInvoiceReturnInline(admin.TabularInline):
     """يُظهر كل مرتجع يخص فاتورة الشراء مباشرة تحتها — مفيد للتحقق من دقة الترحيل."""
     model = PurchaseInvoiceReturn
     extra = 0
-    fields = ("amount_returned", "notes", "returned_at")
+    fields = ("amount_returned", "excess_credit", "notes", "returned_at")
+
+
+class PurchaseInvoiceItemInline(admin.TabularInline):
+    """أصناف قائمة المذخر (المدفوع والبونص منفصلان). للعرض فقط: تُنشأ من المخزون."""
+    model = PurchaseInvoiceItem
+    extra = 0
+    can_delete = False
+    fields = ("trade_name", "medicine", "quantity", "bonus_quantity", "buy_price", "effective_unit_cost", "sell_price", "expiry_date", "line_total")
+    readonly_fields = fields
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+class SupplierCreditApplicationInline(admin.TabularInline):
+    model = SupplierCreditApplication
+    extra = 0
+    fields = ("amount", "notes", "applied_at")
+    readonly_fields = fields
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(PurchaseInvoice)
 class PurchaseInvoiceAdmin(admin.ModelAdmin):
-    list_display = ("invoice_number", "pharmacy", "supplier", "total_amount", "paid_amount", "created_at")
-    list_filter = ("pharmacy",)
+    list_display = ("invoice_number", "pharmacy", "supplier", "source", "item_count", "invoice_date", "total_amount", "paid_amount", "created_at")
+    list_filter = ("pharmacy", "source")
     search_fields = ("invoice_number", "supplier__name")
     date_hierarchy = "created_at"
-    inlines = (SupplierPaymentInline, PurchaseInvoiceReturnInline)
+    inlines = (PurchaseInvoiceItemInline, SupplierPaymentInline, PurchaseInvoiceReturnInline, SupplierCreditApplicationInline)
+
+
+@admin.register(PurchaseInvoiceItem)
+class PurchaseInvoiceItemAdmin(admin.ModelAdmin):
+    list_display = ("trade_name", "purchase_invoice", "quantity", "bonus_quantity", "buy_price", "effective_unit_cost", "line_total", "expiry_date")
+    list_filter = ("pharmacy",)
+    search_fields = ("trade_name", "purchase_invoice__invoice_number", "purchase_invoice__supplier__name")
 
 
 @admin.register(SupplierPayment)
@@ -74,9 +108,36 @@ class SupplierPaymentAdmin(admin.ModelAdmin):
     search_fields = ("supplier__name", "purchase_invoice__invoice_number")
 
 
+class PurchaseInvoiceReturnItemInline(admin.TabularInline):
+    """أدوية الاسترجاع (الاسترجاعات القديمة بالمبلغ فقط بلا أسطر). للعرض فقط."""
+    model = PurchaseInvoiceReturnItem
+    extra = 0
+    can_delete = False
+    fields = ("trade_name", "medicine", "quantity", "credited_quantity", "unit_return_price", "credit_amount")
+    readonly_fields = fields
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(SupplierCreditApplication)
+class SupplierCreditApplicationAdmin(admin.ModelAdmin):
+    list_display = ("supplier", "purchase_invoice", "amount", "notes", "applied_at")
+    list_filter = ("pharmacy",)
+    search_fields = ("supplier__name", "purchase_invoice__invoice_number")
+
+
+@admin.register(SupplierRefund)
+class SupplierRefundAdmin(admin.ModelAdmin):
+    list_display = ("supplier", "amount", "notes", "received_at")
+    list_filter = ("pharmacy",)
+    search_fields = ("supplier__name",)
+
+
 @admin.register(PurchaseInvoiceReturn)
 class PurchaseInvoiceReturnAdmin(admin.ModelAdmin):
-    list_display = ("supplier", "purchase_invoice", "amount_returned", "returned_at")
+    list_display = ("supplier", "purchase_invoice", "amount_returned", "excess_credit", "returned_at")
+    inlines = (PurchaseInvoiceReturnItemInline,)
     list_filter = ("pharmacy",)
     search_fields = ("supplier__name", "purchase_invoice__invoice_number")
 

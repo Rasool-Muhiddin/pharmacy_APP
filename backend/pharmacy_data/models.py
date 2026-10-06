@@ -112,6 +112,14 @@ class Medicine(models.Model):
         super().save(*args, **kwargs)
 
 
+BATCH_SOURCE_PURCHASE_LIST = "purchase_list"
+BATCH_SOURCE_OPENING_STOCK = "opening_stock"
+BATCH_SOURCE_CHOICES = [
+    (BATCH_SOURCE_PURCHASE_LIST, "قائمة مذخر"),
+    (BATCH_SOURCE_OPENING_STOCK, "رصيد افتتاحي"),
+]
+
+
 class MedicineBatch(models.Model):
     """
     دفعة صلاحية مخفية عن المستخدم (يقابل جدول medicine_batch المحلي). البيع
@@ -125,6 +133,15 @@ class MedicineBatch(models.Model):
     expiry_date = models.DateField(null=True, blank=True)
     purchase_price = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
+    # مصدر الدفعة للتتبّع (إرجاع لمذخر/إيقاف التعامل معه). الدفعات الأقدم من
+    # قوائم المذاخر تبقى فارغة/NULL. SET_NULL: حذف مذخر/فاتورة لا يمس المخزون.
+    source = models.CharField(max_length=20, choices=BATCH_SOURCE_CHOICES, blank=True, default="")
+    supplier = models.ForeignKey(
+        "Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="batches"
+    )
+    purchase_invoice = models.ForeignKey(
+        "PurchaseInvoice", on_delete=models.SET_NULL, null=True, blank=True, related_name="batches"
+    )
 
     class Meta:
         ordering = ["expiry_date", "id"]
@@ -265,6 +282,14 @@ class Supplier(models.Model):
         return self.name
 
 
+PURCHASE_SOURCE_MANUAL = "manual"
+PURCHASE_SOURCE_INVENTORY_LIST = "inventory_list"
+PURCHASE_SOURCE_CHOICES = [
+    (PURCHASE_SOURCE_MANUAL, "يدوية"),
+    (PURCHASE_SOURCE_INVENTORY_LIST, "من قائمة المخزون"),
+]
+
+
 class PurchaseInvoice(models.Model):
     """
     يقابل جدول purchase_invoice المحلي. total_amount وpaid_amount حقلان
@@ -279,6 +304,11 @@ class PurchaseInvoice(models.Model):
     invoice_number = models.CharField(max_length=60, blank=True, default="")
     total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     paid_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    # تاريخ فاتورة المذخر الورقية (قد يختلف عن وقت إدخالها في النظام).
+    invoice_date = models.DateField(null=True, blank=True)
+    # manual = فاتورة قديمة أُدخلت يدوياً بلا أصناف؛ inventory_list = من قائمة المخزون.
+    source = models.CharField(max_length=20, choices=PURCHASE_SOURCE_CHOICES, default=PURCHASE_SOURCE_MANUAL)
+    item_count = models.PositiveIntegerField(default=0)
     # نفس منطق Invoice.created_at أعلاه: default بدل auto_now_add، لتتمكن
     # MigrationViewSet من حفظ تاريخ فاتورة الشراء التاريخي الحقيقي.
     created_at = models.DateTimeField(default=timezone.now)
@@ -288,12 +318,60 @@ class PurchaseInvoice(models.Model):
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["pharmacy", "supplier"])]
         constraints = [
+            # الأرقام المكررة القديمة أُعيدت تسميتها (-2، -3…) في الترحيل 0013.
+            models.UniqueConstraint(
+                fields=["pharmacy", "supplier", "invoice_number"],
+                condition=~models.Q(invoice_number=""),
+                name="unique_purchase_invoice_number_per_supplier",
+            ),
             models.CheckConstraint(condition=models.Q(total_amount__gte=0), name="purchase_invoice_total_gte_0"),
             models.CheckConstraint(condition=models.Q(paid_amount__gte=0), name="purchase_invoice_paid_gte_0"),
         ]
 
     def __str__(self):
         return self.invoice_number or f"PI-{self.pk}"
+
+
+class PurchaseInvoiceItem(models.Model):
+    """
+    سطر من قائمة المذخر (يقابل جدول purchase_invoice_item المحلي).
+    quantity = المدفوع فقط، bonus_quantity = المجاني (بونص) منفصلاً. سطر
+    "مجاني" بالكامل: quantity=0 وbonus_quantity>=1. line_total = quantity ×
+    buy_price (البونص لا يدخل الإجمالي ولا الدين). effective_unit_cost = كلفة
+    الوحدة بعد توزيع البونص (stock.effective_unit_cost).
+    medicine SET_NULL + لقطة trade_name: حذف الدواء لا يمس تاريخ الفاتورة.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="purchase_invoice_items")
+    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name="items")
+    medicine = models.ForeignKey(
+        Medicine, on_delete=models.SET_NULL, null=True, blank=True, related_name="purchase_items"
+    )
+    trade_name = models.CharField(max_length=200)
+    quantity = models.PositiveIntegerField(default=0)
+    bonus_quantity = models.PositiveIntegerField(default=0)
+    buy_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    effective_unit_cost = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    sell_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    expiry_date = models.DateField(null=True, blank=True)
+    line_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(quantity__gt=0) | models.Q(bonus_quantity__gt=0),
+                name="purchase_invoice_item_qty_gt_0",
+            ),
+            models.CheckConstraint(condition=models.Q(line_total__gte=0), name="purchase_invoice_item_total_gte_0"),
+        ]
+
+    @property
+    def is_free(self):
+        return self.quantity == 0
+
+    def __str__(self):
+        return f"{self.trade_name} x{self.quantity}+{self.bonus_quantity}"
 
 
 class SupplierPayment(models.Model):
@@ -375,16 +453,102 @@ class DamagedMedicine(models.Model):
 
 
 class PurchaseInvoiceReturn(models.Model):
-    """يقابل جدول purchase_invoice_return المحلي."""
+    """
+    يقابل جدول purchase_invoice_return المحلي. amount_returned = قيمة الاسترجاع
+    كاملة (رصيد المرتجع). excess_credit = ما زاد منها على متبقي فاتورتها فذهب
+    لرصيد المذخر (سجلات قديمة: 0). الاسترجاع الجديد بالأصناف له أسطر
+    (items)؛ القديم بالمبلغ فقط بلا أسطر ويبقى صالحاً كما هو.
+    قيمة 0 مسموحة: استرجاع وحدات بونص/مجانية فقط.
+    """
 
     pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="purchase_invoice_returns")
     supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name="returns")
     purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name="returns")
     amount_returned = models.DecimalField(max_digits=14, decimal_places=2)
+    excess_credit = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     notes = models.CharField(max_length=255, blank=True, default="")
     returned_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         constraints = [
-            models.CheckConstraint(condition=models.Q(amount_returned__gt=0), name="purchase_invoice_return_amount_gt_0"),
+            models.CheckConstraint(condition=models.Q(amount_returned__gte=0), name="purchase_invoice_return_amount_gte_0"),
+            models.CheckConstraint(
+                condition=models.Q(excess_credit__gte=0) & models.Q(excess_credit__lte=models.F("amount_returned")),
+                name="purchase_invoice_return_excess_valid",
+            ),
+        ]
+
+
+class PurchaseInvoiceReturnItem(models.Model):
+    """
+    سطر استرجاع (دواء) من سطر فاتورة شراء. credited_quantity = الوحدات المحسوبة
+    من الوحدات المدفوعة (البونص/المجاني بلا رصيد)؛ credit_amount =
+    credited_quantity × unit_return_price. medicine SET_NULL + لقطة الاسم.
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="purchase_return_items")
+    purchase_return = models.ForeignKey(PurchaseInvoiceReturn, on_delete=models.CASCADE, related_name="items")
+    purchase_invoice_item = models.ForeignKey(
+        PurchaseInvoiceItem, on_delete=models.CASCADE, related_name="return_items"
+    )
+    medicine = models.ForeignKey(
+        Medicine, on_delete=models.SET_NULL, null=True, blank=True, related_name="purchase_return_items"
+    )
+    trade_name = models.CharField(max_length=200)
+    quantity = models.PositiveIntegerField()
+    credited_quantity = models.PositiveIntegerField(default=0)
+    unit_return_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    credit_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(quantity__gt=0), name="purchase_return_item_qty_gt_0"),
+            models.CheckConstraint(
+                condition=models.Q(credited_quantity__lte=models.F("quantity")),
+                name="purchase_return_item_credited_lte_qty",
+            ),
+            models.CheckConstraint(condition=models.Q(credit_amount__gte=0), name="purchase_return_item_credit_gte_0"),
+        ]
+
+    def __str__(self):
+        return f"{self.trade_name} x{self.quantity}"
+
+
+class SupplierCreditApplication(models.Model):
+    """
+    استخدام رصيد المذخر (لصالح الصيدلية) لتخفيض متبقي فاتورة شراء ("خصم من رصيد
+    سابق"). حركة غير نقدية: تنقل المال من الرصيد إلى الفاتورة ولا تغيّر رصيد
+    المذخر الإجمالي (راجع supplier_ledger).
+    """
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="supplier_credit_applications")
+    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name="credit_applications")
+    purchase_invoice = models.ForeignKey(
+        PurchaseInvoice, on_delete=models.CASCADE, related_name="credit_applications"
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    notes = models.CharField(max_length=255, blank=True, default="")
+    applied_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["applied_at", "id"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="supplier_credit_application_amount_gt_0"),
+        ]
+
+
+class SupplierRefund(models.Model):
+    """أموال استلمتها الصيدلية من المذخر مقابل رصيدها لديه ("استلام أموال من المذخر")."""
+
+    pharmacy = models.ForeignKey(Pharmacy, on_delete=models.CASCADE, related_name="supplier_refunds")
+    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name="refunds")
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    notes = models.CharField(max_length=255, blank=True, default="")
+    received_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["received_at", "id"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="supplier_refund_amount_gt_0"),
         ]

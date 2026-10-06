@@ -201,9 +201,15 @@ class RegressionTests(TestCase):
     def test_purchase_invoice_rejects_overpayment(self):
         from pharmacy_data.models import Supplier
         supplier = Supplier.objects.create(pharmacy=self.pharmacy, name="S")
-        r = self.api("post", "/api/purchase-invoices/", {"supplier": supplier.id, "total_amount": "100", "paid_amount": "150"})
-        self.assertEqual(r.status_code, 400, r.content)
+        # الإنشاء اليدوي أُزيل: الفواتير تأتي حصراً من قوائم المخزون.
         r = self.api("post", "/api/purchase-invoices/", {"supplier": supplier.id, "total_amount": "100", "paid_amount": "40"})
+        self.assertEqual(r.status_code, 405, r.content)
+        line = {"trade_name": "B", "quantity": 1, "buy_price": "100", "sell_price": "150", "expiry_date": "2030-01-01"}
+        body = {"supplier": supplier.id, "invoice_number": "X1", "items": [line], "paid_amount": "150"}
+        r = self.api("post", "/api/purchase-invoices/from-list/", body)
+        self.assertEqual(r.status_code, 400, r.content)
+        body["paid_amount"] = "40"
+        r = self.api("post", "/api/purchase-invoices/from-list/", body)
         self.assertEqual(r.status_code, 201, r.content)
 
     def test_migration_tolerates_duplicate_barcodes(self):

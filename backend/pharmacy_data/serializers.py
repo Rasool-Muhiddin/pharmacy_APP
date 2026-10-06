@@ -11,6 +11,8 @@ from .models import (
     Medicine,
     MedicineBatch,
     PurchaseInvoice,
+    PurchaseInvoiceItem,
+    PurchaseInvoiceReturnItem,
     StockTransfer,
     Supplier,
     Warehouse,
@@ -93,11 +95,27 @@ class StockTransferInputSerializer(serializers.Serializer):
 
 
 class MedicineBatchSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
-    owner_only_fields = ("purchase_price",)
+    owner_only_fields = ("purchase_price", "supplier_name", "purchase_invoice_number")
+    # مصدر الدفعة للتتبّع: اسم المذخر ورقم فاتورته (أو "رصيد افتتاحي" عبر source).
+    supplier_name = serializers.CharField(source="supplier.name", default=None, read_only=True)
+    purchase_invoice_number = serializers.CharField(
+        source="purchase_invoice.invoice_number", default=None, read_only=True
+    )
 
     class Meta:
         model = MedicineBatch
-        fields = ["id", "quantity", "expiry_date", "purchase_price", "created_at"]
+        fields = [
+            "id",
+            "quantity",
+            "expiry_date",
+            "purchase_price",
+            "created_at",
+            "source",
+            "supplier",
+            "supplier_name",
+            "purchase_invoice",
+            "purchase_invoice_number",
+        ]
         read_only_fields = fields
 
 
@@ -302,17 +320,151 @@ class SupplierSummarySerializer(serializers.Serializer):
     invoice_count = serializers.IntegerField()
     total_purchases = serializers.DecimalField(max_digits=14, decimal_places=2)
     remaining_debt = serializers.DecimalField(max_digits=14, decimal_places=2)
+    # رصيد المذخر الموحّد (موجب دين، سالب لصالح الصيدلية)، ورصيد الصيدلية لديه،
+    # والمتاح منه للاستخدام/الاستلام (supplier_ledger).
+    balance = serializers.DecimalField(max_digits=14, decimal_places=2)
+    credit_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
+    available_credit = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class PurchaseListItemInputSerializer(serializers.Serializer):
+    """سطر واحد من قائمة المذخر/الرصيد الافتتاحي (التحقق التجاري في purchase_list)."""
+
+    medicine_id = serializers.IntegerField(required=False, allow_null=True)
+    trade_name = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
+    scientific_name = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
+    category = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
+    barcode = serializers.CharField(max_length=64, required=False, allow_blank=True, allow_null=True, default=None)
+    shelf_location = serializers.CharField(max_length=120, required=False, allow_blank=True, default="")
+    quantity = serializers.IntegerField(min_value=0, default=0)
+    bonus_quantity = serializers.IntegerField(min_value=0, default=0)
+    is_free = serializers.BooleanField(default=False)
+    buy_price = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, required=False, allow_null=True)
+    sell_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    expiry_date = serializers.DateField(required=False, allow_null=True)
+
+    def to_internal_value(self, data):
+        # تاريخ فارغ = غير محدد (يُرفض لاحقاً برسالة "يرجى تحديد تاريخ الانتهاء" للسطر).
+        if isinstance(data, dict) and data.get("expiry_date") == "":
+            data = {**data, "expiry_date": None}
+        return super().to_internal_value(data)
+
+
+class OpeningStockInputSerializer(serializers.Serializer):
+    """بيانات الدخل لـ POST /api/medicines/opening-stock/."""
+
+    warehouse = serializers.IntegerField(required=False, allow_null=True)
+    items = PurchaseListItemInputSerializer(many=True)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("لا يمكن حفظ قائمة بلا أصناف.")
+        return value
+
+
+class PurchaseListInputSerializer(OpeningStockInputSerializer):
+    """بيانات الدخل لـ POST /api/purchase-invoices/from-list/ — لا مجاميع من العميل."""
+
+    supplier = serializers.IntegerField(required=False, allow_null=True)
+    supplier_name = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
+    supplier_phone = serializers.CharField(max_length=30, required=False, allow_blank=True, default="")
+    invoice_number = serializers.CharField(max_length=60, allow_blank=True)
+    invoice_date = serializers.DateField(required=False, allow_null=True)
+    paid_amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=0, required=False, default=0)
+
+
+class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
+    invoice_number = serializers.CharField(source="purchase_invoice.invoice_number", read_only=True)
+    # للاسترجاع: المسترجع سابقاً من السطر، ومخزون الصنف الحالي (null إن حُذف).
+    returned_quantity = serializers.SerializerMethodField()
+    current_stock = serializers.IntegerField(source="medicine.quantity", default=None, read_only=True)
+    invoice_date = serializers.DateField(source="purchase_invoice.invoice_date", read_only=True)
+    invoice_created_at = serializers.DateTimeField(source="purchase_invoice.created_at", read_only=True)
+    is_free = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = PurchaseInvoiceItem
+        fields = [
+            "id",
+            "purchase_invoice",
+            "invoice_number",
+            "invoice_date",
+            "invoice_created_at",
+            "medicine",
+            "trade_name",
+            "quantity",
+            "bonus_quantity",
+            "is_free",
+            "buy_price",
+            "effective_unit_cost",
+            "sell_price",
+            "expiry_date",
+            "line_total",
+            "returned_quantity",
+            "current_stock",
+        ]
+        read_only_fields = fields
+
+    def get_returned_quantity(self, obj):
+        annotated = getattr(obj, "returned_quantity_total", None)
+        if annotated is not None:
+            return annotated
+        return obj.return_items.aggregate(total=Sum("quantity"))["total"] or 0
+
+
+class PurchaseReturnItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PurchaseInvoiceReturnItem
+        fields = [
+            "id",
+            "purchase_invoice_item",
+            "medicine",
+            "trade_name",
+            "quantity",
+            "credited_quantity",
+            "unit_return_price",
+            "credit_amount",
+        ]
+        read_only_fields = fields
+
+
+class ReturnItemLineInputSerializer(serializers.Serializer):
+    purchase_invoice_item = serializers.IntegerField()
+    quantity = serializers.IntegerField(min_value=1)
+    # اختياري: بدونه يُستخدم سعر شراء السطر الأصلي.
+    unit_price = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0, required=False, allow_null=True)
+
+
+class ReturnItemsInputSerializer(serializers.Serializer):
+    """بيانات الدخل لـ POST /api/purchase-invoices/<id>/return-items/ — لا مجاميع من العميل."""
+
+    items = ReturnItemLineInputSerializer(many=True)
+    notes = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    return_date = serializers.DateField(required=False, allow_null=True)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("اختر صنفاً واحداً على الأقل لاسترجاعه.")
+        return value
+
+
+class SupplierRefundInputSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    notes = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    received_date = serializers.DateField(required=False, allow_null=True)
 
 
 class PurchaseInvoiceSerializer(serializers.ModelSerializer):
     """
-    returned_amount/net_amount/remaining_amount محسوبة ديناميكياً من
-    الاسترجاعات المرتبطة (وليست أعمدة مخزَّنة)، لتبقى متسقة دائماً مع
-    آخر حالة فعلية للفاتورة.
+    للقراءة فقط: فواتير الشراء تُنشأ حصراً من قوائم المخزون
+    (PurchaseInvoiceViewSet.from_list). returned_amount/net_amount/
+    remaining_amount محسوبة ديناميكياً من الاسترجاعات المرتبطة (وليست أعمدة
+    مخزَّنة)، لتبقى متسقة دائماً مع آخر حالة فعلية للفاتورة.
     """
 
     returned_amount = serializers.SerializerMethodField()
     net_amount = serializers.SerializerMethodField()
+    credit_applied = serializers.SerializerMethodField()
     remaining_amount = serializers.SerializerMethodField()
 
     class Meta:
@@ -321,46 +473,43 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
             "id",
             "supplier",
             "invoice_number",
+            "invoice_date",
+            "source",
+            "item_count",
             "total_amount",
             "paid_amount",
             "returned_amount",
             "net_amount",
+            "credit_applied",
             "remaining_amount",
             "created_at",
             "updated_at",
         ]
-        # supplier يُحدَّد يدوياً في PurchaseInvoiceViewSet.perform_create بعد
-        # التحقق من ملكيته لصيدلية المستخدم — لا PrimaryKeyRelatedField عام
-        # كان سيسمح نظرياً بأي معرّف مذخر من صيدلية أخرى. total_amount/
-        # paid_amount قابلان للكتابة فقط عند الإنشاء؛ بعد ذلك يتغيران حصراً
-        # عبر add_payment/add_return/settle_credit (انظر views.py).
-        read_only_fields = [
-            "id",
-            "supplier",
-            "returned_amount",
-            "net_amount",
-            "remaining_amount",
-            "created_at",
-            "updated_at",
-        ]
+        read_only_fields = fields
 
-    def validate(self, attrs):
-        total = attrs.get("total_amount", 0)
-        paid = attrs.get("paid_amount", 0)
-        if total < 0 or paid < 0:
-            raise serializers.ValidationError("المبالغ لا يمكن أن تكون سالبة.")
-        if paid > total:
-            raise serializers.ValidationError("المبلغ المدفوع أكبر من إجمالي الفاتورة.")
-        return attrs
+    def _figures(self, obj):
+        # الفواتير من PurchaseInvoiceViewSet مُعلَّمة مسبقاً؛ غيرها يُحسب مرة واحدة.
+        if not hasattr(obj, "returned_on_invoice"):
+            from .supplier_ledger import annotate_invoices
+
+            annotated = annotate_invoices(PurchaseInvoice.objects.filter(pk=obj.pk)).get()
+            for field in ("returned_total", "returned_on_invoice", "applied_in", "linked_paid"):
+                setattr(obj, field, getattr(annotated, field))
+        return obj
 
     def get_returned_amount(self, obj):
-        return obj.returns.aggregate(s=Sum("amount_returned"))["s"] or 0
+        return self._figures(obj).returned_total
 
     def get_net_amount(self, obj):
         return obj.total_amount - self.get_returned_amount(obj)
 
+    def get_credit_applied(self, obj):
+        return self._figures(obj).applied_in
+
     def get_remaining_amount(self, obj):
-        return self.get_net_amount(obj) - obj.paid_amount
+        from .supplier_ledger import remaining_of
+
+        return max(remaining_of(self._figures(obj)), 0)
 
 
 class ExpenseSerializer(serializers.ModelSerializer):

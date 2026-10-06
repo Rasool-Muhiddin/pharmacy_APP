@@ -6,6 +6,9 @@ import 'dart:io';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart' show rootBundle;
 
+import '../models/purchase_list.dart';
+import '../models/purchase_return.dart';
+
 class DatabaseHelper {
   DatabaseHelper._();
 
@@ -110,7 +113,7 @@ Future<Database> _initDatabase() async {
 
   return openDatabase(
     path,
-    version: 10,
+    version: 12,
     onConfigure: (db) async {
       // ترقيات v7 و v9 تعيد بناء جداول (medicine/invoice: DROP + RENAME) وتنقل
       // معرّفات صفوف تشير إليها جداول أخرى. PRAGMA foreign_keys لا يمكن تغييره
@@ -280,10 +283,14 @@ Future<void> _onCreate(Database db, int version) async {
       paid_amount REAL NOT NULL DEFAULT 0,
       remaining_debt REAL NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
+      invoice_date TEXT,
+      source TEXT NOT NULL DEFAULT 'manual',
+      item_count INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
       FOREIGN KEY(supplier_id) REFERENCES pharmacy_supplier(id) ON DELETE CASCADE
     )
   ''');
+  await _createPurchaseInvoiceItemTable(db);
 
   // 11. جدول دفعات تسديد الديون للمذاخر
   await db.execute('''
@@ -301,21 +308,10 @@ Future<void> _onCreate(Database db, int version) async {
     )
   ''');
 
-  // 12. سجل الاسترجاعات الجزئية من فواتير الشراء
-  await db.execute('''
-    CREATE TABLE purchase_invoice_return (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      pharmacy_id INTEGER NOT NULL,
-      supplier_id INTEGER NOT NULL,
-      purchase_invoice_id INTEGER NOT NULL,
-      amount_returned REAL NOT NULL CHECK(amount_returned > 0),
-      notes TEXT,
-      returned_at TEXT NOT NULL,
-      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
-      FOREIGN KEY(supplier_id) REFERENCES pharmacy_supplier(id) ON DELETE CASCADE,
-      FOREIGN KEY(purchase_invoice_id) REFERENCES purchase_invoice(id) ON DELETE CASCADE
-    )
-  ''');
+  // 12. سجل الاسترجاعات من فواتير الشراء + أسطرها، واستخدام رصيد المذخر
+  // والمبالغ المستلمة منه (v12).
+  await _createPurchaseReturnTable(db, 'purchase_invoice_return');
+  await _createSupplierCreditTables(db);
 
   await db.execute('''
     CREATE TABLE expense(
@@ -348,6 +344,7 @@ Future<void> _onCreate(Database db, int version) async {
   await db.execute('CREATE INDEX idx_scientific_name ON medicine(scientific_name);');
   await _createInvoiceIndexes(db);
   await db.execute('CREATE INDEX idx_purchase_invoice_supplier ON purchase_invoice(supplier_id);');
+  await _createPurchaseInvoiceNumberIndex(db);
   await db.execute('CREATE INDEX idx_supplier_payment_supplier ON supplier_payment(supplier_id);');
   await db.execute('CREATE INDEX idx_supplier_payment_invoice ON supplier_payment(purchase_invoice_id);');
   await db.execute('CREATE INDEX idx_purchase_invoice_return_invoice ON purchase_invoice_return(purchase_invoice_id);');
@@ -617,6 +614,259 @@ Future<void> _onUpgrade(
   if (oldVersion < 10) {
     await _upgradeToCostAndBatches(db);
   }
+
+  if (oldVersion < 11) {
+    await _upgradeToPurchaseLists(db);
+  }
+
+  if (oldVersion < 12) {
+    await _upgradeToSupplierCredit(db);
+  }
+}
+
+/// سجل الاسترجاع. amount_returned = قيمة الاسترجاع كاملة (0 مسموح: بونص/مجاني
+/// فقط)، excess_credit = ما زاد على متبقي فاتورته فذهب لرصيد المذخر.
+Future<void> _createPurchaseReturnTable(DatabaseExecutor db, String name) async {
+  await db.execute('''
+    CREATE TABLE $name (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      supplier_id INTEGER NOT NULL,
+      purchase_invoice_id INTEGER NOT NULL,
+      amount_returned REAL NOT NULL CHECK(amount_returned >= 0),
+      excess_credit REAL NOT NULL DEFAULT 0 CHECK(excess_credit >= 0 AND excess_credit <= amount_returned),
+      notes TEXT,
+      returned_at TEXT NOT NULL,
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(supplier_id) REFERENCES pharmacy_supplier(id) ON DELETE CASCADE,
+      FOREIGN KEY(purchase_invoice_id) REFERENCES purchase_invoice(id) ON DELETE CASCADE
+    )
+  ''');
+}
+
+/// أسطر الاسترجاع بالأصناف، استخدام رصيد المذخر ("خصم من رصيد سابق")، والمبالغ
+/// المستلمة منه — نفس PurchaseInvoiceReturnItem/SupplierCreditApplication/SupplierRefund.
+Future<void> _createSupplierCreditTables(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS purchase_invoice_return_item(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      purchase_return_id INTEGER NOT NULL,
+      purchase_invoice_item_id INTEGER NOT NULL,
+      medicine_id INTEGER,
+      trade_name TEXT NOT NULL,
+      quantity INTEGER NOT NULL CHECK(quantity > 0),
+      credited_quantity INTEGER NOT NULL DEFAULT 0 CHECK(credited_quantity >= 0 AND credited_quantity <= quantity),
+      unit_return_price REAL NOT NULL DEFAULT 0,
+      credit_amount REAL NOT NULL DEFAULT 0 CHECK(credit_amount >= 0),
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(purchase_return_id) REFERENCES purchase_invoice_return(id) ON DELETE CASCADE,
+      FOREIGN KEY(purchase_invoice_item_id) REFERENCES purchase_invoice_item(id) ON DELETE CASCADE,
+      FOREIGN KEY(medicine_id) REFERENCES medicine(id) ON DELETE SET NULL
+    )
+  ''');
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS supplier_credit_application(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      supplier_id INTEGER NOT NULL,
+      purchase_invoice_id INTEGER NOT NULL,
+      amount REAL NOT NULL CHECK(amount > 0),
+      notes TEXT,
+      applied_at TEXT NOT NULL,
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(supplier_id) REFERENCES pharmacy_supplier(id) ON DELETE CASCADE,
+      FOREIGN KEY(purchase_invoice_id) REFERENCES purchase_invoice(id) ON DELETE CASCADE
+    )
+  ''');
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS supplier_refund(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      supplier_id INTEGER NOT NULL,
+      amount REAL NOT NULL CHECK(amount > 0),
+      notes TEXT,
+      received_at TEXT NOT NULL,
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(supplier_id) REFERENCES pharmacy_supplier(id) ON DELETE CASCADE
+    )
+  ''');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_return_item_return ON purchase_invoice_return_item(purchase_return_id);');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_return_item_invoice_item ON purchase_invoice_return_item(purchase_invoice_item_id);');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_credit_application_invoice ON supplier_credit_application(purchase_invoice_id);');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_credit_application_supplier ON supplier_credit_application(supplier_id);');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_supplier_refund_supplier ON supplier_refund(supplier_id);');
+}
+
+/// v12: استرجاع الأصناف ورصيد المذخر. يُعاد بناء purchase_invoice_return (قيد
+/// CHECK أصبح >= 0 + عمود excess_credit) بنفس المعرّفات والبيانات، ثم المتبقي
+/// السالب القديم يصبح رصيداً (نفس ترحيل 0016) — رصيد كل مذخر لا يتغير.
+Future<void> _upgradeToSupplierCredit(DatabaseExecutor db) async {
+  await _createPurchaseReturnTable(db, 'purchase_invoice_return_v12');
+  await db.execute('''
+    INSERT INTO purchase_invoice_return_v12
+      (id, pharmacy_id, supplier_id, purchase_invoice_id, amount_returned, excess_credit, notes, returned_at)
+    SELECT id, pharmacy_id, supplier_id, purchase_invoice_id, amount_returned, 0, notes, returned_at
+    FROM purchase_invoice_return
+  ''');
+  await db.execute('DROP TABLE purchase_invoice_return;');
+  await db.execute('ALTER TABLE purchase_invoice_return_v12 RENAME TO purchase_invoice_return;');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_purchase_invoice_return_invoice ON purchase_invoice_return(purchase_invoice_id);');
+  await _createSupplierCreditTables(db);
+  await _convertLegacyNegativeRemainders(db);
+  await db.rawUpdate('UPDATE purchase_invoice SET remaining_debt = MAX(0, ${invoiceRemainingSql('purchase_invoice')})');
+}
+
+/// المتبقي السالب القديم ← excess_credit على أحدث استرجاعات الفاتورة، ثم يسدّد
+/// فواتير المذخر الأخرى المفتوحة (الأقدم أولاً)، والباقي رصيد لصالح الصيدلية.
+Future<void> _convertLegacyNegativeRemainders(DatabaseExecutor db) async {
+  final now = DateTime.now().toIso8601String();
+  final suppliers = await db.rawQuery('SELECT DISTINCT supplier_id FROM purchase_invoice');
+  for (final s in suppliers) {
+    final supplierId = s['supplier_id'] as int;
+    final invoices =
+        await db.query('purchase_invoice', where: 'supplier_id = ?', whereArgs: [supplierId], orderBy: 'created_at, id');
+    for (final invoice in invoices) {
+      var need = roundMoney(-await _invoiceRemaining(db, invoice['id'] as int));
+      if (need <= 0) continue;
+      var excess = need;
+      final returns = await db.query('purchase_invoice_return',
+          where: 'purchase_invoice_id = ?', whereArgs: [invoice['id']], orderBy: 'returned_at DESC, id DESC');
+      for (final ret in returns) {
+        if (need <= 0) break;
+        final current = (ret['excess_credit'] as num).toDouble();
+        final room = (ret['amount_returned'] as num).toDouble() - current;
+        final take = need < room ? need : room;
+        if (take > 0) {
+          await db.update('purchase_invoice_return', {'excess_credit': roundMoney(current + take)},
+              where: 'id = ?', whereArgs: [ret['id']]);
+          need = roundMoney(need - take);
+        }
+      }
+      // need > 0 هنا = متبقٍّ سالب ليس من استرجاع (بيانات شاذة): يُترك كما هو.
+      excess = roundMoney(excess - need);
+      for (final other in invoices) {
+        if (excess <= 0) break;
+        if (other['id'] == invoice['id']) continue;
+        final open = await _invoiceRemaining(db, other['id'] as int);
+        if (open > 0) {
+          final amount = roundMoney(excess < open ? excess : open);
+          await db.insert('supplier_credit_application', {
+            'pharmacy_id': other['pharmacy_id'],
+            'supplier_id': supplierId,
+            'purchase_invoice_id': other['id'],
+            'amount': amount,
+            'notes': SupplierCreditNote.legacy,
+            'applied_at': now,
+          });
+          excess = roundMoney(excess - amount);
+        }
+      }
+    }
+  }
+}
+
+/// v11: قوائم المذاخر من المخزون — أصناف فاتورة الشراء (مع البونص منفصلاً)،
+/// وربط كل دفعة بمذخرها وفاتورتها (أو "رصيد افتتاحي"). الدفعات والفواتير
+/// القديمة تبقى بلا ربط (NULL / 'manual'). أرقام الفواتير المكررة لنفس المذخر
+/// تُعاد تسميتها (-2، -3…) قبل فهرس الفرادة — بلا حذف أي سجل (نفس ترحيل 0013).
+Future<void> _upgradeToPurchaseLists(DatabaseExecutor db) async {
+  // medicine_batch قد يكون أُنشئ للتو بشكله الكامل (ترقية من < 10).
+  await _addColumnIfMissing(db, 'medicine_batch', 'source', 'TEXT');
+  await _addColumnIfMissing(
+      db, 'medicine_batch', 'supplier_id', 'INTEGER REFERENCES pharmacy_supplier(id) ON DELETE SET NULL');
+  await _addColumnIfMissing(
+      db, 'medicine_batch', 'purchase_invoice_id', 'INTEGER REFERENCES purchase_invoice(id) ON DELETE SET NULL');
+  await _addColumnIfMissing(db, 'medicine_batch', 'supplier_name', 'TEXT');
+  await _addColumnIfMissing(db, 'medicine_batch', 'invoice_number', 'TEXT');
+  await _addColumnIfMissing(db, 'purchase_invoice', 'invoice_date', 'TEXT');
+  await _addColumnIfMissing(db, 'purchase_invoice', 'source', "TEXT NOT NULL DEFAULT 'manual'");
+  await _addColumnIfMissing(db, 'purchase_invoice', 'item_count', 'INTEGER NOT NULL DEFAULT 0');
+  await _createPurchaseInvoiceItemTable(db);
+  await _dedupePurchaseInvoiceNumbers(db);
+  await _createPurchaseInvoiceNumberIndex(db);
+}
+
+Future<void> _addColumnIfMissing(DatabaseExecutor db, String table, String column, String definition) async {
+  final columns = await db.rawQuery('PRAGMA table_info($table)');
+  if (columns.any((c) => c['name'] == column)) return;
+  await db.execute('ALTER TABLE $table ADD COLUMN $column $definition;');
+}
+
+/// سطر من قائمة المذخر. quantity = المدفوع، bonus_quantity = المجاني منفصلاً
+/// (سطر مجاني بالكامل: quantity = 0). medicine_id SET NULL + لقطة trade_name:
+/// حذف الصنف لا يمس تاريخ الفاتورة (نفس PurchaseInvoiceItem على الخادم).
+Future<void> _createPurchaseInvoiceItemTable(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS purchase_invoice_item(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pharmacy_id INTEGER NOT NULL,
+      purchase_invoice_id INTEGER NOT NULL,
+      medicine_id INTEGER,
+      trade_name TEXT NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+      bonus_quantity INTEGER NOT NULL DEFAULT 0 CHECK(bonus_quantity >= 0),
+      buy_price REAL NOT NULL DEFAULT 0,
+      effective_unit_cost REAL NOT NULL DEFAULT 0,
+      sell_price REAL NOT NULL DEFAULT 0,
+      expiry_date TEXT,
+      line_total REAL NOT NULL DEFAULT 0 CHECK(line_total >= 0),
+      CHECK(quantity > 0 OR bonus_quantity > 0),
+      FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
+      FOREIGN KEY(purchase_invoice_id) REFERENCES purchase_invoice(id) ON DELETE CASCADE,
+      FOREIGN KEY(medicine_id) REFERENCES medicine(id) ON DELETE SET NULL
+    )
+  ''');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_purchase_invoice_item_invoice ON purchase_invoice_item(purchase_invoice_id);');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_purchase_invoice_item_medicine ON purchase_invoice_item(medicine_id);');
+}
+
+/// رقم فاتورة المذخر فريد لنفس المذخر (الفارغ مستثنى) — مقابل قيد
+/// unique_purchase_invoice_number_per_supplier على الخادم.
+Future<void> _createPurchaseInvoiceNumberIndex(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_invoice_number_supplier
+    ON purchase_invoice(pharmacy_id, supplier_id, invoice_number)
+    WHERE invoice_number IS NOT NULL AND invoice_number != ''
+  ''');
+}
+
+Future<void> _dedupePurchaseInvoiceNumbers(DatabaseExecutor db) async {
+  final groups = await db.rawQuery('''
+    SELECT pharmacy_id, supplier_id, invoice_number FROM purchase_invoice
+    WHERE invoice_number IS NOT NULL AND invoice_number != ''
+    GROUP BY pharmacy_id, supplier_id, invoice_number HAVING COUNT(*) > 1
+  ''');
+  for (final group in groups) {
+    final number = group['invoice_number'] as String;
+    final taken = (await db.rawQuery(
+      'SELECT invoice_number FROM purchase_invoice WHERE pharmacy_id = ? AND supplier_id = ?',
+      [group['pharmacy_id'], group['supplier_id']],
+    ))
+        .map((r) => r['invoice_number'])
+        .toSet();
+    final duplicates = await db.rawQuery('''
+      SELECT id FROM purchase_invoice
+      WHERE pharmacy_id = ? AND supplier_id = ? AND invoice_number = ?
+      ORDER BY created_at ASC, id ASC
+    ''', [group['pharmacy_id'], group['supplier_id'], number]);
+    var suffix = 2;
+    for (final row in duplicates.skip(1)) {
+      while (taken.contains('$number-$suffix')) {
+        suffix++;
+      }
+      final renamed = '$number-$suffix';
+      taken.add(renamed);
+      await db.update('purchase_invoice', {'invoice_number': renamed}, where: 'id = ?', whereArgs: [row['id']]);
+    }
+  }
 }
 
 /// v10: تتبّع الربح — avg_cost للدواء، unit_cost لسطر البيع، total_cost
@@ -636,6 +886,9 @@ Future<void> _upgradeToCostAndBatches(DatabaseExecutor db) async {
 
 /// دفعات الصلاحية المخفية: مجموع quantity = medicine.quantity دائماً.
 /// server_id: معرّف الدفعة على الخادم لصفوف كاش الأونلاين (NULL للمحلية).
+/// مصدر الدفعة (v11): source = purchase_list / opening_stock (NULL للأقدم)،
+/// supplier_id/purchase_invoice_id للدفعات المحلية فقط؛ صفوف كاش الخادم لا
+/// تملك مذخراً/فاتورة محليين فتحمل الاسم والرقم نصاً (supplier_name/invoice_number).
 Future<void> _createMedicineBatchTable(DatabaseExecutor db) async {
   await db.execute('''
     CREATE TABLE medicine_batch(
@@ -646,7 +899,14 @@ Future<void> _createMedicineBatchTable(DatabaseExecutor db) async {
       purchase_price REAL,
       created_at TEXT NOT NULL,
       server_id INTEGER,
-      FOREIGN KEY(medicine_id) REFERENCES medicine(id) ON DELETE CASCADE
+      source TEXT,
+      supplier_id INTEGER,
+      purchase_invoice_id INTEGER,
+      supplier_name TEXT,
+      invoice_number TEXT,
+      FOREIGN KEY(medicine_id) REFERENCES medicine(id) ON DELETE CASCADE,
+      FOREIGN KEY(supplier_id) REFERENCES pharmacy_supplier(id) ON DELETE SET NULL,
+      FOREIGN KEY(purchase_invoice_id) REFERENCES purchase_invoice(id) ON DELETE SET NULL
     )
   ''');
   await db.execute('CREATE INDEX idx_medicine_batch_medicine ON medicine_batch(medicine_id, expiry_date);');
@@ -931,6 +1191,9 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     required int quantity,
     String? expiryDate,
     double? purchasePrice,
+    String? source,
+    int? supplierId,
+    int? purchaseInvoiceId,
   }) async {
     await txn.insert('medicine_batch', {
       'medicine_id': medicineId,
@@ -938,26 +1201,32 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       'expiry_date': (expiryDate == null || expiryDate.trim().isEmpty) ? null : expiryDate.trim(),
       'purchase_price': roundCost(purchasePrice),
       'created_at': DateTime.now().toIso8601String(),
+      'source': source,
+      'supplier_id': supplierId,
+      'purchase_invoice_id': purchaseInvoiceId,
     });
     await _refreshMedicineStock(txn, medicineId);
   }
 
   /// يخصم [quantity] بترتيب FEFO (الأقرب انتهاءً أولاً، بلا تاريخ أخيراً) مع
   /// التقسيم بين الدفعات، ويحذف المستنفدة. [sellableOnly] (البيع) يتجاهل
-  /// الدفعات المنتهية. يرجع الأجزاء المأخوذة (لنقلها كما هي بين المخازن).
+  /// الدفعات المنتهية. يرجع الأجزاء المأخوذة بمصدرها (لنقلها كما هي بين المخازن).
   Future<List<Map<String, Object?>>> _deductFefo(
     DatabaseExecutor txn,
     int medicineId,
     int quantity, {
     required bool sellableOnly,
+    int? preferInvoiceId,
   }) async {
     final medicine = await _medicineRow(txn, medicineId);
     await _reconcileBatches(txn, medicine);
+    // استرجاع لمذخر ([preferInvoiceId]): دفعات تلك الفاتورة أولاً ثم FEFO.
     final batches = await txn.rawQuery('''
       SELECT * FROM medicine_batch b
       WHERE b.medicine_id = ? AND b.quantity > 0 ${sellableOnly ? 'AND $_sellableBatch' : ''}
-      ORDER BY (b.expiry_date IS NULL OR b.expiry_date = '') ASC, b.expiry_date ASC, b.id ASC
-    ''', [medicineId]);
+      ORDER BY ${preferInvoiceId != null ? 'CASE WHEN b.purchase_invoice_id = ? THEN 0 ELSE 1 END ASC,' : ''}
+               (b.expiry_date IS NULL OR b.expiry_date = '') ASC, b.expiry_date ASC, b.id ASC
+    ''', [medicineId, if (preferInvoiceId != null) preferInvoiceId]);
 
     var remaining = quantity;
     final taken = <Map<String, Object?>>[];
@@ -965,7 +1234,17 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       if (remaining == 0) break;
       final batchQty = batch['quantity'] as int;
       final part = batchQty < remaining ? batchQty : remaining;
-      taken.add({'quantity': part, 'expiry_date': batch['expiry_date'], 'purchase_price': batch['purchase_price']});
+      taken.add({
+        'quantity': part,
+        'expiry_date': batch['expiry_date'],
+        'purchase_price': batch['purchase_price'],
+        // مصدر الدفعة ينتقل معها (التتبّع للمذخر/الفاتورة يبقى بعد النقل).
+        'source': batch['source'],
+        'supplier_id': batch['supplier_id'],
+        'purchase_invoice_id': batch['purchase_invoice_id'],
+        'supplier_name': batch['supplier_name'],
+        'invoice_number': batch['invoice_number'],
+      });
       remaining -= part;
       if (part == batchQty) {
         await txn.delete('medicine_batch', where: 'id = ?', whereArgs: [batch['id']]);
@@ -1065,13 +1344,21 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     };
   }
 
-  /// دفعات الصنف المتوفرة (الأقرب انتهاءً أولاً) — لعرض تفاصيلها عند النقر.
+  /// دفعات الصنف المتوفرة (الأقرب انتهاءً أولاً) — لعرض تفاصيلها عند النقر،
+  /// مع مصدرها: supplier_name/invoice_number من المذخر والفاتورة المحليين، أو
+  /// النص المخزّن لصفوف كاش الخادم، وsource ('opening_stock' = رصيد افتتاحي).
   Future<List<Map<String, dynamic>>> getMedicineBatches(int medicineId) async {
     final db = await database;
     return db.rawQuery('''
-      SELECT * FROM medicine_batch
-      WHERE medicine_id = ? AND quantity > 0
-      ORDER BY (expiry_date IS NULL OR expiry_date = '') ASC, expiry_date ASC, id ASC
+      SELECT b.id, b.medicine_id, b.quantity, b.expiry_date, b.purchase_price, b.created_at,
+             b.server_id, b.source, b.supplier_id, b.purchase_invoice_id,
+             COALESCE(s.name, b.supplier_name) AS supplier_name,
+             COALESCE(pi.invoice_number, b.invoice_number) AS invoice_number
+      FROM medicine_batch b
+      LEFT JOIN pharmacy_supplier s ON s.id = b.supplier_id
+      LEFT JOIN purchase_invoice pi ON pi.id = b.purchase_invoice_id
+      WHERE b.medicine_id = ? AND b.quantity > 0
+      ORDER BY (b.expiry_date IS NULL OR b.expiry_date = '') ASC, b.expiry_date ASC, b.id ASC
     ''', [medicineId]);
   }
 
@@ -1342,10 +1629,8 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       }
       for (final part in moved) {
         await txn.insert('medicine_batch', {
+          ...part,
           'medicine_id': targetId,
-          'quantity': part['quantity'],
-          'expiry_date': part['expiry_date'],
-          'purchase_price': part['purchase_price'],
           'created_at': DateTime.now().toIso8601String(),
         });
       }
@@ -1595,8 +1880,18 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         'purchase_price': _parseServerDecimalOrNull(raw['purchase_price']),
         'created_at': (raw['created_at'] as String?) ?? DateTime.now().toIso8601String(),
         'server_id': (raw['id'] as num?)?.toInt(),
+        // تتبّع المصدر نصاً: supplier_id/purchase_invoice_id المحليان لا
+        // يقابلان معرّفات الخادم (والمذاخر غير مخزّنة محلياً أونلاين).
+        'source': _nonEmpty(raw['source']),
+        'supplier_name': _nonEmpty(raw['supplier_name']),
+        'invoice_number': _nonEmpty(raw['purchase_invoice_number']),
       });
     }
+  }
+
+  static String? _nonEmpty(dynamic value) {
+    final text = value?.toString().trim() ?? '';
+    return text.isEmpty ? null : text;
   }
 
   double? _parseServerDecimalOrNull(dynamic value) {
@@ -2259,30 +2554,75 @@ Future<double> totalSalesToday(int pharmacyId) async {
     if (purchasePrice != null && purchasePrice <= 0) throw StateError('سعر الشراء يجب أن يكون أكبر من صفر.');
     final db = await database;
     await db.transaction((txn) async {
-      final medicine = await _medicineRow(txn, medicineId);
-      await _reconcileBatches(txn, medicine);
-      final oldAvg = (medicine['avg_cost'] as num?)?.toDouble();
-      final cost = purchasePrice ?? oldAvg;
-      if (cost == null) {
-        throw StateError('سعر الشراء مطلوب لأن كلفة هذا الصنف غير معروفة بعد.');
-      }
-      await txn.update(
-        'medicine',
-        {
-          'avg_cost': weightedAverageCost(
-            oldQty: (medicine['quantity'] as num).toInt(),
-            oldAvg: oldAvg,
-            newQty: addedQuantity,
-            newCost: cost,
-          ),
-          'buy_price': roundMoney(cost),
-          'sell_price': roundMoney(salePrice),
-        },
-        where: 'id = ?',
-        whereArgs: [medicineId],
+      await _supplyInTxn(
+        txn,
+        medicineId: medicineId,
+        paidQuantity: addedQuantity,
+        expiryDate: newExpiryDate,
+        purchasePrice: purchasePrice,
+        salePrice: salePrice,
       );
-      await _addBatch(txn, medicineId: medicineId, quantity: addedQuantity, expiryDate: newExpiryDate, purchasePrice: cost);
     });
+  }
+
+  /// توريد شحنة داخل معاملة قائمة (نفس stock.supply في الخادم حرفياً):
+  /// متوسط مرجّح + سعر بيع موحّد جديد + دفعة جديدة.
+  ///
+  /// [paidQuantity] = المدفوع، [bonusQuantity] = المجاني فوقه؛ الدفعة = المجموع
+  /// بكلفة effectiveUnitCost. paidQuantity == 0 = سطر مجاني بالكامل: كلفة 0
+  /// معروفة تدخل المتوسط، وbuy_price الحالي لا يتغير. [salePrice] null يُبقي
+  /// سعر البيع الحالي. [allowUnknownCost] (رصيد افتتاحي بسعر شراء 0): كلفة
+  /// مجهولة لا ترفض التوريد، فالدفعة بلا كلفة ولا يتغير avg_cost.
+  /// يرجع كلفة وحدة الدفعة (null = غير معروفة).
+  Future<double?> _supplyInTxn(
+    DatabaseExecutor txn, {
+    required int medicineId,
+    required int paidQuantity,
+    int bonusQuantity = 0,
+    String? expiryDate,
+    double? purchasePrice,
+    double? salePrice,
+    bool allowUnknownCost = false,
+    String? source,
+    int? supplierId,
+    int? purchaseInvoiceId,
+  }) async {
+    final medicine = await _medicineRow(txn, medicineId);
+    await _reconcileBatches(txn, medicine);
+    final oldAvg = (medicine['avg_cost'] as num?)?.toDouble();
+    final total = paidQuantity + bonusQuantity;
+    final double? cost = paidQuantity == 0 ? 0 : (purchasePrice ?? oldAvg);
+    if (cost == null && !allowUnknownCost) {
+      throw StateError('سعر الشراء مطلوب لأن كلفة هذا الصنف غير معروفة بعد.');
+    }
+    final unitCost = cost == null
+        ? null
+        : effectiveUnitCost(paidQty: paidQuantity, bonusQty: bonusQuantity, buyPrice: cost);
+    final values = <String, Object?>{
+      if (unitCost != null)
+        'avg_cost': weightedAverageCost(
+          oldQty: (medicine['quantity'] as num).toInt(),
+          oldAvg: oldAvg,
+          newQty: total,
+          newCost: unitCost,
+        ),
+      if (paidQuantity > 0 && cost != null) 'buy_price': roundMoney(cost),
+      if (salePrice != null) 'sell_price': roundMoney(salePrice),
+    };
+    if (values.isNotEmpty) {
+      await txn.update('medicine', values, where: 'id = ?', whereArgs: [medicineId]);
+    }
+    await _addBatch(
+      txn,
+      medicineId: medicineId,
+      quantity: total,
+      expiryDate: expiryDate,
+      purchasePrice: unitCost,
+      source: source,
+      supplierId: supplierId,
+      purchaseInvoiceId: purchaseInvoiceId,
+    );
+    return roundCost(unitCost);
   }
 
   /// 2. عملية إتلاف دواء متكاملة (خصم من المخزن + إضافة سجل في جدول التوالف في حركة واحدة)
@@ -2339,113 +2679,459 @@ Future<double> totalSalesToday(int pharmacyId) async {
 // 1️⃣ إدارة قائمة المذاخر وملخص الحسابات المالية
 //====================================================
 
-/// جلب جميع المذاخر مع حساب (إجمالي المشتريات) و(إجمالي الديون الحالية) لكل مذخر تلقائياً
+/// متبقي فاتورة شراء كتعبير SQL ([alias] اسم/اسم مستعار جدول purchase_invoice):
+/// الإجمالي − المدفوع − (المرتجع − فائضه الذاهب لرصيد المذخر) − الرصيد المستخدم لها.
+/// نفس supplier_ledger.remaining_of في الخادم.
+static String invoiceRemainingSql(String alias) => '''
+  ($alias.total_amount - $alias.paid_amount
+    - COALESCE((SELECT SUM(r.amount_returned - r.excess_credit) FROM purchase_invoice_return r
+                WHERE r.purchase_invoice_id = $alias.id), 0.0)
+    - COALESCE((SELECT SUM(a.amount) FROM supplier_credit_application a
+                WHERE a.purchase_invoice_id = $alias.id), 0.0))''';
+
+Future<double> _invoiceRemaining(DatabaseExecutor db, int invoiceId) async {
+  final rows = await db.rawQuery(
+      'SELECT ${invoiceRemainingSql('pi')} AS remaining FROM purchase_invoice pi WHERE pi.id = ?', [invoiceId]);
+  return roundMoney((rows.first['remaining'] as num).toDouble());
+}
+
+/// حسابات المذاخر الموحّدة (نفس supplier_ledger.supplier_figures في الخادم):
+///   balance = الفواتير − المدفوع − المرتجعات + المستلم من المذخر − دفعات قديمة غير مرتبطة
+///     (موجب = دين على الصيدلية، سالب = رصيد لصالحها)
+///   رصيد الصيدلية لديه = فائض المرتجعات − الرصيد المستخدم − المستلم
+///   available_credit = ما يمكن استخدامه/استلامه منه.
+/// مجموع debt_added في كشف الحساب = balance دائماً.
+Future<List<Map<String, dynamic>>> _supplierFigures(DatabaseExecutor db, int pharmacyId, {int? supplierId}) async {
+  final rows = await db.rawQuery('''
+    SELECT s.id, s.pharmacy_id, s.name, s.phone, s.created_at,
+      (SELECT COUNT(*) FROM purchase_invoice pi WHERE pi.supplier_id = s.id) AS invoice_count,
+      COALESCE((SELECT SUM(pi.total_amount) FROM purchase_invoice pi WHERE pi.supplier_id = s.id), 0.0) AS invoice_total,
+      COALESCE((SELECT SUM(pi.paid_amount) FROM purchase_invoice pi WHERE pi.supplier_id = s.id), 0.0) AS paid,
+      COALESCE((SELECT SUM(r.amount_returned) FROM purchase_invoice_return r
+                JOIN purchase_invoice pi ON pi.id = r.purchase_invoice_id WHERE pi.supplier_id = s.id), 0.0) AS returned,
+      COALESCE((SELECT SUM(r.excess_credit) FROM purchase_invoice_return r
+                JOIN purchase_invoice pi ON pi.id = r.purchase_invoice_id WHERE pi.supplier_id = s.id), 0.0) AS excess,
+      COALESCE((SELECT SUM(a.amount) FROM supplier_credit_application a WHERE a.supplier_id = s.id), 0.0) AS applied,
+      COALESCE((SELECT SUM(f.amount) FROM supplier_refund f WHERE f.supplier_id = s.id), 0.0) AS refunds,
+      -- دفعات قديمة غير مرتبطة بفاتورة تبقى محسوبة للحفاظ على البيانات السابقة.
+      COALESCE((SELECT SUM(sp.amount_paid) FROM supplier_payment sp
+                WHERE sp.supplier_id = s.id AND sp.purchase_invoice_id IS NULL), 0.0) AS unlinked_paid
+    FROM pharmacy_supplier s
+    WHERE s.pharmacy_id = ? ${supplierId != null ? 'AND s.id = ?' : ''}
+    ORDER BY s.name ASC
+  ''', [pharmacyId, if (supplierId != null) supplierId]);
+
+  double n(Object? v) => (v as num).toDouble();
+  return rows.map((row) {
+    final balance = roundMoney(
+        n(row['invoice_total']) - n(row['paid']) - n(row['returned']) + n(row['refunds']) - n(row['unlinked_paid']));
+    final bucket = roundMoney(n(row['excess']) - n(row['applied']) - n(row['refunds']));
+    final credit = balance < 0 ? -balance : 0.0;
+    final available = bucket < credit ? bucket : credit;
+    return <String, dynamic>{
+      'id': row['id'],
+      'pharmacy_id': row['pharmacy_id'],
+      'name': row['name'],
+      'phone': row['phone'],
+      'created_at': row['created_at'],
+      'invoice_count': row['invoice_count'],
+      'total_purchases': roundMoney(n(row['invoice_total']) - n(row['returned'])),
+      'remaining_debt': balance > 0 ? balance : 0.0,
+      'balance': balance,
+      'credit_balance': credit,
+      'available_credit': available > 0 ? available : 0.0,
+    };
+  }).toList();
+}
+
+/// جلب جميع المذاخر مع إجمالي المشتريات والدين ورصيد الصيدلية لدى كل مذخر.
 Future<List<Map<String, dynamic>>> getSuppliersWithFinancials(int pharmacyId) async {
   final db = await database;
-  return await db.rawQuery('''
-    SELECT 
-      s.id,
-      s.pharmacy_id,
-      s.name,
-      s.phone,
-      s.created_at,
-      
-      (SELECT COUNT(*) FROM purchase_invoice pi WHERE pi.supplier_id = s.id)
-        AS invoice_count,
+  return _supplierFigures(db, pharmacyId);
+}
 
-      -- إجمالي الشراء بعد طرح الاسترجاعات الجزئية
-      COALESCE(
-        (SELECT SUM(pi.total_amount - COALESCE((
-           SELECT SUM(pir.amount_returned)
-           FROM purchase_invoice_return pir
-           WHERE pir.purchase_invoice_id = pi.id
-         ), 0.0))
-         FROM purchase_invoice pi
-         WHERE pi.supplier_id = s.id),
-        0.0
-      ) AS total_purchases,
+Future<Map<String, dynamic>> _supplierFiguresFor(DatabaseExecutor db, int supplierId) async {
+  final supplier = await db.query('pharmacy_supplier', where: 'id = ?', whereArgs: [supplierId], limit: 1);
+  if (supplier.isEmpty) throw const PurchaseListException('المذخر غير موجود.');
+  return (await _supplierFigures(db, supplier.first['pharmacy_id'] as int, supplierId: supplierId)).single;
+}
 
-      -- الدفعات المرتبطة بالفاتورة تضاف إلى paid_amount.
-      -- الدفعات القديمة غير المرتبطة تبقى محسوبة هنا للحفاظ على البيانات السابقة.
-      MAX(0.0,
-        COALESCE(
-          (SELECT SUM(
-            pi.total_amount -
-            COALESCE((SELECT SUM(pir.amount_returned)
-                      FROM purchase_invoice_return pir
-                      WHERE pir.purchase_invoice_id = pi.id), 0.0) -
-            pi.paid_amount
-          )
-           FROM purchase_invoice pi
-           WHERE pi.supplier_id = s.id),
-          0.0
-        ) -
-        COALESCE(
-          (SELECT SUM(sp.amount_paid) 
-           FROM supplier_payment sp
-           WHERE sp.supplier_id = s.id
-             AND sp.purchase_invoice_id IS NULL),
-          0.0
-        )
-      ) AS remaining_debt
+/// عمود remaining_debt المخزَّن (للتوافق) = المتبقي الموحّد لكل فاتورة.
+Future<void> _refreshRemainingDebt(DatabaseExecutor db, int supplierId) async {
+  await db.rawUpdate(
+    'UPDATE purchase_invoice SET remaining_debt = MAX(0, ${invoiceRemainingSql('purchase_invoice')}) WHERE supplier_id = ?',
+    [supplierId],
+  );
+}
 
-    FROM pharmacy_supplier s
-    WHERE s.pharmacy_id = ?
-    ORDER BY s.name ASC
-  ''', [pharmacyId]);
+/// يسجّل استخدام رصيد المذخر لتخفيض متبقي فاتورة (حركة غير نقدية).
+Future<double> _applySupplierCredit(
+  DatabaseExecutor db, {
+  required int pharmacyId,
+  required int supplierId,
+  required int invoiceId,
+  required double amount,
+  required String notes,
+  required String when,
+}) async {
+  final value = roundMoney(amount);
+  if (value <= 0) return 0;
+  await db.insert('supplier_credit_application', {
+    'pharmacy_id': pharmacyId,
+    'supplier_id': supplierId,
+    'purchase_invoice_id': invoiceId,
+    'amount': value,
+    'notes': notes,
+    'applied_at': when,
+  });
+  return value;
 }
 
 //====================================================
 // 2️⃣ تسجيل فواتير الشراء والتوريد (Purchase Invoices)
 //====================================================
 
-/// تسجيل فاتورة شراء جديدة من مذخر
-Future<int> insertPurchaseInvoice(Map<String, dynamic> data) async {
+/// إدخال قائمة مذخر (أو رصيد افتتاحي) كاملة في معاملة واحدة — نسخة
+/// أوفلاين من POST /api/purchase-invoices/from-list/ و /api/medicines/opening-stock/
+/// (backend/pharmacy_data/purchase_list.py) بنفس الترتيب والقواعد:
+///   1. المذخر (بالمعرّف، أو بنفس الاسم، أو يُنشأ) ← 2. فاتورة الشراء ←
+///   3. لكل سطر: توريد لصنف موجود في المخزن (نفس الباركود أو نفس الاسم
+///   التجاري) أو إنشاء صنف جديد، بدفعة مرتبطة بالمذخر والفاتورة ←
+///   4. الدفعة الأولية الاختيارية.
+/// الرصيد الافتتاحي: نفس الأسطر بلا مذخر ولا فاتورة ولا دفعة ولا دين.
+/// الكل أو لا شيء: أي خطأ يرمي [PurchaseListException] (line = رقم السطر)
+/// ويُلغي المعاملة كاملة. المجاميع تُحسب هنا فقط.
+///
+/// [items]: مفاتيح الخادم نفسها (medicine_id?, trade_name, scientific_name,
+/// category, barcode, shelf_location, quantity, bonus_quantity, is_free,
+/// buy_price, sell_price, expiry_date). يرجع purchase_invoice_id (null
+/// للرصيد الافتتاحي) وsupplier_id وmedicine_ids.
+Future<Map<String, dynamic>> createPurchaseList({
+  required int pharmacyId,
+  required PurchaseListMode mode,
+  required int warehouseId,
+  required List<Map<String, dynamic>> items,
+  int? supplierId,
+  String? supplierName,
+  String? supplierPhone,
+  String? invoiceNumber,
+  String? invoiceDate,
+  double paidAmount = 0,
+}) async {
+  if (items.isEmpty) throw const PurchaseListException('لا يمكن حفظ قائمة بلا أصناف.');
+  final isSupplierList = mode == PurchaseListMode.supplierList;
   final db = await database;
-  
-  // حساب الدين المتبقي للفاتورة تلقائياً لتجنب الأخطاء البرمجية
-  final double totalAmount = (data['total_amount'] as num?)?.toDouble() ?? 0.0;
-  final double paidAmount = (data['paid_amount'] as num?)?.toDouble() ?? 0.0;
-  
-  if (paidAmount > totalAmount) {
-    throw ArgumentError('المبلغ المدفوع لا يمكن أن يتجاوز مبلغ الفاتورة.');
-  }
+  final now = DateTime.now().toIso8601String();
 
-  final Map<String, dynamic> invoiceData = Map.from(data);
-  invoiceData['remaining_debt'] = totalAmount - paidAmount;
-  
-  if (!invoiceData.containsKey('created_at') || invoiceData['created_at'] == null) {
-    invoiceData['created_at'] = DateTime.now().toIso8601String();
-  }
+  return db.transaction((txn) async {
+    await txn.insert(
+      'pharmacy_branch',
+      {'id': pharmacyId, 'name': 'الفرع الرئيسي', 'is_active': 1, 'created_at': now},
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+    final warehouse = await txn.query('warehouses',
+        where: 'id = ? AND pharmacy_id = ?', whereArgs: [warehouseId, pharmacyId], limit: 1);
+    if (warehouse.isEmpty) throw const PurchaseListException('المخزن غير موجود في هذه الصيدلية.');
 
-  return await db.insert(
-    'purchase_invoice',
-    invoiceData,
-    conflictAlgorithm: ConflictAlgorithm.abort,
-  );
+    int? resolvedSupplierId;
+    int? purchaseInvoiceId;
+    var availableCredit = 0.0;
+    if (isSupplierList) {
+      resolvedSupplierId = await _resolveSupplier(txn, pharmacyId, supplierId, supplierName, supplierPhone, now);
+      // الرصيد المتاح يُقرأ قبل إنشاء الفاتورة الجديدة (إجماليها يرفع رصيد المذخر).
+      availableCredit = ((await _supplierFiguresFor(txn, resolvedSupplierId))['available_credit'] as num).toDouble();
+      final number = (invoiceNumber ?? '').trim();
+      if (number.isEmpty) throw const PurchaseListException('رقم فاتورة المذخر مطلوب.');
+      final duplicate = await txn.query('purchase_invoice',
+          where: 'pharmacy_id = ? AND supplier_id = ? AND invoice_number = ?',
+          whereArgs: [pharmacyId, resolvedSupplierId, number],
+          limit: 1);
+      if (duplicate.isNotEmpty) {
+        throw PurchaseListException('رقم الفاتورة $number مسجّل مسبقاً لهذا المذخر.');
+      }
+      purchaseInvoiceId = await txn.insert('purchase_invoice', {
+        'pharmacy_id': pharmacyId,
+        'supplier_id': resolvedSupplierId,
+        'invoice_number': number,
+        'invoice_date': invoiceDate,
+        'source': PurchaseInvoiceSource.inventoryList,
+        'created_at': now,
+      });
+    }
+
+    final medicineIds = <int>{};
+    var total = 0.0;
+    for (var index = 0; index < items.length; index++) {
+      final line = items[index];
+      final medicineId = await _receivePurchaseLine(
+        txn,
+        index: index,
+        line: line,
+        mode: mode,
+        pharmacyId: pharmacyId,
+        warehouseId: warehouseId,
+        supplierId: resolvedSupplierId,
+        purchaseInvoiceId: purchaseInvoiceId,
+        onReceived: (medicine, paidQty, bonusQty, buyPrice, unitCost) async {
+          if (purchaseInvoiceId == null) return;
+          final amount = purchaseLineTotal(paidQty: paidQty, buyPrice: buyPrice);
+          total += amount;
+          await txn.insert('purchase_invoice_item', {
+            'pharmacy_id': pharmacyId,
+            'purchase_invoice_id': purchaseInvoiceId,
+            'medicine_id': medicine['id'],
+            'trade_name': medicine['trade_name'],
+            'quantity': paidQty,
+            'bonus_quantity': bonusQty,
+            'buy_price': roundMoney(buyPrice),
+            'effective_unit_cost': unitCost ?? 0,
+            'sell_price': medicine['sell_price'],
+            'expiry_date': _blankToNull(line['expiry_date']),
+            'line_total': amount,
+          });
+        },
+      );
+      medicineIds.add(medicineId);
+    }
+
+    if (purchaseInvoiceId != null) {
+      total = roundMoney(total);
+      // رصيد المذخر لصالح الصيدلية يُخصم أولاً حتى إجمالي الفاتورة، ثم "المدفوع الآن".
+      final creditApplied = roundMoney(availableCredit < total ? availableCredit : total);
+      final paid = roundMoney(paidAmount);
+      if (paid < 0) throw const PurchaseListException('المبلغ المدفوع لا يمكن أن يكون سالباً.');
+      if (paid > roundMoney(total - creditApplied)) {
+        throw PurchaseListException(creditApplied > 0
+            ? 'المبلغ المدفوع أكبر من المتبقي بعد الخصم من رصيد المذخر السابق.'
+            : 'المبلغ المدفوع أكبر من إجمالي الفاتورة.');
+      }
+      await txn.update(
+        'purchase_invoice',
+        {'total_amount': total, 'paid_amount': paid, 'item_count': items.length},
+        where: 'id = ?',
+        whereArgs: [purchaseInvoiceId],
+      );
+      await _applySupplierCredit(txn,
+          pharmacyId: pharmacyId,
+          supplierId: resolvedSupplierId!,
+          invoiceId: purchaseInvoiceId,
+          amount: creditApplied,
+          notes: SupplierCreditNote.previous,
+          when: now);
+      if (paid > 0) {
+        await txn.insert('supplier_payment', {
+          'pharmacy_id': pharmacyId,
+          'supplier_id': resolvedSupplierId,
+          'purchase_invoice_id': purchaseInvoiceId,
+          'amount_paid': paid,
+          'notes': 'دفعة عند استلام القائمة',
+          'paid_at': now,
+        });
+      }
+      await _refreshRemainingDebt(txn, resolvedSupplierId);
+    }
+
+    return {
+      'purchase_invoice_id': purchaseInvoiceId,
+      'supplier_id': resolvedSupplierId,
+      'medicine_ids': medicineIds.toList(),
+    };
+  });
 }
 
-/// جلب فواتير الشراء الخاصة بمذخر معين
+static String? _blankToNull(dynamic value) {
+  final text = value?.toString().trim() ?? '';
+  return text.isEmpty ? null : text;
+}
+
+/// مذخر موجود بالمعرّف، أو بنفس الاسم (تفادياً للتكرار)، أو يُنشأ جديداً.
+Future<int> _resolveSupplier(
+  DatabaseExecutor txn,
+  int pharmacyId,
+  int? supplierId,
+  String? name,
+  String? phone,
+  String now,
+) async {
+  if (supplierId != null) {
+    final rows = await txn.query('pharmacy_supplier',
+        where: 'id = ? AND pharmacy_id = ?', whereArgs: [supplierId, pharmacyId], limit: 1);
+    if (rows.isEmpty) throw const PurchaseListException('المذخر غير موجود في هذه الصيدلية.');
+    return supplierId;
+  }
+  final trimmed = (name ?? '').trim();
+  if (trimmed.isEmpty) throw const PurchaseListException('يرجى اختيار المذخر أو كتابة اسم مذخر جديد.');
+  final existing = await txn.query('pharmacy_supplier',
+      where: 'pharmacy_id = ? AND name = ? COLLATE NOCASE', whereArgs: [pharmacyId, trimmed], limit: 1);
+  if (existing.isNotEmpty) return existing.first['id'] as int;
+  return txn.insert('pharmacy_supplier', {
+    'pharmacy_id': pharmacyId,
+    'name': trimmed,
+    'phone': (phone ?? '').trim(),
+    'created_at': now,
+  });
+}
+
+/// الصنف الموجود في نفس المخزن لسطر القائمة: بالمعرّف إن أُرسل، وإلا نفس
+/// الباركود، وإلا نفس الاسم التجاري (بلا حساسية لحالة الأحرف). null = صنف جديد.
+/// نفس find_existing_medicine في الخادم — تستخدمه النافذة أيضاً لشارة "صنف موجود".
+Future<Map<String, Object?>?> findPurchaseListMedicine({
+  required int warehouseId,
+  int? medicineId,
+  String? barcode,
+  required String tradeName,
+  DatabaseExecutor? executor,
+}) async {
+  final txn = executor ?? await database;
+  if (medicineId != null) {
+    final rows =
+        await txn.query('medicine', where: 'id = ? AND warehouse_id = ?', whereArgs: [medicineId, warehouseId], limit: 1);
+    return rows.isEmpty ? null : rows.first;
+  }
+  final code = (barcode ?? '').trim();
+  if (code.isNotEmpty) {
+    final rows =
+        await txn.query('medicine', where: 'warehouse_id = ? AND barcode = ?', whereArgs: [warehouseId, code], limit: 1);
+    if (rows.isNotEmpty) return rows.first;
+  }
+  final name = tradeName.trim();
+  if (name.isEmpty) return null;
+  final rows = await txn.query('medicine',
+      where: 'warehouse_id = ? AND trade_name = ? COLLATE NOCASE',
+      whereArgs: [warehouseId, name],
+      orderBy: 'id ASC',
+      limit: 1);
+  return rows.isEmpty ? null : rows.first;
+}
+
+/// يورّد سطراً واحداً (صنف موجود أو جديد) ويرجع معرّف الصنف. [onReceived]
+/// يُستدعى بعد التوريد لكتابة سطر الفاتورة.
+Future<int> _receivePurchaseLine(
+  DatabaseExecutor txn, {
+  required int index,
+  required Map<String, dynamic> line,
+  required PurchaseListMode mode,
+  required int pharmacyId,
+  required int warehouseId,
+  required int? supplierId,
+  required int? purchaseInvoiceId,
+  required Future<void> Function(Map<String, Object?> medicine, int paidQty, int bonusQty, double buyPrice, double? unitCost)
+      onReceived,
+}) async {
+  final tradeName = (line['trade_name'] ?? '').toString().trim();
+  final barcode = _blankToNull(line['barcode']);
+  final requestedId = line['medicine_id'] == null ? null : lineInt(line['medicine_id']);
+  if (tradeName.isEmpty && requestedId == null) {
+    throw PurchaseListException('يرجى إدخال اسم الصنف.', line: index);
+  }
+  var medicine = await findPurchaseListMedicine(
+    warehouseId: warehouseId,
+    medicineId: requestedId,
+    barcode: barcode,
+    tradeName: tradeName,
+    executor: txn,
+  );
+  if (requestedId != null && medicine == null) {
+    throw PurchaseListException('الصنف المحدد غير موجود في هذا المخزن.', line: index);
+  }
+  final isNew = medicine == null;
+  final error = validatePurchaseLine(line, mode, isNew: isNew);
+  if (error != null) throw PurchaseListException(error, line: index);
+
+  final isSupplierList = mode == PurchaseListMode.supplierList;
+  final isFree = isSupplierList && line['is_free'] == true;
+  final paidQty = isFree ? 0 : lineInt(line['quantity']);
+  final bonusQty = isSupplierList ? lineInt(line['bonus_quantity']) : 0;
+  final buyPrice = isFree ? 0.0 : (lineNum(line['buy_price']) ?? 0);
+  final sellPrice = lineNum(line['sell_price']);
+  // رصيد افتتاحي بسعر شراء 0 = كلفة غير معروفة (نفس قاعدة إضافة الصنف القديمة).
+  final unknownCost = !isSupplierList && buyPrice == 0;
+
+  try {
+    final medicineId = isNew
+        ? await txn.insert('medicine', {
+            'pharmacy_id': pharmacyId,
+            'warehouse_id': warehouseId,
+            'trade_name': tradeName,
+            'scientific_name': (line['scientific_name'] ?? '').toString().trim(),
+            'category': (line['category'] ?? '').toString().trim(),
+            'quantity': 0,
+            'buy_price': roundMoney(buyPrice),
+            'sell_price': roundMoney(sellPrice!),
+            'shelf_location': (line['shelf_location'] ?? '').toString().trim(),
+            'is_damaged': 0,
+            'barcode': barcode,
+          })
+        : medicine['id'] as int;
+    final unitCost = await _supplyInTxn(
+      txn,
+      medicineId: medicineId,
+      paidQuantity: paidQty,
+      bonusQuantity: bonusQty,
+      expiryDate: _blankToNull(line['expiry_date']),
+      purchasePrice: unknownCost ? null : buyPrice,
+      salePrice: sellPrice,
+      allowUnknownCost: unknownCost,
+      source: isSupplierList ? BatchSource.purchaseList : BatchSource.openingStock,
+      supplierId: supplierId,
+      purchaseInvoiceId: purchaseInvoiceId,
+    );
+    medicine = await _medicineRow(txn, medicineId);
+    await onReceived(medicine, paidQty, bonusQty, buyPrice, unitCost);
+    return medicineId;
+  } on StateError catch (e) {
+    throw PurchaseListException(e.message, line: index);
+  } on DatabaseException catch (e) {
+    if (e.isUniqueConstraintError()) {
+      throw PurchaseListException('هذا الباركود مستخدم لصنف آخر في نفس المخزن.', line: index);
+    }
+    rethrow;
+  }
+}
+
+/// أصناف فاتورة شراء (فارغة للفواتير اليدوية القديمة).
+/// مع المسترجع من كل سطر (returned_quantity) ومخزون صنفه الحالي (current_stock،
+/// NULL إن حُذف الصنف) — لنافذة الأصناف والاسترجاع.
+Future<List<Map<String, dynamic>>> getPurchaseInvoiceItems(int purchaseInvoiceId) async {
+  final db = await database;
+  return db.rawQuery('''
+    SELECT pii.*, pi.invoice_number, pi.invoice_date, pi.created_at AS invoice_created_at,
+           COALESCE((SELECT SUM(ri.quantity) FROM purchase_invoice_return_item ri
+                     WHERE ri.purchase_invoice_item_id = pii.id), 0) AS returned_quantity,
+           m.quantity AS current_stock
+    FROM purchase_invoice_item pii
+    JOIN purchase_invoice pi ON pi.id = pii.purchase_invoice_id
+    LEFT JOIN medicine m ON m.id = pii.medicine_id
+    WHERE pii.purchase_invoice_id = ?
+    ORDER BY pii.id ASC
+  ''', [purchaseInvoiceId]);
+}
+
+/// الأصناف المشتراة من مذخر عبر كل فواتيره (أحدث الفواتير أولاً) — لكشف الحساب.
+Future<List<Map<String, dynamic>>> getSupplierPurchasedItems(int supplierId) async {
+  final db = await database;
+  return db.rawQuery('''
+    SELECT pii.*, pi.invoice_number, pi.invoice_date, pi.created_at AS invoice_created_at
+    FROM purchase_invoice_item pii
+    JOIN purchase_invoice pi ON pi.id = pii.purchase_invoice_id
+    WHERE pi.supplier_id = ?
+    ORDER BY pi.created_at DESC, pii.id ASC
+  ''', [supplierId]);
+}
+
+/// جلب فواتير الشراء الخاصة بمذخر معين (المتبقي بالصيغة الموحّدة، لا يقل عن 0).
 Future<List<Map<String, dynamic>>> getPurchaseInvoicesBySupplier(int supplierId) async {
   final db = await database;
   return await db.rawQuery('''
     SELECT
       pi.*,
-      COALESCE((
-        SELECT SUM(pir.amount_returned)
-        FROM purchase_invoice_return pir
-        WHERE pir.purchase_invoice_id = pi.id
-      ), 0.0) AS returned_amount,
-      pi.total_amount - COALESCE((
-        SELECT SUM(pir.amount_returned)
-        FROM purchase_invoice_return pir
-        WHERE pir.purchase_invoice_id = pi.id
-      ), 0.0) AS net_amount,
-      pi.total_amount - COALESCE((
-        SELECT SUM(pir.amount_returned)
-        FROM purchase_invoice_return pir
-        WHERE pir.purchase_invoice_id = pi.id
-      ), 0.0) - pi.paid_amount AS remaining_amount
+      COALESCE((SELECT SUM(pir.amount_returned) FROM purchase_invoice_return pir
+                WHERE pir.purchase_invoice_id = pi.id), 0.0) AS returned_amount,
+      pi.total_amount - COALESCE((SELECT SUM(pir.amount_returned) FROM purchase_invoice_return pir
+                                  WHERE pir.purchase_invoice_id = pi.id), 0.0) AS net_amount,
+      COALESCE((SELECT SUM(a.amount) FROM supplier_credit_application a
+                WHERE a.purchase_invoice_id = pi.id), 0.0) AS credit_applied,
+      MAX(0.0, ${invoiceRemainingSql('pi')}) AS remaining_amount
     FROM purchase_invoice pi
     WHERE pi.supplier_id = ?
     ORDER BY pi.created_at DESC
@@ -2454,10 +3140,10 @@ Future<List<Map<String, dynamic>>> getPurchaseInvoicesBySupplier(int supplierId)
 
 
 //====================================================
-// 3️⃣ تسديد الديون وكشف حساب المذخر (Payments & Ledger)
+// 3️⃣ تسديد الديون، الاسترجاع، رصيد المذخر، وكشف الحساب
 //====================================================
 
-/// إضافة دفعة لفاتورة شراء محددة، مع تحديث المدفوع والمتبقي في نفس العملية.
+/// إضافة دفعة لفاتورة شراء محددة (لا تتجاوز متبقيها الموحّد).
 Future<int> addPurchaseInvoicePayment({
   required int pharmacyId,
   required int supplierId,
@@ -2471,30 +3157,12 @@ Future<int> addPurchaseInvoicePayment({
 
   final db = await database;
   return db.transaction((txn) async {
-    final invoices = await txn.rawQuery('''
-      SELECT
-        pi.total_amount,
-        pi.paid_amount,
-        COALESCE((
-          SELECT SUM(pir.amount_returned)
-          FROM purchase_invoice_return pir
-          WHERE pir.purchase_invoice_id = pi.id
-        ), 0.0) AS returned_amount
-      FROM purchase_invoice pi
-      WHERE pi.id = ? AND pi.supplier_id = ? AND pi.pharmacy_id = ?
-    ''', [purchaseInvoiceId, supplierId, pharmacyId]);
-
+    final invoices = await txn.query('purchase_invoice',
+        where: 'id = ? AND supplier_id = ? AND pharmacy_id = ?', whereArgs: [purchaseInvoiceId, supplierId, pharmacyId]);
     if (invoices.isEmpty) {
       throw StateError('فاتورة الشراء غير موجودة.');
     }
-
-    final invoice = invoices.first;
-    final total = (invoice['total_amount'] as num).toDouble();
-    final paid = (invoice['paid_amount'] as num).toDouble();
-    final returned = (invoice['returned_amount'] as num).toDouble();
-    final outstanding = total - returned - paid;
-
-    if (amount > outstanding) {
+    if (roundMoney(amount) > await _invoiceRemaining(txn, purchaseInvoiceId)) {
       throw ArgumentError('مبلغ الدفعة أكبر من المتبقي لهذه الفاتورة.');
     }
 
@@ -2502,90 +3170,213 @@ Future<int> addPurchaseInvoicePayment({
       'pharmacy_id': pharmacyId,
       'supplier_id': supplierId,
       'purchase_invoice_id': purchaseInvoiceId,
-      'amount_paid': amount,
+      'amount_paid': roundMoney(amount),
       'notes': notes?.trim(),
       'paid_at': DateTime.now().toIso8601String(),
     });
-
-    final newPaid = paid + amount;
-    await txn.update(
-      'purchase_invoice',
-      {
-        'paid_amount': newPaid,
-        'remaining_debt': (total - returned - newPaid).clamp(0.0, double.infinity),
-      },
-      where: 'id = ?',
-      whereArgs: [purchaseInvoiceId],
-    );
+    await txn.rawUpdate('UPDATE purchase_invoice SET paid_amount = paid_amount + ? WHERE id = ?',
+        [roundMoney(amount), purchaseInvoiceId]);
+    await _refreshRemainingDebt(txn, supplierId);
     return paymentId;
   });
 }
 
-/// تسجيل استرجاع جزئي من فاتورة شراء بدون حذف أو إلغاء الفاتورة.
-Future<int> addPurchaseInvoiceReturn({
-  required int pharmacyId,
-  required int supplierId,
-  required int purchaseInvoiceId,
-  required double amount,
-  String? notes,
-}) async {
-  if (amount <= 0) {
-    throw ArgumentError('يجب أن يكون مبلغ الاسترجاع أكبر من صفر.');
-  }
+/// تاريخ الحركة: اليوم (أو null) = الآن، تاريخ سابق = منتصف ذلك اليوم، المستقبل مرفوض.
+static String _movementMoment(DateTime? day) {
+  final now = DateTime.now();
+  if (day == null) return now.toIso8601String();
+  final today = DateTime(now.year, now.month, now.day);
+  final date = DateTime(day.year, day.month, day.day);
+  if (date == today) return now.toIso8601String();
+  if (date.isAfter(today)) throw const PurchaseListException('لا يمكن تسجيل حركة بتاريخ مستقبلي.');
+  return DateTime(date.year, date.month, date.day, 12).toIso8601String();
+}
 
+/// استرجاع أدوية للمذخر من فاتورة شراء (نسخة أوفلاين من
+/// POST /api/purchase-invoices/{id}/return-items/، backend/pharmacy_data/purchase_returns.py):
+/// لكل سطر: الحد = min(المتبقي من السطر، المخزون الحالي)، الرصيد للوحدات المدفوعة
+/// فقط × سعر الاسترجاع (افتراضياً سعر الشراء). المخزون يُخصم من دفعات الفاتورة
+/// أولاً ثم FEFO، وavg_cost لا يتغير. الرصيد يخفّض متبقي الفاتورة، والفائض يسدّد
+/// فواتير المذخر الأخرى (الأقدم أولاً) ثم يبقى رصيداً لصالح الصيدلية.
+/// الكل أو لا شيء؛ أخطاء الأسطر ترمي [PurchaseListException] (line = السطر).
+///
+/// [lines]: [{purchase_invoice_item_id, quantity, unit_price?}].
+Future<Map<String, dynamic>> returnPurchaseItems({
+  required int pharmacyId,
+  required int purchaseInvoiceId,
+  required List<Map<String, dynamic>> lines,
+  String? notes,
+  DateTime? returnDate,
+}) async {
+  if (lines.isEmpty) throw const PurchaseListException('اختر صنفاً واحداً على الأقل لاسترجاعه.');
+  final returnedAt = _movementMoment(returnDate);
   final db = await database;
   return db.transaction((txn) async {
-    final invoices = await txn.rawQuery('''
-      SELECT
-        pi.total_amount,
-        pi.paid_amount,
-        COALESCE((
-          SELECT SUM(pir.amount_returned)
-          FROM purchase_invoice_return pir
-          WHERE pir.purchase_invoice_id = pi.id
-        ), 0.0) AS returned_amount
-      FROM purchase_invoice pi
-      WHERE pi.id = ? AND pi.supplier_id = ? AND pi.pharmacy_id = ?
-    ''', [purchaseInvoiceId, supplierId, pharmacyId]);
-
-    if (invoices.isEmpty) {
-      throw StateError('فاتورة الشراء غير موجودة.');
-    }
-
+    final invoices = await txn.query('purchase_invoice',
+        where: 'id = ? AND pharmacy_id = ?', whereArgs: [purchaseInvoiceId, pharmacyId], limit: 1);
+    if (invoices.isEmpty) throw const PurchaseListException('فاتورة الشراء غير موجودة.');
     final invoice = invoices.first;
-    final total = (invoice['total_amount'] as num).toDouble();
-    final paid = (invoice['paid_amount'] as num).toDouble();
-    final alreadyReturned = (invoice['returned_amount'] as num).toDouble();
+    final supplierId = invoice['supplier_id'] as int;
 
-    if (alreadyReturned + amount > total) {
-      throw ArgumentError('مجموع الاسترجاعات لا يمكن أن يتجاوز مبلغ الفاتورة الأصلي.');
+    final seen = <int>{};
+    final prepared = <Map<String, Object?>>[];
+    final medicineIds = <int>{};
+    var totalCredit = 0.0;
+    for (var index = 0; index < lines.length; index++) {
+      final line = lines[index];
+      final itemId = lineInt(line['purchase_invoice_item_id']);
+      if (!seen.add(itemId)) throw PurchaseListException('هذا الصنف مكرر في طلب الاسترجاع.', line: index);
+      final items = await txn.query('purchase_invoice_item',
+          where: 'id = ? AND purchase_invoice_id = ?', whereArgs: [itemId, purchaseInvoiceId], limit: 1);
+      if (items.isEmpty) throw PurchaseListException('هذا الصنف ليس من أصناف الفاتورة.', line: index);
+      final item = items.first;
+      final medicineId = item['medicine_id'] as int?;
+      if (medicineId == null) {
+        throw PurchaseListException('الصنف ${item['trade_name']} حُذف من المخزون ولا يمكن استرجاعه.', line: index);
+      }
+      final medicine = await _medicineRow(txn, medicineId);
+      final quantity = lineInt(line['quantity']);
+      final paidQty = item['quantity'] as int;
+      final already = Sqflite.firstIntValue(await txn.rawQuery(
+              'SELECT COALESCE(SUM(quantity), 0) FROM purchase_invoice_return_item WHERE purchase_invoice_item_id = ?',
+              [itemId])) ??
+          0;
+      final stock = (medicine['quantity'] as num).toInt();
+      final boughtLeft = paidQty + (item['bonus_quantity'] as int) - already;
+      final limit = returnableQuantity(
+          paidQty: paidQty, bonusQty: item['bonus_quantity'] as int, alreadyReturned: already, currentStock: stock);
+      if (quantity < 1) throw PurchaseListException('الكمية المسترجعة يجب أن تكون 1 على الأقل.', line: index);
+      if (quantity > limit) {
+        throw PurchaseListException(
+          'أقصى كمية يمكن استرجاعها من ${item['trade_name']} هي $limit '
+          '(المتبقي من الفاتورة ${boughtLeft < 0 ? 0 : boughtLeft}، المتوفر بالمخزون $stock).',
+          line: index,
+        );
+      }
+      final price = lineNum(line['unit_price']) ?? (item['buy_price'] as num).toDouble();
+      if (price < 0) throw PurchaseListException('سعر الاسترجاع لا يمكن أن يكون سالباً.', line: index);
+      final credited = creditedUnits(paidQty: paidQty, alreadyReturned: already, quantity: quantity);
+      final credit = roundMoney(credited * price);
+      try {
+        await _deductFefo(txn, medicineId, quantity, sellableOnly: false, preferInvoiceId: purchaseInvoiceId);
+      } on StateError catch (e) {
+        throw PurchaseListException(e.message, line: index);
+      }
+      medicineIds.add(medicineId);
+      totalCredit += credit;
+      prepared.add({
+        'purchase_invoice_item_id': itemId,
+        'medicine_id': medicineId,
+        'trade_name': item['trade_name'],
+        'quantity': quantity,
+        'credited_quantity': credited,
+        'unit_return_price': roundMoney(price),
+        'credit_amount': credit,
+      });
     }
 
+    totalCredit = roundMoney(totalCredit);
+    final outstanding = await _invoiceRemaining(txn, purchaseInvoiceId);
+    final open = outstanding > 0 ? outstanding : 0.0;
+    final excess = totalCredit > open ? roundMoney(totalCredit - open) : 0.0;
     final returnId = await txn.insert('purchase_invoice_return', {
       'pharmacy_id': pharmacyId,
       'supplier_id': supplierId,
       'purchase_invoice_id': purchaseInvoiceId,
-      'amount_returned': amount,
+      'amount_returned': totalCredit,
+      'excess_credit': excess,
       'notes': notes?.trim(),
-      'returned_at': DateTime.now().toIso8601String(),
+      'returned_at': returnedAt,
     });
-
-    final newNet = total - alreadyReturned - amount;
-    await txn.update(
-      'purchase_invoice',
-      {'remaining_debt': (newNet - paid).clamp(0.0, double.infinity)},
-      where: 'id = ?',
-      whereArgs: [purchaseInvoiceId],
-    );
-    return returnId;
+    for (final row in prepared) {
+      await txn.insert('purchase_invoice_return_item', {...row, 'pharmacy_id': pharmacyId, 'purchase_return_id': returnId});
+    }
+    if (excess > 0) {
+      await _settleOtherInvoices(txn,
+          pharmacyId: pharmacyId, supplierId: supplierId, excludeInvoiceId: purchaseInvoiceId, amount: excess, when: returnedAt);
+    }
+    await _refreshRemainingDebt(txn, supplierId);
+    return {
+      'return_id': returnId,
+      'amount_returned': totalCredit,
+      'excess_credit': excess,
+      'medicine_ids': medicineIds.toList(),
+    };
   });
 }
 
-/// كشف حساب تفصيلي للمذخر (دمج الفواتير والدفعات ترتيباً زمنياً)
+/// فائض مرتجع يسدّد فواتير المذخر الأخرى المفتوحة (الأقدم أولاً)؛ يرجع الباقي (رصيد).
+Future<double> _settleOtherInvoices(
+  DatabaseExecutor txn, {
+  required int pharmacyId,
+  required int supplierId,
+  required int excludeInvoiceId,
+  required double amount,
+  required String when,
+}) async {
+  var left = amount;
+  final others = await txn.query('purchase_invoice',
+      where: 'supplier_id = ? AND id != ?', whereArgs: [supplierId, excludeInvoiceId], orderBy: 'created_at, id');
+  for (final other in others) {
+    if (left <= 0) break;
+    final open = await _invoiceRemaining(txn, other['id'] as int);
+    if (open <= 0) continue;
+    left = roundMoney(left -
+        await _applySupplierCredit(txn,
+            pharmacyId: pharmacyId,
+            supplierId: supplierId,
+            invoiceId: other['id'] as int,
+            amount: left < open ? left : open,
+            notes: SupplierCreditNote.fromReturn,
+            when: when));
+  }
+  return left;
+}
+
+/// استلام أموال من المذخر مقابل رصيد الصيدلية لديه (جزئي مسموح، لا يتجاوز الرصيد).
+Future<int> receiveSupplierRefund({
+  required int pharmacyId,
+  required int supplierId,
+  required double amount,
+  String? notes,
+  DateTime? receivedDate,
+}) async {
+  final when = _movementMoment(receivedDate);
+  final value = roundMoney(amount);
+  if (value <= 0) throw const PurchaseListException('يجب أن يكون المبلغ المستلم أكبر من صفر.');
+  final db = await database;
+  return db.transaction((txn) async {
+    final supplier = await txn.query('pharmacy_supplier',
+        where: 'id = ? AND pharmacy_id = ?', whereArgs: [supplierId, pharmacyId], limit: 1);
+    if (supplier.isEmpty) throw const PurchaseListException('المذخر غير موجود.');
+    final available = ((await _supplierFiguresFor(txn, supplierId))['available_credit'] as num).toDouble();
+    if (value > available) {
+      throw PurchaseListException('المبلغ أكبر من رصيدك لدى المذخر (${available.toStringAsFixed(2)}).');
+    }
+    return txn.insert('supplier_refund', {
+      'pharmacy_id': pharmacyId,
+      'supplier_id': supplierId,
+      'amount': value,
+      'notes': notes?.trim(),
+      'received_at': when,
+    });
+  });
+}
+
+/// أسطر استرجاع (لكشف الحساب ونافذة الفاتورة). الاسترجاع القديم بالمبلغ: قائمة فارغة.
+Future<List<Map<String, dynamic>>> getPurchaseReturnItems(int purchaseReturnId) async {
+  final db = await database;
+  return db.query('purchase_invoice_return_item',
+      where: 'purchase_return_id = ?', whereArgs: [purchaseReturnId], orderBy: 'id');
+}
+
+/// كشف حساب تفصيلي للمذخر: الفواتير والدفعات والاسترجاعات (مع أسطرها)
+/// واستخدام الرصيد (بلا أثر على الرصيد) والمبالغ المستلمة. مجموع debt_added =
+/// رصيد المذخر الموحّد دائماً (نفس SupplierViewSet.statement).
 Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId) async {
   final db = await database;
-  return await db.rawQuery('''
-    SELECT 
+  final rows = await db.rawQuery('''
+    SELECT
       id,
       'invoice' AS transaction_type,
       COALESCE(invoice_number, 'فاتورة بدون رقم') AS reference,
@@ -2595,7 +3386,13 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
         WHERE pir.purchase_invoice_id = purchase_invoice.id
       ), 0.0) AS amount,
       paid_amount AS cash_paid,
-      remaining_debt AS debt_added,
+      -- إجمالي الفاتورة ناقص ما دُفع عند إنشائها بلا سطر دفعة (فواتير يدوية
+      -- قديمة). الدفعات والاسترجاعات لها أسطرها المنفصلة أدناه.
+      total_amount - (paid_amount - COALESCE((
+        SELECT SUM(sp.amount_paid)
+        FROM supplier_payment sp
+        WHERE sp.purchase_invoice_id = purchase_invoice.id
+      ), 0.0)) AS debt_added,
       created_at AS date_time,
       '' AS notes
     FROM purchase_invoice
@@ -2603,7 +3400,7 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
 
     UNION ALL
 
-    SELECT 
+    SELECT
       id,
       'payment' AS transaction_type,
       'تسديد دفعة' AS reference,
@@ -2618,19 +3415,60 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
     UNION ALL
 
     SELECT
-      id,
+      r.id,
       'return' AS transaction_type,
-      'استرجاع من فاتورة شراء' AS reference,
-      amount_returned AS amount,
+      'استرجاع من فاتورة #' || COALESCE(NULLIF(pi.invoice_number, ''), pi.id) AS reference,
+      r.amount_returned AS amount,
       0.0 AS cash_paid,
-      -amount_returned AS debt_added,
-      returned_at AS date_time,
+      -r.amount_returned AS debt_added,
+      r.returned_at AS date_time,
+      r.notes
+    FROM purchase_invoice_return r
+    JOIN purchase_invoice pi ON pi.id = r.purchase_invoice_id
+    WHERE r.supplier_id = ?
+
+    UNION ALL
+
+    SELECT
+      a.id,
+      'credit_applied' AS transaction_type,
+      COALESCE(NULLIF(a.notes, ''), '${SupplierCreditNote.previous}') || ' — فاتورة #' ||
+        COALESCE(NULLIF(pi.invoice_number, ''), pi.id) AS reference,
+      a.amount AS amount,
+      0.0 AS cash_paid,
+      0.0 AS debt_added,
+      a.applied_at AS date_time,
+      a.notes
+    FROM supplier_credit_application a
+    JOIN purchase_invoice pi ON pi.id = a.purchase_invoice_id
+    WHERE a.supplier_id = ?
+
+    UNION ALL
+
+    SELECT
+      id,
+      'refund' AS transaction_type,
+      'استلام أموال من المذخر' AS reference,
+      amount AS amount,
+      0.0 AS cash_paid,
+      amount AS debt_added,
+      received_at AS date_time,
       notes
-    FROM purchase_invoice_return
+    FROM supplier_refund
     WHERE supplier_id = ?
 
     ORDER BY date_time DESC
-  ''', [supplierId, supplierId, supplierId]);
+  ''', [supplierId, supplierId, supplierId, supplierId, supplierId]);
+
+  final result = <Map<String, dynamic>>[];
+  for (final row in rows) {
+    if (row['transaction_type'] == 'return') {
+      result.add({...row, 'items': await getPurchaseReturnItems(row['id'] as int)});
+    } else {
+      result.add(Map<String, dynamic>.from(row));
+    }
+  }
+  return result;
 }
 
 
@@ -2642,7 +3480,7 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
 Future<Map<String, dynamic>?> getTopSupplier(int pharmacyId) async {
   final db = await database;
   final result = await db.rawQuery('''
-    SELECT 
+    SELECT
       s.id,
       s.name,
       s.phone,
@@ -2663,50 +3501,10 @@ Future<Map<String, dynamic>?> getTopSupplier(int pharmacyId) async {
   return result.first;
 }
 
-/// حساب مجموع الديون الكلية المستحقة لجميع المذاخر
+/// مجموع ديون المذاخر لكل مذخر على حدة: رصيد مذخر لصالحنا لا يُطرح من دين مذخر آخر.
 Future<double> getTotalSuppliersDebt(int pharmacyId) async {
-  final db = await database;
-  final result = await db.rawQuery('''
-    SELECT MAX(0.0,
-      COALESCE((
-        SELECT SUM(
-          pi.total_amount -
-          COALESCE((SELECT SUM(pir.amount_returned)
-                    FROM purchase_invoice_return pir
-                    WHERE pir.purchase_invoice_id = pi.id), 0.0) -
-          pi.paid_amount
-        )
-        FROM purchase_invoice pi
-        WHERE pi.pharmacy_id = ?
-      ), 0.0) -
-      COALESCE((
-        SELECT SUM(amount_paid)
-        FROM supplier_payment
-        WHERE pharmacy_id = ? AND purchase_invoice_id IS NULL
-      ), 0.0)
-    ) AS total_debt
-  ''', [pharmacyId, pharmacyId]);
-
-  if (result.isEmpty || result.first['total_debt'] == null) {
-    return 0.0;
-  }
-  return (result.first['total_debt'] as num).toDouble();
-}
-
-Future<void> settlePurchaseInvoiceCredit(int purchaseInvoiceId) async {
-  final db = await database;
-
-  await db.rawUpdate('''
-    UPDATE purchase_invoice
-    SET
-      paid_amount = total_amount - COALESCE((
-        SELECT SUM(amount_returned)
-        FROM purchase_invoice_return
-        WHERE purchase_invoice_id = purchase_invoice.id
-      ), 0.0),
-      remaining_debt = 0
-    WHERE id = ?
-  ''', [purchaseInvoiceId]);
+  final suppliers = await getSuppliersWithFinancials(pharmacyId);
+  return roundMoney(suppliers.fold<double>(0, (sum, s) => sum + (s['remaining_debt'] as num).toDouble()));
 }
 
 //====================================================
@@ -2796,6 +3594,9 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
                       'quantity': b['quantity'],
                       'expiry_date': b['expiry_date'],
                       'purchase_price': b['purchase_price'],
+                      'source': b['source'],
+                      'local_supplier_id': b['supplier_id'],
+                      'local_purchase_invoice_id': b['purchase_invoice_id'],
                     })
                 .toList(),
           });
@@ -2808,12 +3609,32 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
     final piId = pi['id'];
     final payments = await db.query('supplier_payment', where: 'purchase_invoice_id = ?', whereArgs: [piId]);
     final returns = await db.query('purchase_invoice_return', where: 'purchase_invoice_id = ?', whereArgs: [piId]);
+    final items = await db.query('purchase_invoice_item', where: 'purchase_invoice_id = ?', whereArgs: [piId], orderBy: 'id');
     purchaseInvoicesPayload.add({
+      // local_id: لربط الدفعات (batches.local_purchase_invoice_id) بفاتورتها على الخادم.
+      'local_id': piId,
       'local_supplier_id': pi['supplier_id'],
       'invoice_number': pi['invoice_number'],
+      'invoice_date': pi['invoice_date'],
+      'source': pi['source'],
+      'item_count': pi['item_count'],
       'total_amount': pi['total_amount'],
       'paid_amount': pi['paid_amount'],
       'created_at': pi['created_at'],
+      'items': items
+          .map((it) => {
+                'local_id': it['id'],
+                'local_medicine_id': it['medicine_id'],
+                'trade_name': it['trade_name'],
+                'quantity': it['quantity'],
+                'bonus_quantity': it['bonus_quantity'],
+                'buy_price': it['buy_price'],
+                'effective_unit_cost': it['effective_unit_cost'],
+                'sell_price': it['sell_price'],
+                'expiry_date': it['expiry_date'],
+                'line_total': it['line_total'],
+              })
+          .toList(),
       'payments': payments
           .map((p) => {
                 'amount_paid': p['amount_paid'],
@@ -2821,15 +3642,42 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
                 'paid_at': p['paid_at'],
               })
           .toList(),
-      'returns': returns
-          .map((r) => {
-                'amount_returned': r['amount_returned'],
-                'notes': r['notes'],
-                'returned_at': r['returned_at'],
-              })
+      'returns': [
+        for (final r in returns)
+          {
+            'amount_returned': r['amount_returned'],
+            'excess_credit': r['excess_credit'],
+            'notes': r['notes'],
+            'returned_at': r['returned_at'],
+            'items': (await getPurchaseReturnItems(r['id'] as int))
+                .map((ri) => {
+                      'local_purchase_invoice_item_id': ri['purchase_invoice_item_id'],
+                      'local_medicine_id': ri['medicine_id'],
+                      'trade_name': ri['trade_name'],
+                      'quantity': ri['quantity'],
+                      'credited_quantity': ri['credited_quantity'],
+                      'unit_return_price': ri['unit_return_price'],
+                      'credit_amount': ri['credit_amount'],
+                    })
+                .toList(),
+          },
+      ],
+      'credit_applications': (await db.query('supplier_credit_application',
+              where: 'purchase_invoice_id = ?', whereArgs: [piId], orderBy: 'id'))
+          .map((a) => {'amount': a['amount'], 'notes': a['notes'], 'applied_at': a['applied_at']})
           .toList(),
     });
   }
+
+  // 3ب. المبالغ المستلمة من المذاخر مقابل رصيد الصيدلية لديهم.
+  final refundsPayload = (await db.query('supplier_refund', where: 'pharmacy_id = ?', whereArgs: [pharmacyId]))
+      .map((f) => {
+            'local_supplier_id': f['supplier_id'],
+            'amount': f['amount'],
+            'notes': f['notes'],
+            'received_at': f['received_at'],
+          })
+      .toList();
 
   // 4. فواتير البيع الكاملة (كل التاريخ) + عناصرها. اسم الكاشير يُجلب من
   // user_profile/users المحليين (نفس JOIN المستخدم في تقرير الشفتات
@@ -2914,6 +3762,7 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
     'damaged_medicines': damagedPayload,
     'expenses': expensesPayload,
     'stock_transfers': transfersPayload,
+    'supplier_refunds': refundsPayload,
   };
 }
 

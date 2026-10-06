@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../models/purchase_list.dart';
 import '../repository/suppliers_repository.dart';
+import 'purchase_return_dialog.dart';
 
 class MissingSuppliersScreen extends StatefulWidget {
   final int pharmacyId;
@@ -235,6 +239,9 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
     final supplierId = supplier['id'] as int;
     final supplierName = supplier['name']?.toString() ?? 'بدون اسم';
     final debt = _number(supplier['remaining_debt']);
+    // رصيد سالب = المذخر مدين للصيدلية: يُعرض "رصيد لصالحك" بدل الدين.
+    final credit = _number(supplier['credit_balance']);
+    final availableCredit = _number(supplier['available_credit']);
     final purchases = _number(supplier['total_purchases']);
     final count = (supplier['invoice_count'] as num?)?.toInt() ?? 0;
     final expanded = _expandedSupplierIds.contains(supplierId);
@@ -300,16 +307,37 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
                         );
                       }
 
+                      if (value == 'purchased_items') {
+                        _showSupplierPurchasedItemsDialog(
+                          context,
+                          supplierId,
+                          supplierName,
+                        );
+                      }
+
+                      if (value == 'receive_refund') {
+                        _showReceiveRefundDialog(context, supplierId, supplierName, availableCredit);
+                      }
+
                       if (value == 'delete') {
                         _confirmDeleteSupplier(supplierId, supplierName);
                       }
                     },
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(
+                    itemBuilder: (_) => [
+                      if (availableCredit > 0)
+                        const PopupMenuItem(
+                          value: 'receive_refund',
+                          child: Text('استلام أموال من المذخر'),
+                        ),
+                      const PopupMenuItem(
                         value: 'statement',
                         child: Text('كشف حساب'),
                       ),
-                      PopupMenuItem(
+                      const PopupMenuItem(
+                        value: 'purchased_items',
+                        child: Text('الأصناف المشتراة'),
+                      ),
+                      const PopupMenuItem(
                         value: 'delete',
                         child: Text('حذف المذخر'),
                       ),
@@ -330,11 +358,13 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
                     _formatAmount(purchases),
                     textMain,
                   ),
-                  _statCard(
-                    'المتبقي',
-                    _formatAmount(debt),
-                    debt > 0 ? danger : success,
-                  ),
+                  credit > 0
+                      ? _statCard('رصيد لصالحك', _formatAmount(credit), success)
+                      : _statCard(
+                          'المتبقي',
+                          _formatAmount(debt),
+                          debt > 0 ? danger : success,
+                        ),
                 ];
 
                 if (constraints.maxWidth < 560) {
@@ -387,7 +417,7 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
               ),
             ),
           ),
-          if (expanded) _buildInvoicesSection(supplierId, supplierName),
+          if (expanded) _buildInvoicesSection(supplierId, supplierName, availableCredit),
         ],
       ),
     );
@@ -403,7 +433,7 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
     );
   }
 
-Widget _buildInvoicesSection(int supplierId, String supplierName) {
+Widget _buildInvoicesSection(int supplierId, String supplierName, double availableCredit) {
   return Padding(
     padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
     child: FutureBuilder<List<Map<String, dynamic>>>(
@@ -435,20 +465,47 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                     ),
                   ),
                 ),
-                FilledButton.icon(
-                  onPressed: () => _showAddInvoiceDialog(
+                if (availableCredit > 0) ...[
+                  FilledButton.icon(
+                    onPressed: () => _showReceiveRefundDialog(context, supplierId, supplierName, availableCredit),
+                    icon: const Icon(Icons.savings_outlined, size: 16),
+                    label: const Text('استلام أموال من المذخر'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: success,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                OutlinedButton.icon(
+                  onPressed: () => _showSupplierPurchasedItemsDialog(
                     context,
                     supplierId,
                     supplierName,
                   ),
-                  icon: const Icon(Icons.add, size: 16),
-                  label: const Text('إضافة فاتورة'),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: primary,
+                  icon: const Icon(Icons.medication_outlined, size: 16),
+                  label: const Text('الأصناف المشتراة'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: primaryDark,
+                    side: const BorderSide(color: primary),
                     padding: const EdgeInsets.symmetric(
                       horizontal: 12,
                       vertical: 10,
                     ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            // الفواتير تُنشأ حصراً من شاشة المخزون (قائمة مذخر)؛ هنا الدفعات والاسترجاعات فقط.
+            const Row(
+              children: [
+                Icon(Icons.info_outline_rounded, size: 15, color: textSecondary),
+                SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'تُضاف فواتير الشراء من شاشة المخزون عبر "إضافة قائمة مذخر". افتح الفاتورة لعرض أصنافها وإضافة دفعة أو استرجاع.',
+                    style: TextStyle(color: textSecondary, fontSize: 12.5),
                   ),
                 ),
               ],
@@ -468,19 +525,20 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: DataTable(
+                  showCheckboxColumn: false,
                   headingRowColor: WidgetStateProperty.all(
                     const Color(0xFFF0F4F5),
                   ),
                   columns: const [
                     DataColumn(label: Text('رقم الفاتورة')),
                     DataColumn(label: Text('التاريخ')),
+                    DataColumn(label: Text('الأصناف')),
                     DataColumn(label: Text('المبلغ الأصلي')),
                     DataColumn(label: Text('الاسترجاع')),
                     DataColumn(label: Text('الصافي')),
                     DataColumn(label: Text('المدفوع')),
                     DataColumn(label: Text('المتبقي')),
                     DataColumn(label: Text('الحالة')),
-                    DataColumn(label: Text('الإجراءات')),
                   ],
                   rows: invoices.map((invoice) {
                     final id = invoice['id'] as int;
@@ -488,117 +546,53 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                     final returned = _number(invoice['returned_amount']);
                     final net = _number(invoice['net_amount']);
                     final paid = _number(invoice['paid_amount']);
+                    // المتبقي لا يقل عن 0: فائض الاسترجاع يذهب لرصيد المذخر.
                     final remaining = _number(invoice['remaining_amount']);
-                    final hasCredit = remaining < -0.001;
-                    final settled = remaining.abs() <= 0.001;
-                    final statusColor = hasCredit
-                        ? primaryDark
-                        : (settled ? success : warning);
-                    final statusText = hasCredit
-                        ? 'رصيد دائن'
-                        : (settled ? 'مؤداة' : 'مؤجلة');
+                    final settled = remaining <= 0.001;
+                    final statusColor = settled ? success : warning;
+                    final statusText = settled ? 'مؤداة' : 'مؤجلة';
 
                     final invNum = invoice['invoice_number']?.toString().trim();
-                    final displayNum = (invNum != null && invNum.isNotEmpty)
-                        ? '#$invNum'
-                        : '#$id';
+                    final displayNum = (invNum != null && invNum.isNotEmpty) ? '#$invNum' : '#$id';
+                    // فواتير القوائم تحمل أصنافها؛ اليدوية القديمة بلا أصناف.
+                    final itemCount = _number(invoice['item_count']).toInt();
+                    final fromList = invoice['source'] == 'inventory_list';
+                    final invoiceDate = (invoice['invoice_date']?.toString().isNotEmpty ?? false)
+                        ? invoice['invoice_date'].toString()
+                        : invoice['created_at']?.toString();
 
                     return DataRow(
+                      // النقر على الفاتورة يفتح أصنافها، ومنها الدفع والاسترجاع.
+                      onSelectChanged: (_) => _showInvoiceItemsDialog(context, invoice, supplierId, supplierName),
                       cells: [
-                        DataCell(Text(displayNum)),
                         DataCell(
-                          Text(_formatDate(invoice['created_at']?.toString())),
+                          Text(
+                            displayNum,
+                            style: const TextStyle(
+                              color: primaryDark,
+                              fontWeight: FontWeight.w700,
+                              decoration: TextDecoration.underline,
+                            ),
+                          ),
                         ),
+                        DataCell(Text(_formatDate(invoiceDate))),
+                        DataCell(Text(fromList ? '$itemCount' : '-')),
                         DataCell(Text(_formatAmount(original))),
                         DataCell(Text(_formatAmount(returned))),
                         DataCell(Text(_formatAmount(net))),
                         DataCell(Text(_formatAmount(paid))),
-                        DataCell(
-                          Text(
-                            hasCredit
-                                ? 'دائن ${_formatAmount(remaining.abs())}'
-                                : _formatAmount(remaining),
-                          ),
-                        ),
+                        DataCell(Text(_formatAmount(remaining))),
                         DataCell(
                           Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 9,
-                              vertical: 5,
-                            ),
+                            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
                             decoration: BoxDecoration(
                               color: statusColor.withValues(alpha: .14),
                               borderRadius: BorderRadius.circular(14),
                             ),
                             child: Text(
                               statusText,
-                              style: TextStyle(
-                                color: statusColor,
-                                fontWeight: FontWeight.w700,
-                              ),
+                              style: TextStyle(color: statusColor, fontWeight: FontWeight.w700),
                             ),
-                          ),
-                        ),
-                        DataCell(
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                tooltip: 'إضافة دفعة',
-                                icon: const Icon(
-                                  Icons.payments_rounded,
-                                  color: success,
-                                ),
-                                onPressed: remaining <= 0
-                                    ? null
-                                    : () => _showPaymentDialog(
-                                          context,
-                                          supplierId,
-                                          supplierName,
-                                          invoice,
-                                        ),
-                              ),
-                              IconButton(
-                                tooltip: 'إضافة استرجاع',
-                                icon: const Icon(
-                                  Icons.keyboard_return_rounded,
-                                  color: Color(0xFF2980B9),
-                                ),
-                                onPressed: returned >= original
-                                    ? null
-                                    : () => _showReturnDialog(
-                                          context,
-                                          supplierId,
-                                          supplierName,
-                                          invoice,
-                                        ),
-                              ),
-                              if (hasCredit)
-                                IconButton(
-                                  tooltip: 'تصفير الرصيد الدائن',
-                                  icon: const Icon(
-                                    Icons.check_circle_rounded,
-                                    color: primaryDark,
-                                  ),
-                                  onPressed: () async {
-                                    await _repository.settlePurchaseInvoiceCredit(
-                                      isOnlineMode: widget.isOnlineMode,
-                                      purchaseInvoiceId: id,
-                                    );
-                                    _refreshData();
-                                    if (context.mounted) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'تم تصفير الرصيد الدائن بنجاح.',
-                                          ),
-                                          backgroundColor: primary,
-                                        ),
-                                      );
-                                    }
-                                  },
-                                ),
-                            ],
                           ),
                         ),
                       ],
@@ -664,7 +658,14 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
       case 'payment':
         return notes.isNotEmpty ? notes : 'دفعة نقدية للمذخر';
       case 'return':
-        return notes.isNotEmpty ? notes : 'استرجاع بضاعة للمذخر';
+        final items = row['items'] is List ? (row['items'] as List).length : 0;
+        final base = reference.isNotEmpty ? reference : 'استرجاع بضاعة للمذخر';
+        final withItems = items > 0 ? '$base ($items صنف)' : base;
+        return notes.isNotEmpty ? '$withItems — $notes' : withItems;
+      case 'credit_applied':
+        return '$reference: ${_formatAmount(_number(row['amount']))} د.ع';
+      case 'refund':
+        return notes.isNotEmpty ? 'استلام أموال من المذخر — $notes' : 'استلام أموال من المذخر';
       default:
         return reference.isEmpty ? '-' : reference;
     }
@@ -801,107 +802,403 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
   }
 
   // ==========================================
-  // 🧾 2. حوار تسجيل فاتورة شراء جديدة
+  // 🧾 2. أصناف فاتورة الشراء / الأصناف المشتراة من المذخر
   // ==========================================
-  void _showAddInvoiceDialog(BuildContext context, int supplierId, String supplierName) {
-    final invoiceNumController = TextEditingController();
-    final totalAmountController = TextEditingController();
-    final paidAmountController = TextEditingController();
+  /// أصناف الفاتورة (مع المسترجع من كل سطر) وفي أسفلها "إضافة دفعة" و"إضافة
+  /// استرجاع". الفواتير اليدوية القديمة بلا أصناف: الدفع فقط.
+  Future<void> _showInvoiceItemsDialog(
+    BuildContext context,
+    Map<String, dynamic> invoice,
+    int supplierId,
+    String supplierName,
+  ) async {
+    var current = invoice;
+    late Future<List<Map<String, dynamic>>> itemsFuture;
+    void load() => itemsFuture = _repository.getPurchaseInvoiceItems(
+          purchaseInvoiceId: invoice['id'] as int,
+          isOnlineMode: widget.isOnlineMode,
+        );
+    load();
 
+    Future<void> reloadInvoice(StateSetter setDialogState) async {
+      final rows = await _repository.getPurchaseInvoicesBySupplier(
+        supplierId: supplierId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+      final fresh = rows.where((r) => r['id'] == invoice['id']);
+      setDialogState(() {
+        if (fresh.isNotEmpty) current = fresh.first;
+        load();
+      });
+      _refreshData();
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        final size = MediaQuery.of(ctx).size;
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final number = current['invoice_number']?.toString().trim() ?? '';
+            final remaining = _number(current['remaining_amount']);
+            return Directionality(
+              textDirection: TextDirection.rtl,
+              child: Dialog(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: (size.width * 0.85).clamp(360.0, 1100.0),
+                    maxHeight: size.height * 0.85,
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: FutureBuilder<List<Map<String, dynamic>>>(
+                      future: itemsFuture,
+                      builder: (context, snapshot) {
+                        final items = snapshot.data ?? const <Map<String, dynamic>>[];
+                        final loading = snapshot.connectionState == ConnectionState.waiting;
+                        final canReturn = items.any((i) => i['current_stock'] != null);
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Row(
+                              children: [
+                                const CircleAvatar(
+                                  backgroundColor: Color(0xFFE6F7F5),
+                                  child: Icon(Icons.receipt_long_rounded, color: primary),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    'أصناف الفاتورة ${number.isEmpty ? '#${current['id']}' : '#$number'} — $supplierName',
+                                    style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800, color: textMain),
+                                  ),
+                                ),
+                                IconButton(onPressed: () => Navigator.pop(ctx), icon: const Icon(Icons.close_rounded)),
+                              ],
+                            ),
+                            const Divider(height: 24),
+                            Flexible(
+                              child: loading
+                                  ? const Padding(
+                                      padding: EdgeInsets.all(32),
+                                      child: Center(child: CircularProgressIndicator(color: primary)),
+                                    )
+                                  : snapshot.hasError
+                                      ? Text(snapshot.error.toString(), style: const TextStyle(color: danger))
+                                      : items.isEmpty
+                                          ? const Padding(
+                                              padding: EdgeInsets.all(32),
+                                              child: Text(
+                                                'لا توجد أصناف (فاتورة قديمة أُدخلت يدوياً).',
+                                                textAlign: TextAlign.center,
+                                                style: TextStyle(color: textSecondary),
+                                              ),
+                                            )
+                                          : _buildPurchaseItemsTable(items, false, showReturned: true),
+                            ),
+                            const SizedBox(height: 14),
+                            Wrap(
+                              spacing: 20,
+                              runSpacing: 6,
+                              children: [
+                                Text('الإجمالي: ${_formatAmount(_number(current['total_amount']))} د.ع'),
+                                Text('المدفوع: ${_formatAmount(_number(current['paid_amount']))} د.ع'),
+                                Text('الاسترجاع: ${_formatAmount(_number(current['returned_amount']))} د.ع'),
+                                if (_number(current['credit_applied']) > 0)
+                                  Text('خصم من رصيد سابق: ${_formatAmount(_number(current['credit_applied']))} د.ع'),
+                                Text(
+                                  'المتبقي: ${_formatAmount(remaining)} د.ع',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                    color: remaining > 0 ? danger : success,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            Row(
+                              children: [
+                                FilledButton.icon(
+                                  onPressed: remaining <= 0
+                                      ? null
+                                      : () async {
+                                          final saved = await _showPaymentDialog(ctx, supplierId, supplierName, current);
+                                          if (saved) await reloadInvoice(setDialogState);
+                                        },
+                                  icon: const Icon(Icons.payments_rounded, size: 18),
+                                  label: const Text('إضافة دفعة'),
+                                  style: FilledButton.styleFrom(backgroundColor: success),
+                                ),
+                                const SizedBox(width: 10),
+                                if (items.isNotEmpty)
+                                  FilledButton.icon(
+                                    onPressed: loading || !canReturn
+                                        ? null
+                                        : () async {
+                                            final saved = await showPurchaseReturnDialog(
+                                              ctx,
+                                              pharmacyId: widget.pharmacyId,
+                                              isOnlineMode: widget.isOnlineMode,
+                                              invoice: current,
+                                              items: items,
+                                            );
+                                            if (saved) {
+                                              await reloadInvoice(setDialogState);
+                                              if (mounted) {
+                                                ScaffoldMessenger.of(this.context).showSnackBar(
+                                                  const SnackBar(
+                                                    content: Text('تم تسجيل الاسترجاع وتحديث المخزون والرصيد.'),
+                                                    backgroundColor: success,
+                                                  ),
+                                                );
+                                              }
+                                            }
+                                          },
+                                    icon: const Icon(Icons.keyboard_return_rounded, size: 18),
+                                    label: const Text('إضافة استرجاع'),
+                                    style: FilledButton.styleFrom(backgroundColor: const Color(0xFF2980B9)),
+                                  ),
+                              ],
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showSupplierPurchasedItemsDialog(
+    BuildContext context,
+    int supplierId,
+    String supplierName,
+  ) {
+    _showPurchaseItemsDialog(
+      context,
+      title: 'الأصناف المشتراة من $supplierName',
+      future: _repository.getSupplierPurchasedItems(
+        supplierId: supplierId,
+        isOnlineMode: widget.isOnlineMode,
+      ),
+      showInvoiceColumns: true,
+      emptyText: 'لا توجد أصناف مشتراة مسجلة من هذا المذخر بعد.',
+    );
+  }
+
+  void _showPurchaseItemsDialog(
+    BuildContext context, {
+    required String title,
+    required Future<List<Map<String, dynamic>>> future,
+    required bool showInvoiceColumns,
+    required String emptyText,
+  }) {
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        backgroundColor: cardBg,
-        title: Text('فاتورة شراء - $supplierName', style: const TextStyle(color: textMain, fontWeight: FontWeight.bold)),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+      builder: (ctx) {
+        final size = MediaQuery.of(ctx).size;
+        return Directionality(
+          textDirection: TextDirection.rtl,
+          child: Dialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: (size.width * 0.85).clamp(360.0, 1100.0),
+                maxHeight: size.height * 0.85,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        const CircleAvatar(
+                          backgroundColor: Color(0xFFE6F7F5),
+                          child: Icon(Icons.receipt_long_rounded, color: primary),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            title,
+                            style: const TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.w800,
+                              color: textMain,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 24),
+                    Flexible(
+                      child: FutureBuilder<List<Map<String, dynamic>>>(
+                        future: future,
+                        builder: (context, snapshot) {
+                          if (snapshot.connectionState == ConnectionState.waiting) {
+                            return const Padding(
+                              padding: EdgeInsets.all(32),
+                              child: Center(child: CircularProgressIndicator(color: primary)),
+                            );
+                          }
+                          if (snapshot.hasError) {
+                            return Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Text(
+                                snapshot.error.toString(),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: danger),
+                              ),
+                            );
+                          }
+                          final items = snapshot.data ?? [];
+                          if (items.isEmpty) {
+                            return Padding(
+                              padding: const EdgeInsets.all(32),
+                              child: Text(
+                                emptyText,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: textSecondary),
+                              ),
+                            );
+                          }
+                          return _buildPurchaseItemsTable(items, showInvoiceColumns);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPurchaseItemsTable(List<Map<String, dynamic>> items, bool showInvoiceColumns, {bool showReturned = false}) {
+    var paidTotal = 0, bonusTotal = 0, freeCount = 0;
+    var amountTotal = 0.0;
+    for (final item in items) {
+      paidTotal += _number(item['quantity']).toInt();
+      bonusTotal += _number(item['bonus_quantity']).toInt();
+      if (item['is_free'] == true) freeCount++;
+      amountTotal += _number(item['line_total']);
+    }
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Flexible(
+          child: SingleChildScrollView(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: DataTable(
+                headingRowColor: WidgetStateProperty.all(const Color(0xFFF0F4F5)),
+                columns: [
+                  if (showInvoiceColumns) const DataColumn(label: Text('رقم الفاتورة')),
+                  if (showInvoiceColumns) const DataColumn(label: Text('التاريخ')),
+                  const DataColumn(label: Text('الصنف')),
+                  const DataColumn(label: Text('الكمية المدفوعة'), numeric: true),
+                  const DataColumn(label: Text('البونص / المجاني'), numeric: true),
+                  const DataColumn(label: Text('سعر الشراء'), numeric: true),
+                  const DataColumn(label: Text('الصلاحية')),
+                  const DataColumn(label: Text('إجمالي السطر'), numeric: true),
+                  if (showReturned) const DataColumn(label: Text('المسترجع'), numeric: true),
+                ],
+                rows: items.map((item) {
+                  final isFree = item['is_free'] == true;
+                  final invoiceDate = (item['invoice_date']?.toString().isNotEmpty ?? false)
+                      ? item['invoice_date'].toString()
+                      : item['invoice_created_at']?.toString();
+                  return DataRow(
+                    cells: [
+                      if (showInvoiceColumns) DataCell(Text('#${item['invoice_number'] ?? ''}')),
+                      if (showInvoiceColumns) DataCell(Text(_formatDate(invoiceDate))),
+                      DataCell(
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              item['trade_name']?.toString() ?? '',
+                              style: const TextStyle(fontWeight: FontWeight.w700),
+                            ),
+                            if (isFree) ...[
+                              const SizedBox(width: 8),
+                              _freeBadge(),
+                            ],
+                          ],
+                        ),
+                      ),
+                      DataCell(Text(isFree ? '-' : '${_number(item['quantity']).toInt()}')),
+                      DataCell(Text('${_number(item['bonus_quantity']).toInt()}')),
+                      DataCell(Text(isFree ? '-' : _formatAmount(_number(item['buy_price'])))),
+                      DataCell(Text(_formatDate(item['expiry_date']?.toString()))),
+                      DataCell(Text(_formatAmount(_number(item['line_total'])))),
+                      if (showReturned)
+                        DataCell(Text(
+                          _number(item['returned_quantity']) > 0 ? '${_number(item['returned_quantity']).toInt()}' : '-',
+                          style: TextStyle(
+                            color: _number(item['returned_quantity']) > 0 ? const Color(0xFF2980B9) : textSecondary,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        )),
+                    ],
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF1F8F8),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Wrap(
+            spacing: 24,
+            runSpacing: 8,
             children: [
-              TextField(
-                controller: invoiceNumController,
-                decoration: InputDecoration(
-                  labelText: 'رقم الفاتورة (اختياري)',
-                  labelStyle: const TextStyle(color: textSecondary),
-                  enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: borderCol), borderRadius: BorderRadius.circular(10)),
-                  focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: primary, width: 2), borderRadius: BorderRadius.circular(10)),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: totalAmountController,
-                decoration: InputDecoration(
-                  labelText: 'إجمالي مبلغ الفاتورة',
-                  labelStyle: const TextStyle(color: textSecondary),
-                  enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: borderCol), borderRadius: BorderRadius.circular(10)),
-                  focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: primary, width: 2), borderRadius: BorderRadius.circular(10)),
-                ),
-                keyboardType: TextInputType.number,
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: paidAmountController,
-                decoration: InputDecoration(
-                  labelText: 'المبلغ المدفوع كاش',
-                  labelStyle: const TextStyle(color: textSecondary),
-                  enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: borderCol), borderRadius: BorderRadius.circular(10)),
-                  focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: primary, width: 2), borderRadius: BorderRadius.circular(10)),
-                ),
-                keyboardType: TextInputType.number,
+              Text('عدد الأصناف: ${items.length}', style: const TextStyle(fontWeight: FontWeight.w700)),
+              Text('الكمية المدفوعة: $paidTotal'),
+              Text('البونص / المجاني: $bonusTotal'),
+              if (freeCount > 0) Text('أصناف مجانية: $freeCount'),
+              Text(
+                'الإجمالي: ${_formatAmount(amountTotal)} د.ع',
+                style: const TextStyle(fontWeight: FontWeight.w800, color: primaryDark),
               ),
             ],
           ),
         ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء', style: TextStyle(color: textSecondary))),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF2980B9),
-              foregroundColor: Colors.white,
-              elevation: 0,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-            ),
-            onPressed: () async {
-              final double total = double.tryParse(totalAmountController.text) ?? 0.0;
-              final double paid = double.tryParse(paidAmountController.text) ?? 0.0;
+      ],
+    );
+  }
 
-              if (total > 0) {
-                try {
-                  await _repository.insertPurchaseInvoice(
-                    pharmacyId: widget.pharmacyId,
-                    isOnlineMode: widget.isOnlineMode,
-                    data: {
-                      'supplier_id': supplierId,
-                      'invoice_number': invoiceNumController.text.trim().isEmpty ? null : invoiceNumController.text.trim(),
-                      'total_amount': total,
-                      'paid_amount': paid,
-                    },
-                  );
-
-
-                  if (ctx.mounted) Navigator.pop(ctx);
-                  _refreshData();
-
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('تم تسجيل الفاتورة بنجاح!'),
-                        backgroundColor: success,
-                      ),
-                    );
-                  }
-                } catch (e) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('خطأ أثناء تسجيل الفاتورة: $e'), backgroundColor: danger),
-                    );
-                  }
-                }
-              }
-            },
-            child: const Text('تسجيل الفاتورة'),
-          ),
-        ],
+  Widget _freeBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: success.withValues(alpha: .14),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: const Text(
+        'مجاني',
+        style: TextStyle(color: success, fontWeight: FontWeight.w700, fontSize: 12),
       ),
     );
   }
@@ -909,18 +1206,18 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
   // ==========================================
   // 💵 3. حوار تسديد دفعة لفاتورة محددة
   // ==========================================
-  void _showPaymentDialog(
+  Future<bool> _showPaymentDialog(
     BuildContext context,
     int supplierId,
     String supplierName,
     Map<String, dynamic> invoice,
-  ) {
+  ) async {
     final amountController = TextEditingController();
     final notesController = TextEditingController();
     final invoiceId = invoice['id'] as int;
     final remaining = _number(invoice['remaining_amount']);
 
-    showDialog(
+    final saved = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -978,11 +1275,11 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                     notes: notesController.text,
                   );
 
-                  if (ctx.mounted) Navigator.pop(ctx);
+                  if (ctx.mounted) Navigator.pop(ctx, true);
                   _refreshData();
 
                   if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
+                    ScaffoldMessenger.of(this.context).showSnackBar(
                       const SnackBar(
                         content: Text('تم تسجيل الدفعة بنجاح!'),
                         backgroundColor: success,
@@ -1003,94 +1300,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
         ],
       ),
     );
-  }
-
-  // ==========================================
-  // ↩️ 4. حوار الاسترجاع الجزئي من فاتورة شراء
-  // ==========================================
-  void _showReturnDialog(
-    BuildContext context,
-    int supplierId,
-    String supplierName,
-    Map<String, dynamic> invoice,
-  ) {
-    final amountController = TextEditingController();
-    final notesController = TextEditingController();
-    final invoiceId = invoice['id'] as int;
-    final availableToReturn = _number(invoice['total_amount']) - _number(invoice['returned_amount']);
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        backgroundColor: cardBg,
-        title: Text('استرجاع من فاتورة $supplierName', style: const TextStyle(color: textMain, fontWeight: FontWeight.bold)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Align(
-              alignment: AlignmentDirectional.centerStart,
-              child: Text('الحد المتاح للاسترجاع: ${_formatAmount(availableToReturn)} د.ع', style: const TextStyle(color: textSecondary)),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: amountController,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: InputDecoration(
-                labelText: 'قيمة الأدوية المسترجعة',
-                labelStyle: const TextStyle(color: textSecondary),
-                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: borderCol), borderRadius: BorderRadius.circular(10)),
-                focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: primary, width: 2), borderRadius: BorderRadius.circular(10)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: notesController,
-              decoration: InputDecoration(
-                labelText: 'ملاحظة الاسترجاع (اختياري)',
-                labelStyle: const TextStyle(color: textSecondary),
-                enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: borderCol), borderRadius: BorderRadius.circular(10)),
-                focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: primary, width: 2), borderRadius: BorderRadius.circular(10)),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء', style: TextStyle(color: textSecondary))),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2980B9), foregroundColor: Colors.white, elevation: 0),
-            onPressed: () async {
-              final amount = double.tryParse(amountController.text) ?? 0;
-              if (amount <= 0) return;
-              try {
-                await _repository.addPurchaseInvoiceReturn(
-                  pharmacyId: widget.pharmacyId,
-                  isOnlineMode: widget.isOnlineMode,
-                  supplierId: supplierId,
-                  purchaseInvoiceId: invoiceId,
-                  amount: amount,
-                  notes: notesController.text,
-                );
-                if (ctx.mounted) Navigator.pop(ctx);
-                _refreshData();
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('تم تسجيل الاسترجاع بنجاح.'), backgroundColor: primary),
-                  );
-                }
-              } catch (e) {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('تعذر تسجيل الاسترجاع: $e'), backgroundColor: danger),
-                  );
-                }
-              }
-            },
-            child: const Text('تأكيد الاسترجاع'),
-          ),
-        ],
-      ),
-    );
+    return saved == true;
   }
 
   // ==========================================
@@ -1109,6 +1319,12 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
     int supplierId,
     String supplierName,
   ) {
+    // استرجاعات مفتوحة لعرض أدويتها (المفتاح = معرّف الاسترجاع).
+    final expandedReturns = <Object?>{};
+    final statementFuture = _repository.getSupplierStatementOfAccount(
+      supplierId: supplierId,
+      isOnlineMode: widget.isOnlineMode,
+    );
     showDialog<void>(
       context: context,
       barrierDismissible: true,
@@ -1138,11 +1354,9 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                     children: [
                       _statementTopBar(dialogContext, supplierName),
                       Flexible(
-                        child: FutureBuilder<List<Map<String, dynamic>>>(
-                          future: _repository.getSupplierStatementOfAccount(
-                            supplierId: supplierId,
-                            isOnlineMode: widget.isOnlineMode,
-                          ),
+                        child: StatefulBuilder(
+                          builder: (_, setStatementState) => FutureBuilder<List<Map<String, dynamic>>>(
+                          future: statementFuture,
                           builder: (futureCtx, snapshot) {
                             if (snapshot.connectionState ==
                                 ConnectionState.waiting) {
@@ -1192,7 +1406,8 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                               final type =
                                   row['transaction_type']?.toString();
                               final amount = _number(row['amount']);
-                              if (type == 'invoice') totalInvoice += amount;
+                              // المبلغ المستلم من المذخر يُعرض في عمود المدين (يرفع الرصيد).
+                              if (type == 'invoice' || type == 'refund') totalInvoice += amount;
                               if (type == 'payment') totalPayment += amount;
                               if (type == 'return') totalReturn += amount;
                             }
@@ -1226,8 +1441,19 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                                     TableCellVerticalAlignment.middle,
                                 children: [
                                   _statementHeaderRow(),
-                                  for (final row in statement)
-                                    _statementRow(row),
+                                  for (final row in statement) ...[
+                                    _statementRow(
+                                      row,
+                                      expanded: expandedReturns.contains(row['id']),
+                                      onToggle: () => setStatementState(() {
+                                        expandedReturns.contains(row['id'])
+                                            ? expandedReturns.remove(row['id'])
+                                            : expandedReturns.add(row['id']);
+                                      }),
+                                    ),
+                                    if (row['transaction_type'] == 'return' && expandedReturns.contains(row['id']))
+                                      _statementReturnItemsRow(row),
+                                  ],
                                   _statementTotalsRow(
                                     totalInvoice,
                                     totalPayment,
@@ -1238,6 +1464,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                               ),
                             );
                           },
+                        ),
                         ),
                       ),
                       _statementCloseButton(dialogContext),
@@ -1339,7 +1566,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
       children: [
         label('التاريخ'),
         label('البيان'),
-        label('مدين\n(فاتورة)'),
+        label('مدين\n(فاتورة / استلام)'),
         label('دائن - دفعة', icon: Icons.payments_outlined),
         label('دائن - استرجاع', icon: Icons.undo_rounded),
         label('الرصيد بعد\nالحركة'),
@@ -1348,11 +1575,14 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
   }
 
   // --- صف بيانات لحركة واحدة (فاتورة / دفعة / استرجاع) ---
-  TableRow _statementRow(Map<String, dynamic> row) {
+  TableRow _statementRow(Map<String, dynamic> row, {bool expanded = false, VoidCallback? onToggle}) {
     final type = row['transaction_type']?.toString() ?? '';
     final isInvoice = type == 'invoice';
     final isPayment = type == 'payment';
     final isReturn = type == 'return';
+    final isRefund = type == 'refund';
+    final isCreditApplied = type == 'credit_applied';
+    final returnItems = isReturn && row['items'] is List ? row['items'] as List : const [];
 
     final amount = _number(row['amount']);
     final balance = _number(row['balance']);
@@ -1368,6 +1598,14 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
       badgeBg = success.withValues(alpha: 0.16);
       badgeFg = const Color(0xFF1E8449);
       badgeText = 'دفعة';
+    } else if (isRefund) {
+      badgeBg = const Color(0xFFE8DAEF);
+      badgeFg = const Color(0xFF6C3483);
+      badgeText = 'استلام';
+    } else if (isCreditApplied) {
+      badgeBg = const Color(0xFFD6EAF8);
+      badgeFg = const Color(0xFF1F618D);
+      badgeText = 'خصم رصيد';
     } else {
       badgeBg = warning.withValues(alpha: 0.18);
       badgeFg = const Color(0xFF9C5B00);
@@ -1420,6 +1658,12 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
                 ),
               ),
               const SizedBox(width: 6),
+              if (returnItems.isNotEmpty)
+                InkWell(
+                  onTap: onToggle,
+                  child: Icon(expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                      size: 18, color: primaryDark),
+                ),
               Flexible(
                 child: Text(
                   _statementDescription(row),
@@ -1438,7 +1682,7 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
           alignment: Alignment.centerRight,
         ),
         _statementCell(
-          amountText(isInvoice ? amount : 0, const Color(0xFF2C3E50)),
+          amountText(isInvoice || isRefund ? amount : 0, const Color(0xFF2C3E50)),
         ),
         _statementCell(
           amountText(isPayment ? amount : 0, success),
@@ -1448,18 +1692,60 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
         ),
         _statementCell(
           Text(
-            _formatAmount(balance),
+            _balanceText(balance),
             textAlign: TextAlign.center,
             style: TextStyle(
               fontWeight: FontWeight.w800,
               fontSize: 12.5,
-              color: balance > 0 ? danger : textSecondary,
+              color: _balanceColor(balance),
             ),
           ),
         ),
       ],
     );
   }
+
+  /// أدوية استرجاع (يظهر تحت سطره في كشف الحساب عند فتحه).
+  TableRow _statementReturnItemsRow(Map<String, dynamic> row) {
+    final items = (row['items'] as List).whereType<Map>().toList();
+    return TableRow(
+      decoration: const BoxDecoration(
+        color: Color(0xFFF4FAFE),
+        border: Border(bottom: BorderSide(color: borderCol, width: 1)),
+      ),
+      children: [
+        const SizedBox(),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(6, 6, 24, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final item in items)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Text(
+                    '• ${item['trade_name']} × ${_number(item['quantity']).toInt()}'
+                    '${_number(item['credited_quantity']) < _number(item['quantity']) ? ' (${(_number(item['quantity']) - _number(item['credited_quantity'])).toInt()} بلا رصيد)' : ''}'
+                    ' — ${_formatAmount(_number(item['credit_amount']))} د.ع',
+                    style: const TextStyle(fontSize: 12, color: textMain),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(),
+        const SizedBox(),
+        const SizedBox(),
+        const SizedBox(),
+      ],
+    );
+  }
+
+  /// الرصيد السالب = المذخر مدين للصيدلية: "لصالحك" بلون مختلف بدل رقم سالب.
+  String _balanceText(double balance) =>
+      balance < -0.001 ? 'لصالحك ${_formatAmount(-balance)}' : _formatAmount(balance);
+
+  Color _balanceColor(double balance) => balance > 0.001 ? danger : (balance < -0.001 ? success : textSecondary);
 
   // --- صف الإجمالي أسفل الجدول ---
   TableRow _statementTotalsRow(
@@ -1497,9 +1783,10 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
         _statementCell(total(totalPayment, color: success)),
         _statementCell(total(totalReturn, color: warning)),
         _statementCell(
-          total(
-            finalBalance,
-            color: finalBalance > 0 ? danger : textSecondary,
+          Text(
+            finalBalance < -0.001 ? 'رصيد لصالحك: ${_formatAmount(-finalBalance)}' : _formatAmount(finalBalance),
+            textAlign: TextAlign.center,
+            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: _balanceColor(finalBalance)),
           ),
         ),
       ],
@@ -1532,6 +1819,123 @@ Widget _buildInvoicesSection(int supplierId, String supplierName) {
   // ==========================================
   // 🗑️ 5. تأكيد حذف المذخر
   // ==========================================
+  /// "استلام أموال من المذخر": المبلغ افتراضياً كامل الرصيد، والجزئي مسموح،
+  /// ولا يتجاوز الرصيد المتاح أبداً (يُتحقق منه أيضاً عند الحفظ).
+  Future<void> _showReceiveRefundDialog(
+    BuildContext context,
+    int supplierId,
+    String supplierName,
+    double availableCredit,
+  ) async {
+    final amountController = TextEditingController(text: availableCredit.toStringAsFixed(availableCredit % 1 == 0 ? 0 : 2));
+    final notesController = TextEditingController();
+    var date = DateTime.now();
+    String? error;
+    var saving = false;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Text('استلام أموال من $supplierName', style: const TextStyle(color: textMain, fontWeight: FontWeight.bold)),
+            content: SizedBox(
+              width: 380,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('رصيدك لدى المذخر: ${_formatAmount(availableCredit)} د.ع',
+                      style: const TextStyle(color: success, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: amountController,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+                    decoration: const InputDecoration(labelText: 'المبلغ المستلم', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 12),
+                  InkWell(
+                    onTap: () async {
+                      final picked = await showDatePicker(
+                        context: ctx,
+                        initialDate: date,
+                        firstDate: DateTime(DateTime.now().year - 3),
+                        lastDate: DateTime.now(),
+                      );
+                      if (picked != null) setDialogState(() => date = picked);
+                    },
+                    child: InputDecorator(
+                      decoration: const InputDecoration(labelText: 'التاريخ', border: OutlineInputBorder()),
+                      child: Text(_formatDate(date.toIso8601String())),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: notesController,
+                    decoration: const InputDecoration(labelText: 'ملاحظات (اختياري)', border: OutlineInputBorder()),
+                  ),
+                  if (error != null) ...[
+                    const SizedBox(height: 10),
+                    Text(error!, style: const TextStyle(color: danger, fontWeight: FontWeight.w600)),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء', style: TextStyle(color: textSecondary))),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: success, foregroundColor: Colors.white, elevation: 0),
+                onPressed: saving
+                    ? null
+                    : () async {
+                        final amount = double.tryParse(amountController.text.trim()) ?? 0;
+                        if (amount <= 0) {
+                          setDialogState(() => error = 'أدخل مبلغاً أكبر من صفر.');
+                          return;
+                        }
+                        if (amount > availableCredit + 0.001) {
+                          setDialogState(() => error = 'المبلغ أكبر من رصيدك لدى المذخر.');
+                          return;
+                        }
+                        setDialogState(() {
+                          saving = true;
+                          error = null;
+                        });
+                        try {
+                          await _repository.receiveSupplierRefund(
+                            pharmacyId: widget.pharmacyId,
+                            isOnlineMode: widget.isOnlineMode,
+                            supplierId: supplierId,
+                            amount: amount,
+                            notes: notesController.text,
+                            receivedDate: date,
+                          );
+                          if (ctx.mounted) Navigator.pop(ctx);
+                          _refreshData();
+                          if (mounted) {
+                            ScaffoldMessenger.of(this.context).showSnackBar(
+                              const SnackBar(content: Text('تم تسجيل المبلغ المستلم من المذخر.'), backgroundColor: success),
+                            );
+                          }
+                        } catch (e) {
+                          setDialogState(() {
+                            saving = false;
+                            error = e is PurchaseListException ? e.message : e.toString();
+                          });
+                        }
+                      },
+                child: const Text('تأكيد الاستلام'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   void _confirmDeleteSupplier(int id, String name) {
     showDialog(
       context: context,

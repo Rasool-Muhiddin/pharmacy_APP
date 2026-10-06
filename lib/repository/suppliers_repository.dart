@@ -1,6 +1,8 @@
 import '../database/db_helper.dart';
+import '../models/purchase_list.dart';
 import '../services/connectivity_service.dart';
 import '../services/suppliers_api_service.dart';
+import 'medicine_repository.dart';
 
 class SuppliersRepositoryException implements Exception {
   final String message;
@@ -139,23 +141,93 @@ class SuppliersRepository {
     await _api.deleteSupplier(id);
   }
 
-  Future<void> insertPurchaseInvoice({
+  /// قائمة مذخر كاملة من شاشة المخزون (الطريق الوحيد لإنشاء فاتورة شراء):
+  /// المذخر (موجود [supplierId] أو جديد [supplierName]) ← الفاتورة ← توريد كل
+  /// الأصناف (مع البونص) ← الدفعة الأولية [paidAmount]. الكل أو لا شيء؛ أخطاء
+  /// الأسطر ترمي [PurchaseListException] (line = السطر المرفوض).
+  ///
+  /// أونلاين: طلب واحد ذرّي على الخادم، ثم تحديث كاش المخزون بالأصناف المعادة.
+  Future<void> createPurchaseList({
     required int pharmacyId,
     required bool isOnlineMode,
-    required Map<String, dynamic> data,
+    required int warehouseId,
+    required String invoiceNumber,
+    required List<Map<String, dynamic>> items,
+    int? supplierId,
+    String? supplierName,
+    String? supplierPhone,
+    String? invoiceDate,
+    double paidAmount = 0,
   }) async {
     if (!isOnlineMode) {
-      await _db.insertPurchaseInvoice({...data, 'pharmacy_id': pharmacyId});
+      await _db.createPurchaseList(
+        pharmacyId: pharmacyId,
+        mode: PurchaseListMode.supplierList,
+        warehouseId: warehouseId,
+        items: items,
+        supplierId: supplierId,
+        supplierName: supplierName,
+        supplierPhone: supplierPhone,
+        invoiceNumber: invoiceNumber,
+        invoiceDate: invoiceDate,
+        paidAmount: paidAmount,
+      );
       return;
     }
 
+    if (DatabaseHelper.isLocalId(warehouseId) ||
+        items.any((i) => i['medicine_id'] is int && DatabaseHelper.isLocalId(i['medicine_id'] as int))) {
+      throw const SuppliersRepositoryException(
+        'هذا السجل محلي (أوفلاين) ولم يُرفع إلى الخادم بعد، فلا يمكن تعديله في وضع الأونلاين.',
+      );
+    }
     await _assertOnlineWritable();
-    await _api.createPurchaseInvoice({
-      'supplier': data['supplier_id'],
-      'invoice_number': data['invoice_number'] ?? '',
-      'total_amount': data['total_amount'],
-      'paid_amount': data['paid_amount'] ?? 0,
-    });
+
+    final Map<String, dynamic> result;
+    try {
+      result = await _api.createPurchaseList({
+        if (supplierId != null) 'supplier': supplierId,
+        'supplier_name': supplierName ?? '',
+        'supplier_phone': supplierPhone ?? '',
+        'invoice_number': invoiceNumber,
+        if (invoiceDate != null) 'invoice_date': invoiceDate,
+        'warehouse': warehouseId,
+        'paid_amount': paidAmount.toStringAsFixed(2),
+        'items': items,
+      });
+    } on SuppliersApiException catch (e) {
+      throw PurchaseListException(e.message, line: e.line);
+    }
+    await MedicineRepository.instance.cacheServerMedicines(
+      pharmacyId: pharmacyId,
+      serverItems: result['medicines'],
+    );
+  }
+
+  /// أصناف فاتورة شراء (اسم، كمية مدفوعة، بونص، سعر، صلاحية، إجمالي السطر).
+  Future<List<Map<String, dynamic>>> getPurchaseInvoiceItems({
+    required int purchaseInvoiceId,
+    required bool isOnlineMode,
+  }) async {
+    if (!isOnlineMode) {
+      return (await _db.getPurchaseInvoiceItems(purchaseInvoiceId)).map(_normalizePurchaseItemRow).toList();
+    }
+    await _assertOnlineReadable();
+    final rows = await _api.fetchPurchaseInvoiceItems(purchaseInvoiceId);
+    return rows.map(_normalizePurchaseItemRow).toList();
+  }
+
+  /// الأصناف المشتراة من مذخر عبر كل فواتيره (لكشف الحساب).
+  Future<List<Map<String, dynamic>>> getSupplierPurchasedItems({
+    required int supplierId,
+    required bool isOnlineMode,
+  }) async {
+    if (!isOnlineMode) {
+      return (await _db.getSupplierPurchasedItems(supplierId)).map(_normalizePurchaseItemRow).toList();
+    }
+    await _assertOnlineReadable();
+    final rows = await _api.fetchSupplierPurchasedItems(supplierId);
+    return rows.map(_normalizePurchaseItemRow).toList();
   }
 
   Future<void> addPurchaseInvoicePayment({
@@ -181,41 +253,87 @@ class SuppliersRepository {
     await _api.addPurchaseInvoicePayment(purchaseInvoiceId, amount: amount, notes: notes);
   }
 
-  Future<void> addPurchaseInvoiceReturn({
+  /// استرجاع أدوية للمذخر من فاتورة شراء (الاسترجاع بالأصناف فقط). [lines]:
+  /// [{purchase_invoice_item_id, quantity, unit_price}]. الكل أو لا شيء؛ أخطاء
+  /// الأسطر ترمي [PurchaseListException] (line = السطر المرفوض).
+  /// أونلاين: طلب ذرّي على الخادم ثم تحديث كاش المخزون بالأصناف المعادة.
+  Future<void> returnPurchaseItems({
     required int pharmacyId,
     required bool isOnlineMode,
-    required int supplierId,
     required int purchaseInvoiceId,
-    required double amount,
+    required List<Map<String, dynamic>> lines,
     String? notes,
+    DateTime? returnDate,
   }) async {
     if (!isOnlineMode) {
-      await _db.addPurchaseInvoiceReturn(
+      await _db.returnPurchaseItems(
         pharmacyId: pharmacyId,
-        supplierId: supplierId,
         purchaseInvoiceId: purchaseInvoiceId,
-        amount: amount,
+        lines: lines,
         notes: notes,
+        returnDate: returnDate,
       );
       return;
     }
 
     await _assertOnlineWritable();
-    await _api.addPurchaseInvoiceReturn(purchaseInvoiceId, amount: amount, notes: notes);
+    final Map<String, dynamic> result;
+    try {
+      result = await _api.returnPurchaseItems(purchaseInvoiceId, {
+        'items': [
+          for (final line in lines)
+            {
+              'purchase_invoice_item': line['purchase_invoice_item_id'],
+              'quantity': line['quantity'],
+              if (line['unit_price'] != null) 'unit_price': (line['unit_price'] as num).toStringAsFixed(2),
+            },
+        ],
+        'notes': notes ?? '',
+        if (returnDate != null) 'return_date': _isoDate(returnDate),
+      });
+    } on SuppliersApiException catch (e) {
+      throw PurchaseListException(e.message, line: e.line);
+    }
+    await MedicineRepository.instance.cacheServerMedicines(
+      pharmacyId: pharmacyId,
+      serverItems: result['medicines'],
+    );
   }
 
-  Future<void> settlePurchaseInvoiceCredit({
+  /// استلام أموال من المذخر (جزئي مسموح، لا يتجاوز رصيد الصيدلية المتاح لديه).
+  Future<void> receiveSupplierRefund({
+    required int pharmacyId,
     required bool isOnlineMode,
-    required int purchaseInvoiceId,
+    required int supplierId,
+    required double amount,
+    String? notes,
+    DateTime? receivedDate,
   }) async {
     if (!isOnlineMode) {
-      await _db.settlePurchaseInvoiceCredit(purchaseInvoiceId);
+      await _db.receiveSupplierRefund(
+        pharmacyId: pharmacyId,
+        supplierId: supplierId,
+        amount: amount,
+        notes: notes,
+        receivedDate: receivedDate,
+      );
       return;
     }
 
     await _assertOnlineWritable();
-    await _api.settlePurchaseInvoiceCredit(purchaseInvoiceId);
+    try {
+      await _api.receiveSupplierRefund(supplierId, {
+        'amount': amount.toStringAsFixed(2),
+        'notes': notes ?? '',
+        if (receivedDate != null) 'received_date': _isoDate(receivedDate),
+      });
+    } on SuppliersApiException catch (e) {
+      throw PurchaseListException(e.message);
+    }
   }
+
+  static String _isoDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   // ================== أدوات مساعدة ==================
 
@@ -252,6 +370,9 @@ class SuppliersRepository {
       'invoice_count': (row['invoice_count'] as num? ?? 0).toInt(),
       'total_purchases': _numOf(row['total_purchases']).toDouble(),
       'remaining_debt': _numOf(row['remaining_debt']).toDouble(),
+      'balance': _numOf(row['balance']).toDouble(),
+      'credit_balance': _numOf(row['credit_balance']).toDouble(),
+      'available_credit': _numOf(row['available_credit']).toDouble(),
     };
   }
 
@@ -263,15 +384,47 @@ class SuppliersRepository {
       'returned_amount': _numOf(row['returned_amount']).toDouble(),
       'net_amount': _numOf(row['net_amount']).toDouble(),
       'remaining_amount': _numOf(row['remaining_amount']).toDouble(),
+      'credit_applied': _numOf(row['credit_applied']).toDouble(),
+      'item_count': _numOf(row['item_count']).toInt(),
+    };
+  }
+
+  /// سطر فاتورة شراء بشكل موحّد للوضعين (is_free = كمية مدفوعة 0).
+  Map<String, dynamic> _normalizePurchaseItemRow(Map<String, dynamic> row) {
+    final quantity = _numOf(row['quantity']).toInt();
+    return {
+      ...row,
+      'quantity': quantity,
+      'bonus_quantity': _numOf(row['bonus_quantity']).toInt(),
+      'is_free': quantity == 0,
+      'buy_price': _numOf(row['buy_price']).toDouble(),
+      'effective_unit_cost': _numOf(row['effective_unit_cost']).toDouble(),
+      'sell_price': _numOf(row['sell_price']).toDouble(),
+      'line_total': _numOf(row['line_total']).toDouble(),
+      'returned_quantity': _numOf(row['returned_quantity']).toInt(),
+      // null = الصنف حُذف من المخزون (لا يمكن استرجاعه).
+      'current_stock': row['current_stock'] == null ? null : _numOf(row['current_stock']).toInt(),
     };
   }
 
   Map<String, dynamic> _normalizeStatementRow(Map<String, dynamic> row) {
+    final items = row['items'];
     return {
       ...row,
       'amount': _numOf(row['amount']).toDouble(),
       'cash_paid': _numOf(row['cash_paid']).toDouble(),
       'debt_added': _numOf(row['debt_added']).toDouble(),
+      if (items is List)
+        'items': items
+            .whereType<Map>()
+            .map((i) => {
+                  ...Map<String, dynamic>.from(i),
+                  'quantity': _numOf(i['quantity']).toInt(),
+                  'credited_quantity': _numOf(i['credited_quantity']).toInt(),
+                  'unit_return_price': _numOf(i['unit_return_price']).toDouble(),
+                  'credit_amount': _numOf(i['credit_amount']).toDouble(),
+                })
+            .toList(),
     };
   }
 }

@@ -378,8 +378,8 @@ void main() {
     await raw.setVersion(8);
     await raw.close();
 
-    final db = await helper.database; // v8 -> v9 -> v10
-    expect(await db.getVersion(), 10);
+    final db = await helper.database; // v8 -> v9 -> v10 -> v11
+    expect(await db.getVersion(), 12);
     final priced = (await db.query('medicine', where: "trade_name = 'Priced'")).single;
     expect(priced['avg_cost'], 12.5);
     expect((await batches(db, priced['id'] as int)).map((b) => [b['quantity'], b['expiry_date'], b['purchase_price']]), [

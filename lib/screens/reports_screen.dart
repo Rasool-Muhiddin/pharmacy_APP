@@ -179,9 +179,9 @@ Future<void> _loadReportDataOffline() async {
       SELECT COUNT(id) AS total FROM invoice WHERE pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter()} AND is_refunded = 1
       AND date(created_at) BETWEEN date(?) AND date(?)
     ''', [widget.pharmacyId, startStr, endStr]);
-    final supplierDebtSummary = await db.rawQuery('''
-      SELECT COALESCE(SUM(remaining_debt), 0) AS total FROM purchase_invoice WHERE pharmacy_id = ?
-    ''', [widget.pharmacyId]);
+    // مجموع ديون المذاخر بالصيغة الموحّدة، لكل مذخر على حدة (رصيد مذخر لصالحنا لا
+    // يُطرح من دين مذخر آخر) — نفس supplier_ledger.total_debt في الخادم.
+    final totalSupplierDebt = await DatabaseHelper.instance.getTotalSuppliersDebt(widget.pharmacyId);
 
     // 2. حساب خسائر الأدوية المنتهية بالفترة المحددة
     // 🟢 يُحتسَب الدواء "خسارة" فقط بعد مرور يوم كامل فعلياً على تاريخه
@@ -278,7 +278,7 @@ Future<void> _loadReportDataOffline() async {
       _totalInvoicesCount = totalInvoicesCount;
       _totalDiscountsGiven = totalDiscounts;
       _totalExpenses = (expensesSummary.first['total'] as num).toDouble();
-      _totalSupplierDebt = (supplierDebtSummary.first['total'] as num).toDouble();
+      _totalSupplierDebt = totalSupplierDebt;
       _refundedInvoicesCount = (refundedSummary.first['total'] as num).toInt();
       _totalDamageLosses = expiredLosses + damagedLosses; // الخسائر الخاصة بالفترة فقط
       _topSellingItems = topSelling;

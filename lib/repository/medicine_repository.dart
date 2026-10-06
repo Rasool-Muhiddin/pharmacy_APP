@@ -1,4 +1,5 @@
 import '../database/db_helper.dart';
+import '../models/purchase_list.dart';
 import '../services/connectivity_service.dart';
 import '../services/damaged_api_service.dart';
 import '../services/medicine_api_service.dart';
@@ -99,47 +100,46 @@ class MedicineRepository {
     return _localRowById(id);
   }
 
-  /// توريد شحنة: متوسط كلفة مرجّح، سعر بيع موحّد جديد، ودفعة صلاحية جديدة.
-  /// [purchasePrice] null = يُستخدم avg_cost الحالي (حالة غير المالك).
-  ///
-  /// أونلاين: طلب واحد ذرّي على الخادم (`POST /medicines/<id>/supply/` داخل
-  /// transaction + select_for_update) بدل قراءة-ثم-كتابة الكمية المطلقة
-  /// القديمة التي كانت تُفقد إحدى زيادتين متزامنتين.
-  Future<Map<String, dynamic>> supplyMedicine({
+  /// رصيد افتتاحي (المخزون الموجود على الرفوف عند بدء استخدام النظام): نفس
+  /// أسطر قائمة المذخر بلا مذخر ولا فاتورة ولا دين، الكل أو لا شيء. أخطاء
+  /// الأسطر ترمي [PurchaseListException] (line = السطر المرفوض).
+  Future<void> createOpeningStock({
     required int pharmacyId,
     required bool isOnlineMode,
-    required int medicineId,
-    required int addedQuantity,
-    String? newExpiryDate,
-    double? purchasePrice,
-    required double salePrice,
+    required int warehouseId,
+    required List<Map<String, dynamic>> items,
   }) async {
     if (!isOnlineMode) {
-      await _db.supplyMedicine(
-        medicineId: medicineId,
-        addedQuantity: addedQuantity,
-        newExpiryDate: newExpiryDate,
-        purchasePrice: purchasePrice,
-        salePrice: salePrice,
+      await _db.createPurchaseList(
+        pharmacyId: pharmacyId,
+        mode: PurchaseListMode.openingStock,
+        warehouseId: warehouseId,
+        items: items,
       );
-      return _localRowById(medicineId);
+      return;
     }
 
-    _assertServerRecord(medicineId);
+    _assertServerRecord(warehouseId);
+    for (final item in items) {
+      _assertServerRecord(item['medicine_id']);
+    }
     await _assertOnlineWritable();
 
-    final updated = await _api.supplyMedicine(
-      medicineId,
-      quantity: addedQuantity,
-      expiryDate: newExpiryDate,
-      purchasePrice: purchasePrice,
-      salePrice: salePrice,
-    );
-    await _db.upsertMedicineFromServer(
-      pharmacyId: pharmacyId,
-      serverData: updated,
-    );
-    return _localRowById(medicineId);
+    final Map<String, dynamic> result;
+    try {
+      result = await _api.createOpeningStock({'warehouse': warehouseId, 'items': items});
+    } on MedicineApiException catch (e) {
+      throw PurchaseListException(e.message, line: e.line);
+    }
+    await cacheServerMedicines(pharmacyId: pharmacyId, serverItems: result['medicines']);
+  }
+
+  /// يحدّث كاش المخزون المحلي بأصناف أعادها الخادم بعد عملية ناجحة (مع دفعاتها).
+  Future<void> cacheServerMedicines({required int pharmacyId, required Object? serverItems}) async {
+    if (serverItems is! List) return;
+    for (final item in serverItems.whereType<Map<String, dynamic>>()) {
+      await _db.upsertMedicineFromServer(pharmacyId: pharmacyId, serverData: item);
+    }
   }
 
   /// إتلاف جزء من كمية دواء (خصم من المخزن + تسجيل السبب).

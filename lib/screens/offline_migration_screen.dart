@@ -227,8 +227,15 @@ class _OfflineMigrationScreenState extends State<OfflineMigrationScreen> {
         _summaryRow('الموردون', '${r['suppliers_created']}'),
         _summaryRow('الأدوية', '${r['medicines_created']}'),
         _summaryRow('فواتير الشراء', '${r['purchase_invoices_created']}'),
+        // خادم أقدم لا يرسل هذا العدد.
+        if (r['purchase_invoice_items_created'] != null)
+          _summaryRow('أصناف فواتير الشراء', '${r['purchase_invoice_items_created']}'),
         _summaryRow('دفعات الموردين', '${r['supplier_payments_created']}'),
         _summaryRow('مرتجعات الشراء', '${r['purchase_invoice_returns_created']}'),
+        if (r['purchase_return_items_created'] != null)
+          _summaryRow('أدوية مسترجعة للمذاخر', '${r['purchase_return_items_created']}'),
+        if (r['supplier_refunds_created'] != null)
+          _summaryRow('مبالغ مستلمة من المذاخر', '${r['supplier_refunds_created']}'),
         _summaryRow('فواتير البيع', '${r['invoices_created']}'),
         _summaryRow('عناصر فواتير البيع', '${r['invoice_items_created']}'),
         _summaryRow('سجلات التالف', '${r['damaged_records_created']}'),

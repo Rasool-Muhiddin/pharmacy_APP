@@ -6,9 +6,13 @@ class SuppliersApiException implements Exception {
   final String message;
   final int? statusCode;
 
+  /// رقم السطر المرفوض في قائمة المذخر (من 0)، إن أرسله الخادم.
+  final int? line;
+
   const SuppliersApiException(
     this.message, {
     this.statusCode,
+    this.line,
   });
 
   @override
@@ -98,8 +102,21 @@ class SuppliersApiService {
     return results;
   }
 
-  Future<Map<String, dynamic>> createPurchaseInvoice(Map<String, dynamic> data) {
-    return _send(method: 'POST', url: '$_baseUrl/purchase-invoices/', body: data);
+  /// POST /api/purchase-invoices/from-list/ — قائمة مذخر كاملة ذرّياً (المذخر،
+  /// الفاتورة، توريد كل الأصناف، الدفعة الأولية). يرجع
+  /// {"purchase_invoice", "supplier", "medicines"}؛ المجاميع يحسبها الخادم.
+  Future<Map<String, dynamic>> createPurchaseList(Map<String, dynamic> body) {
+    return _send(method: 'POST', url: '$_baseUrl/purchase-invoices/from-list/', body: body);
+  }
+
+  /// `GET /api/purchase-invoices/{id}/items/` — أصناف الفاتورة (فارغة لليدوية القديمة).
+  Future<List<Map<String, dynamic>>> fetchPurchaseInvoiceItems(int invoiceId) {
+    return _getList(url: '$_baseUrl/purchase-invoices/$invoiceId/items/');
+  }
+
+  /// `GET /api/suppliers/{id}/purchased-items/` — الأصناف المشتراة من المذخر.
+  Future<List<Map<String, dynamic>>> fetchSupplierPurchasedItems(int supplierId) {
+    return _getList(url: '$_baseUrl/suppliers/$supplierId/purchased-items/');
   }
 
   Future<Map<String, dynamic>> addPurchaseInvoicePayment(
@@ -114,24 +131,15 @@ class SuppliersApiService {
     );
   }
 
-  Future<Map<String, dynamic>> addPurchaseInvoiceReturn(
-    int invoiceId, {
-    required double amount,
-    String? notes,
-  }) {
-    return _send(
-      method: 'POST',
-      url: '$_baseUrl/purchase-invoices/$invoiceId/add_return/',
-      body: {'amount': amount, 'notes': notes ?? ''},
-    );
+  /// `POST /api/purchase-invoices/{id}/return-items/` — استرجاع أدوية للمذخر ذرّياً.
+  /// يرجع {"purchase_invoice", "return", "medicines"}؛ الحدود والرصيد يحسبها الخادم.
+  Future<Map<String, dynamic>> returnPurchaseItems(int invoiceId, Map<String, dynamic> body) {
+    return _send(method: 'POST', url: '$_baseUrl/purchase-invoices/$invoiceId/return-items/', body: body);
   }
 
-  Future<Map<String, dynamic>> settlePurchaseInvoiceCredit(int invoiceId) {
-    return _send(
-      method: 'POST',
-      url: '$_baseUrl/purchase-invoices/$invoiceId/settle_credit/',
-      body: const {},
-    );
+  /// `POST /api/suppliers/{id}/receive-refund/` — استلام أموال من المذخر مقابل رصيد الصيدلية.
+  Future<Map<String, dynamic>> receiveSupplierRefund(int supplierId, Map<String, dynamic> body) {
+    return _send(method: 'POST', url: '$_baseUrl/suppliers/$supplierId/receive-refund/', body: body);
   }
 
   // ================== طبقة النقل المشتركة (نفس نمط MedicineApiService) ==================
@@ -258,7 +266,11 @@ class SuppliersApiService {
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw SuppliersApiException(_extractErrorMessage(decoded), statusCode: response.statusCode);
+      throw SuppliersApiException(
+        _extractErrorMessage(decoded),
+        statusCode: response.statusCode,
+        line: decoded is Map ? int.tryParse(decoded['line']?.toString() ?? '') : null,
+      );
     }
 
     return decoded;

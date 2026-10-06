@@ -7,10 +7,11 @@
 
 الحمولة بنفس شكل DatabaseHelper.getOfflineMigrationPayload في Flutter.
 
-الترتيب صارم بسبب الاعتماديات: Warehouses → Suppliers → Medicines →
-PurchaseInvoices (مع Payments/Returns متداخلة) → Invoices (مع Items متداخلة)
-→ DamagedMedicines → Expenses → StockTransfers. القوائم المتداخلة تُرسَل ضمن
-عنصرها الأب، فلا حاجة لجدول تحويل معرّفات إلا للمخازن/الموردين/الأدوية.
+الترتيب صارم بسبب الاعتماديات: Warehouses → Suppliers → Medicines (مع
+Batches) → PurchaseInvoices (مع Items/Payments/Returns متداخلة) → Invoices (مع
+Items متداخلة) → DamagedMedicines → Expenses → StockTransfers. القوائم
+المتداخلة تُرسَل ضمن عنصرها الأب، فلا حاجة لجدول تحويل معرّفات إلا للمخازن/
+الموردين/الأدوية/فواتير الشراء (الأخيرة لربط الدفعات بفاتورتها بعد إنشائها).
 """
 
 import logging
@@ -32,11 +33,18 @@ from .models import (
     InvoiceItem,
     Medicine,
     MedicineBatch,
+    BATCH_SOURCE_CHOICES,
+    PURCHASE_SOURCE_CHOICES,
+    PURCHASE_SOURCE_MANUAL,
     PurchaseInvoice,
+    PurchaseInvoiceItem,
     PurchaseInvoiceReturn,
+    PurchaseInvoiceReturnItem,
     StockTransfer,
     Supplier,
+    SupplierCreditApplication,
     SupplierPayment,
+    SupplierRefund,
     Warehouse,
 )
 
@@ -44,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 PAYLOAD_LIST_KEYS = (
     "warehouses", "suppliers", "medicines", "purchase_invoices",
-    "invoices", "damaged_medicines", "expenses", "stock_transfers",
+    "invoices", "damaged_medicines", "expenses", "stock_transfers", "supplier_refunds",
 )
 
 
@@ -123,12 +131,33 @@ def _parse_datetime(value):
 
 
 def _cost(value):
-    """كلفة اختيارية من الجهاز: None/فارغ/غير رقمي/<= 0 = غير معروفة."""
+    """
+    كلفة اختيارية من الجهاز: None/فارغ/غير رقمي/سالب = غير معروفة. الصفر كلفة
+    معروفة (صنف مجاني من المذخر)؛ الجهاز لم يخزّن 0 كلفةً قط قبل ذلك (كان NULL).
+    """
+    if value is None or value == "":
+        return None
     try:
         cost = Decimal(str(value))
     except Exception:
         return None
-    return stock.to_cost(cost) if cost.is_finite() and cost > 0 else None
+    return stock.to_cost(cost) if cost.is_finite() and cost >= 0 else None
+
+
+_BATCH_SOURCES = {key for key, _ in BATCH_SOURCE_CHOICES}
+_PURCHASE_SOURCES = {key for key, _ in PURCHASE_SOURCE_CHOICES}
+
+
+def _unique_invoice_number(taken, supplier_id, number):
+    """احتياط لبيانات أقدم: رقم مكرر لنفس المذخر يُعطى لاحقة -2، -3… كترحيل 0013."""
+    if not number:
+        return number
+    candidate, suffix = number, 2
+    while (supplier_id, candidate) in taken:
+        candidate = f"{number}-{suffix}"[:60]
+        suffix += 1
+    taken.add((supplier_id, candidate))
+    return candidate
 
 
 def _money_or_none(value):
@@ -166,6 +195,7 @@ def iter_offline_import(pharmacy, payload):
     damaged_in = payload.get("damaged_medicines") or []
     expenses_in = payload.get("expenses") or []
     transfers_in = payload.get("stock_transfers") or []
+    refunds_in = payload.get("supplier_refunds") or []
 
     # كل عنصر من المستويات العليا = وحدة تقدّم واحدة. العناصر
     # المتداخلة (payments/returns/items) لا تُحسَب في الإجمالي منفصلة —
@@ -173,7 +203,7 @@ def iter_offline_import(pharmacy, payload):
     # واحدة، بصرف النظر عن عدد دفعاتها).
     overall_total = (
         len(warehouses_in) + len(suppliers_in) + len(medicines_in) + len(purchase_invoices_in)
-        + len(invoices_in) + len(damaged_in) + len(expenses_in) + len(transfers_in)
+        + len(invoices_in) + len(damaged_in) + len(expenses_in) + len(transfers_in) + len(refunds_in)
     )
     overall_done = 0
     yield ({"event": "start", "overall_total": overall_total})
@@ -222,6 +252,8 @@ def iter_offline_import(pharmacy, payload):
             yield ({"event": "progress", "stage": "suppliers", "overall_done": overall_done, "overall_total": overall_total})
 
         medicine_id_map = {}
+        # (دفعة الخادم، معرّف فاتورة الشراء المحلي): تُربط بعد إنشاء الفواتير.
+        batches_pending_invoice = []
         seen_barcodes = set()
         for item in medicines_in:
             # عملاء أقدم لا يرسلون local_warehouse_id: كل أدويتهم للرئيسي.
@@ -255,13 +287,18 @@ def iter_offline_import(pharmacy, payload):
                 for b in batches:
                     qty = int(b.get("quantity") or 0)
                     if qty > 0:
-                        MedicineBatch.objects.create(
+                        source = b.get("source") or ""
+                        batch = MedicineBatch.objects.create(
                             pharmacy=pharmacy,
                             medicine=medicine,
                             quantity=qty,
                             expiry_date=_parse_date(b.get("expiry_date")),
                             purchase_price=_cost(b.get("purchase_price")),
+                            source=source if source in _BATCH_SOURCES else "",
+                            supplier_id=supplier_id_map.get(b.get("local_supplier_id")),
                         )
+                        if b.get("local_purchase_invoice_id") is not None:
+                            batches_pending_invoice.append((batch.pk, b["local_purchase_invoice_id"]))
                 stock.reconcile(medicine)
                 stock.refresh_stock(medicine)
             else:
@@ -273,8 +310,13 @@ def iter_offline_import(pharmacy, payload):
             yield ({"event": "progress", "stage": "medicines", "overall_done": overall_done, "overall_total": overall_total})
 
         purchase_invoices_created = 0
+        purchase_items_created = 0
+        return_items_created = 0
+        credit_applications_created = 0
         payments_created = 0
         returns_created = 0
+        purchase_invoice_id_map = {}
+        taken_numbers = set()
         for item in purchase_invoices_in:
             local_supplier_id = item.get("local_supplier_id")
             server_supplier_id = supplier_id_map.get(local_supplier_id)
@@ -283,14 +325,43 @@ def iter_offline_import(pharmacy, payload):
                     f"فاتورة شراء تشير لمورد غير موجود ضمن قائمة الموردين المرفوعة (local_supplier_id={local_supplier_id})."
                 )
 
+            source = item.get("source") or PURCHASE_SOURCE_MANUAL
+            items_in = item.get("items") or []
             purchase_invoice = PurchaseInvoice.objects.create(
                 pharmacy=pharmacy,
                 supplier_id=server_supplier_id,
-                invoice_number=item.get("invoice_number") or "",
+                invoice_number=_unique_invoice_number(
+                    taken_numbers, server_supplier_id, (item.get("invoice_number") or "").strip()
+                ),
+                invoice_date=_parse_date(item.get("invoice_date")),
+                source=source if source in _PURCHASE_SOURCES else PURCHASE_SOURCE_MANUAL,
+                item_count=int(item.get("item_count") or len(items_in)),
                 total_amount=Decimal(str(item.get("total_amount") or 0)),
                 paid_amount=Decimal(str(item.get("paid_amount") or 0)),
                 created_at=_parse_datetime(item.get("created_at")) or timezone.now(),
             )
+            if item.get("local_id") is not None:
+                purchase_invoice_id_map[item["local_id"]] = purchase_invoice.pk
+
+            item_id_map = {}
+            for it in items_in:
+                # الصنف قد يكون حُذف محلياً (SET_NULL): يبقى السطر بلقطة الاسم.
+                created_item = PurchaseInvoiceItem.objects.create(
+                    pharmacy=pharmacy,
+                    purchase_invoice=purchase_invoice,
+                    medicine_id=medicine_id_map.get(it.get("local_medicine_id")),
+                    trade_name=it.get("trade_name") or "",
+                    quantity=int(it.get("quantity") or 0),
+                    bonus_quantity=int(it.get("bonus_quantity") or 0),
+                    buy_price=Decimal(str(it.get("buy_price") or 0)),
+                    effective_unit_cost=_cost(it.get("effective_unit_cost")) or Decimal(0),
+                    sell_price=Decimal(str(it.get("sell_price") or 0)),
+                    expiry_date=_parse_date(it.get("expiry_date")),
+                    line_total=Decimal(str(it.get("line_total") or 0)),
+                )
+                if it.get("local_id") is not None:
+                    item_id_map[it["local_id"]] = created_item
+                purchase_items_created += 1
 
             for p in item.get("payments") or []:
                 SupplierPayment.objects.create(
@@ -304,19 +375,72 @@ def iter_offline_import(pharmacy, payload):
                 payments_created += 1
 
             for r in item.get("returns") or []:
-                PurchaseInvoiceReturn.objects.create(
+                returned = Decimal(str(r.get("amount_returned") or 0))
+                record = PurchaseInvoiceReturn.objects.create(
                     pharmacy=pharmacy,
                     supplier_id=server_supplier_id,
                     purchase_invoice=purchase_invoice,
-                    amount_returned=Decimal(str(r.get("amount_returned") or 0)),
+                    amount_returned=returned,
+                    excess_credit=min(Decimal(str(r.get("excess_credit") or 0)), returned),
                     notes=r.get("notes") or "",
                     returned_at=_parse_datetime(r.get("returned_at")) or timezone.now(),
                 )
                 returns_created += 1
+                # أسطر الاسترجاع بالأصناف (الاسترجاع القديم بالمبلغ فقط بلا أسطر).
+                for line in r.get("items") or []:
+                    source_item = item_id_map.get(line.get("local_purchase_invoice_item_id"))
+                    if source_item is None:
+                        raise ValidationError("سطر استرجاع يشير لصنف غير موجود ضمن أصناف فاتورته المرفوعة.")
+                    quantity = int(line.get("quantity") or 0)
+                    PurchaseInvoiceReturnItem.objects.create(
+                        pharmacy=pharmacy,
+                        purchase_return=record,
+                        purchase_invoice_item=source_item,
+                        medicine_id=medicine_id_map.get(line.get("local_medicine_id")),
+                        trade_name=line.get("trade_name") or source_item.trade_name,
+                        quantity=quantity,
+                        credited_quantity=min(int(line.get("credited_quantity") or 0), quantity),
+                        unit_return_price=Decimal(str(line.get("unit_return_price") or 0)),
+                        credit_amount=Decimal(str(line.get("credit_amount") or 0)),
+                    )
+                    return_items_created += 1
+
+            # "خصم من رصيد سابق" / تسوية فائض مرتجع على هذه الفاتورة.
+            for a in item.get("credit_applications") or []:
+                SupplierCreditApplication.objects.create(
+                    pharmacy=pharmacy,
+                    supplier_id=server_supplier_id,
+                    purchase_invoice=purchase_invoice,
+                    amount=Decimal(str(a.get("amount") or 0)),
+                    notes=a.get("notes") or "",
+                    applied_at=_parse_datetime(a.get("applied_at")) or timezone.now(),
+                )
+                credit_applications_created += 1
 
             purchase_invoices_created += 1
             overall_done += 1
             yield ({"event": "progress", "stage": "purchase_invoices", "overall_done": overall_done, "overall_total": overall_total})
+
+        for batch_id, local_invoice_id in batches_pending_invoice:
+            server_invoice_id = purchase_invoice_id_map.get(local_invoice_id)
+            if server_invoice_id is not None:
+                MedicineBatch.objects.filter(pk=batch_id).update(purchase_invoice_id=server_invoice_id)
+
+        refunds_created = 0
+        for item in refunds_in:
+            server_supplier_id = supplier_id_map.get(item.get("local_supplier_id"))
+            if server_supplier_id is None:
+                raise ValidationError("مبلغ مستلم من مذخر يشير لمورد غير موجود ضمن قائمة الموردين المرفوعة.")
+            SupplierRefund.objects.create(
+                pharmacy=pharmacy,
+                supplier_id=server_supplier_id,
+                amount=Decimal(str(item.get("amount") or 0)),
+                notes=item.get("notes") or "",
+                received_at=_parse_datetime(item.get("received_at")) or timezone.now(),
+            )
+            refunds_created += 1
+            overall_done += 1
+            yield ({"event": "progress", "stage": "supplier_refunds", "overall_done": overall_done, "overall_total": overall_total})
 
         invoices_created = 0
         invoice_items_created = 0
@@ -432,6 +556,10 @@ def iter_offline_import(pharmacy, payload):
             "suppliers_created": len(supplier_id_map),
             "medicines_created": len(medicine_id_map),
             "purchase_invoices_created": purchase_invoices_created,
+            "purchase_invoice_items_created": purchase_items_created,
+            "purchase_return_items_created": return_items_created,
+            "supplier_credit_applications_created": credit_applications_created,
+            "supplier_refunds_created": refunds_created,
             "supplier_payments_created": payments_created,
             "purchase_invoice_returns_created": returns_created,
             "invoices_created": invoices_created,

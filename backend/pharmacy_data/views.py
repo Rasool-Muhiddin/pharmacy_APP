@@ -36,7 +36,7 @@ from .models import (
     SupplierPayment,
     Warehouse,
 )
-from . import stock
+from . import purchase_list, purchase_returns, stock, supplier_ledger
 from .offline_import import (
     error_message,
     has_existing_online_data,
@@ -49,7 +49,13 @@ from .serializers import (
     ExpenseSerializer,
     InvoiceSerializer,
     MedicineSerializer,
+    OpeningStockInputSerializer,
+    PurchaseInvoiceItemSerializer,
     PurchaseInvoiceSerializer,
+    PurchaseListInputSerializer,
+    PurchaseReturnItemSerializer,
+    ReturnItemsInputSerializer,
+    SupplierRefundInputSerializer,
     StockTransferInputSerializer,
     StockTransferSerializer,
     SupplierSerializer,
@@ -77,7 +83,9 @@ class MedicineViewSet(viewsets.ModelViewSet):
         membership = getattr(self.request.user, "pharmacymembership", None)
         if membership is None:
             return Medicine.objects.none()
-        qs = Medicine.objects.filter(pharmacy=membership.pharmacy).prefetch_related("batches")
+        qs = Medicine.objects.filter(pharmacy=membership.pharmacy).prefetch_related(
+            "batches", "batches__supplier", "batches__purchase_invoice"
+        )
         warehouse_id = self.request.query_params.get("warehouse")
         if warehouse_id:
             if not str(warehouse_id).isdigit():
@@ -119,6 +127,25 @@ class MedicineViewSet(viewsets.ModelViewSet):
             )
         medicine = self.get_queryset().get(pk=medicine.pk)
         return Response(self.get_serializer(medicine).data)
+
+    @action(detail=False, methods=["post"], url_path="opening-stock")
+    def opening_stock(self, request):
+        """
+        POST /api/medicines/opening-stock/
+        body: {"warehouse": 1?, "items": [{trade_name, quantity, buy_price, sell_price, expiry_date, ...}]}
+
+        رصيد افتتاحي (المخزون الموجود على الرفوف عند بدء استخدام النظام): نفس
+        أسطر قائمة المذخر بلا مذخر ولا فاتورة ولا دين، ذرّياً بالكامل.
+        """
+        membership, license = resolve_context(request)
+        data = purchase_list.validated_input(OpeningStockInputSerializer, request.data)
+        with transaction.atomic():
+            medicines = purchase_list.create_opening_stock(membership.pharmacy, license, data)
+        touched = self.get_queryset().filter(pk__in=[m.pk for m in medicines])
+        return Response(
+            {"medicines": self.get_serializer(touched, many=True).data},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 def _is_referenced(medicine):
@@ -269,13 +296,14 @@ class WarehouseViewSet(viewsets.ModelViewSet):
                     is_damaged=False,
                     barcode=barcode,
                 )
-            for expiry_date, purchase_price, part in moved:
+            for expiry_date, purchase_price, part, origin in moved:
                 MedicineBatch.objects.create(
                     pharmacy=pharmacy,
                     medicine=target,
                     quantity=part,
                     expiry_date=expiry_date,
                     purchase_price=purchase_price,
+                    **origin,
                 )
             stock.refresh_stock(target)
 
@@ -559,55 +587,13 @@ class SupplierViewSet(viewsets.ModelViewSet):
     def summary(self, request):
         """
         GET /api/suppliers/summary/ — نسخة الخادم من getSuppliersWithFinancials
-        المحلية: صافي المشتريات وعدد الفواتير والدين المتبقي لكل مذخر،
-        محسوبة من الفواتير/الاسترجاعات/الدفعات الفعلية وليس عمود مخزَّن،
-        لتفادي أي تعارض بين الأجهزة.
+        المحلية، من supplier_ledger (نفس الصيغة الموحّدة): صافي المشتريات، عدد
+        الفواتير، الدين المتبقي، ورصيد الصيدلية لدى المذخر.
         """
         membership = self._membership()
-
-        returns_subq = (
-            PurchaseInvoiceReturn.objects.filter(purchase_invoice__supplier=OuterRef("pk"))
-            .order_by()
-            .values("purchase_invoice__supplier")
-            .annotate(total=Sum("amount_returned"))
-            .values("total")
-        )
-
-        suppliers = Supplier.objects.filter(pharmacy=membership.pharmacy).annotate(
-            invoice_count=Count("purchase_invoices", distinct=True),
-            total_invoiced=Coalesce(
-                Sum("purchase_invoices__total_amount"),
-                Value(0),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            ),
-            total_paid=Coalesce(
-                Sum("purchase_invoices__paid_amount"),
-                Value(0),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            ),
-            total_returned=Coalesce(
-                Subquery(returns_subq, output_field=DecimalField(max_digits=14, decimal_places=2)),
-                Value(0),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            ),
-        ).order_by("name")
-
-        result = []
-        for s in suppliers:
-            net_purchases = s.total_invoiced - s.total_returned
-            remaining = net_purchases - s.total_paid
-            result.append(
-                {
-                    "id": s.id,
-                    "name": s.name,
-                    "phone": s.phone,
-                    "invoice_count": s.invoice_count,
-                    "total_purchases": net_purchases,
-                    "remaining_debt": max(remaining, Decimal("0")),
-                }
-            )
-
-        return Response(SupplierSummarySerializer(result, many=True).data)
+        suppliers = list(Supplier.objects.filter(pharmacy=membership.pharmacy).order_by("name"))
+        figures = supplier_ledger.supplier_figures(s.pk for s in suppliers)
+        return Response(SupplierSummarySerializer([_summary_row(s, figures[s.pk]) for s in suppliers], many=True).data)
 
     @action(detail=True, methods=["get"])
     def statement(self, request, pk=None):
@@ -619,27 +605,18 @@ class SupplierViewSet(viewsets.ModelViewSet):
             raise NotFound("المذخر غير موجود.")
 
         rows = []
-
-        invoices = supplier.purchase_invoices.annotate(
-            returned=Coalesce(
-                Sum("returns__amount_returned"),
-                Value(0),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            )
-        )
-        for inv in invoices:
+        for inv in supplier_ledger.annotate_invoices(supplier.purchase_invoices.all()):
             rows.append(
                 {
                     "id": inv.id,
                     "transaction_type": "invoice",
                     "reference": inv.invoice_number or "فاتورة بدون رقم",
-                    "amount": inv.total_amount - inv.returned,
+                    "amount": inv.total_amount - inv.returned_total,
                     "cash_paid": inv.paid_amount,
-                    # total_amount الخام هنا وليس remaining_debt: الدفعات
-                    # والاسترجاعات مُدرجة أصلاً كحركات منفصلة أدناه، فطرحها
-                    # هنا أيضاً كان يسبب ازدواج الخصم في الحساب التراكمي
-                    # بالنسخة المحلية.
-                    "debt_added": inv.total_amount,
+                    # الإجمالي ناقص ما دُفع بلا سطر دفعة (فواتير يدوية قديمة).
+                    # الدفعات والاسترجاعات حركات منفصلة أدناه. مجموع debt_added
+                    # لكل الحركات = رصيد المذخر (supplier_ledger) دائماً.
+                    "debt_added": inv.total_amount - (inv.paid_amount - inv.linked_paid),
                     "date_time": inv.created_at,
                     "notes": "",
                 }
@@ -659,32 +636,111 @@ class SupplierViewSet(viewsets.ModelViewSet):
                 }
             )
 
-        for ret in supplier.returns.all():
+        for ret in supplier.returns.select_related("purchase_invoice").prefetch_related("items"):
             rows.append(
                 {
                     "id": ret.id,
                     "transaction_type": "return",
-                    "reference": "استرجاع من فاتورة شراء",
+                    "reference": f"استرجاع من فاتورة #{ret.purchase_invoice.invoice_number or ret.purchase_invoice_id}",
                     "amount": ret.amount_returned,
                     "cash_paid": 0,
                     "debt_added": -ret.amount_returned,
                     "date_time": ret.returned_at,
                     "notes": ret.notes,
+                    "excess_credit": ret.excess_credit,
+                    # استرجاع قديم بالمبلغ فقط: قائمة فارغة.
+                    "items": PurchaseReturnItemSerializer(ret.items.all(), many=True).data,
+                }
+            )
+
+        # استخدام الرصيد ينقل المال لفاتورة فقط: معلومة في الكشف بلا أثر على الرصيد.
+        for app in supplier.credit_applications.select_related("purchase_invoice"):
+            rows.append(
+                {
+                    "id": app.id,
+                    "transaction_type": "credit_applied",
+                    "reference": f"{app.notes or supplier_ledger.CREDIT_NOTE_PREVIOUS} — فاتورة #"
+                    f"{app.purchase_invoice.invoice_number or app.purchase_invoice_id}",
+                    "amount": app.amount,
+                    "cash_paid": 0,
+                    "debt_added": 0,
+                    "date_time": app.applied_at,
+                    "notes": app.notes,
+                }
+            )
+
+        for refund in supplier.refunds.all():
+            rows.append(
+                {
+                    "id": refund.id,
+                    "transaction_type": "refund",
+                    "reference": "استلام أموال من المذخر",
+                    "amount": refund.amount,
+                    "cash_paid": 0,
+                    "debt_added": refund.amount,
+                    "date_time": refund.received_at,
+                    "notes": refund.notes,
                 }
             )
 
         rows.sort(key=lambda r: r["date_time"], reverse=True)
         return Response(rows)
 
+    @action(detail=True, methods=["post"], url_path="receive-refund")
+    def receive_refund(self, request, pk=None):
+        """
+        POST /api/suppliers/<id>/receive-refund/  body: {"amount": 500, "notes": "", "received_date": "2026-10-06"}
+        استلام أموال من المذخر مقابل رصيد الصيدلية لديه (جزئي مسموح، لا يتجاوز الرصيد).
+        """
+        membership = self._membership()
+        data = SupplierRefundInputSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        data = data.validated_data
+        with transaction.atomic():
+            try:
+                supplier = Supplier.objects.get(pk=pk, pharmacy=membership.pharmacy)
+            except Supplier.DoesNotExist:
+                raise NotFound("المذخر غير موجود.")
+            purchase_returns.receive_refund(supplier, data["amount"], data.get("notes"), data.get("received_date"))
+        return Response(
+            SupplierSummarySerializer(_summary_row(supplier, supplier_ledger.figures_for(supplier))).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["get"], url_path="purchased-items")
+    def purchased_items(self, request, pk=None):
+        """GET /api/suppliers/<id>/purchased-items/ — الأصناف المشتراة من هذا المذخر."""
+        membership = self._membership()
+        try:
+            supplier = Supplier.objects.get(pk=pk, pharmacy=membership.pharmacy)
+        except Supplier.DoesNotExist:
+            raise NotFound("المذخر غير موجود.")
+        items = purchase_list.supplier_purchased_items(supplier)
+        return Response(PurchaseInvoiceItemSerializer(items, many=True).data)
+
+
+def _summary_row(supplier, figures):
+    return {
+        "id": supplier.id,
+        "name": supplier.name,
+        "phone": supplier.phone,
+        "invoice_count": figures["invoice_count"],
+        "total_purchases": figures["total_purchases"],
+        "remaining_debt": figures["debt"],
+        "balance": figures["balance"],
+        "credit_balance": figures["credit"],
+        "available_credit": figures["available_credit"],
+    }
+
 
 class PurchaseInvoiceViewSet(
-    mixins.CreateModelMixin,
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
     viewsets.GenericViewSet,
 ):
     """
-    لا update/destroy مباشر: total_amount/paid_amount يتغيران فقط عبر
+    لا create/update/destroy مباشر: الفاتورة تُنشأ حصراً من قائمة المخزون
+    (from_list)، وtotal_amount/paid_amount يتغيران فقط عبر
     add_payment/add_return/settle_credit الذرّية أدناه — نفس نمط
     checkout/refund في InvoiceViewSet، لمنع أي تعديل غير متسق للأرصدة.
     """
@@ -700,16 +756,81 @@ class PurchaseInvoiceViewSet(
         supplier_id = self.request.query_params.get("supplier")
         if supplier_id:
             qs = qs.filter(supplier_id=supplier_id)
-        return qs.order_by("-created_at")
+        return supplier_ledger.annotate_invoices(qs).order_by("-created_at")
 
-    def perform_create(self, serializer):
-        membership = self.request.user.pharmacymembership
-        supplier_id = self.request.data.get("supplier")
-        try:
-            supplier = Supplier.objects.get(pk=supplier_id, pharmacy=membership.pharmacy)
-        except (Supplier.DoesNotExist, TypeError, ValueError):
-            raise ValidationError("المذخر غير موجود في هذه الصيدلية.")
-        serializer.save(pharmacy=membership.pharmacy, supplier=supplier)
+    @action(detail=False, methods=["post"], url_path="from-list")
+    def from_list(self, request):
+        """
+        POST /api/purchase-invoices/from-list/
+        body: {"supplier": 3 | "supplier_name": "..", "supplier_phone": "..",
+               "invoice_number": "A-17", "invoice_date": "2026-10-05", "warehouse": 1?,
+               "paid_amount": 0, "items": [{medicine_id?, trade_name, quantity, bonus_quantity,
+               is_free, buy_price, sell_price, expiry_date, barcode, ...}]}
+
+        قائمة مذخر كاملة ذرّياً: المذخر ← الفاتورة ← توريد كل الأصناف بدفعات
+        مرتبطة ← الدفعة الأولية. المجاميع تُحسب على الخادم فقط.
+        """
+        membership, license = resolve_context(request)
+        data = purchase_list.validated_input(PurchaseListInputSerializer, request.data)
+        with transaction.atomic():
+            invoice, medicines = purchase_list.create_purchase_list(membership.pharmacy, license, data)
+        touched = (
+            Medicine.objects.filter(pk__in=[m.pk for m in medicines])
+            .prefetch_related("batches", "batches__supplier", "batches__purchase_invoice")
+            .order_by("trade_name")
+        )
+        context = self.get_serializer_context()
+        return Response(
+            {
+                "purchase_invoice": PurchaseInvoiceSerializer(invoice, context=context).data,
+                "supplier": SupplierSerializer(invoice.supplier, context=context).data,
+                "medicines": MedicineSerializer(touched, many=True, context=context).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["get"])
+    def items(self, request, pk=None):
+        """GET /api/purchase-invoices/<id>/items/ — أصناف الفاتورة (فارغة للفواتير اليدوية القديمة)."""
+        invoice = self.get_object()
+        return Response(PurchaseInvoiceItemSerializer(purchase_list.invoice_items(invoice), many=True).data)
+
+    @action(detail=True, methods=["post"], url_path="return-items")
+    def return_items(self, request, pk=None):
+        """
+        POST /api/purchase-invoices/<id>/return-items/
+        body: {"items": [{"purchase_invoice_item": 5, "quantity": 2, "unit_price": 900}],
+               "notes": "", "return_date": "2026-10-06"}
+
+        استرجاع أدوية للمذخر ذرّياً: خصم المخزون (دفعات الفاتورة أولاً)، سجل
+        الاسترجاع بأسطره، وتخفيض الدين (الفائض يسدّد فواتير أخرى ثم يصبح رصيداً).
+        """
+        membership = self._membership()
+        data = purchase_list.validated_input(ReturnItemsInputSerializer, request.data)
+        with transaction.atomic():
+            invoice = self._locked_invoice(pk, membership)
+            record, medicines = purchase_returns.return_items(
+                invoice, data["items"], data.get("notes"), data.get("return_date")
+            )
+        invoice = self.get_queryset().get(pk=invoice.pk)
+        touched = (
+            Medicine.objects.filter(pk__in=[m.pk for m in medicines])
+            .prefetch_related("batches", "batches__supplier", "batches__purchase_invoice")
+        )
+        context = self.get_serializer_context()
+        return Response(
+            {
+                "purchase_invoice": PurchaseInvoiceSerializer(invoice, context=context).data,
+                "return": {
+                    "id": record.id,
+                    "amount_returned": record.amount_returned,
+                    "excess_credit": record.excess_credit,
+                    "items": PurchaseReturnItemSerializer(record.items.all(), many=True).data,
+                },
+                "medicines": MedicineSerializer(touched, many=True, context=context).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     def _membership(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
@@ -741,9 +862,7 @@ class PurchaseInvoiceViewSet(
 
         with transaction.atomic():
             invoice = self._locked_invoice(pk, membership)
-            returned = invoice.returns.aggregate(s=Sum("amount_returned"))["s"] or Decimal("0")
-            outstanding = invoice.total_amount - returned - invoice.paid_amount
-            if amount > outstanding:
+            if amount > supplier_ledger.invoice_remaining(invoice):
                 raise ValidationError("مبلغ الدفعة أكبر من المتبقي لهذه الفاتورة.")
 
             SupplierPayment.objects.create(
@@ -756,12 +875,18 @@ class PurchaseInvoiceViewSet(
             invoice.paid_amount = F("paid_amount") + amount
             invoice.save(update_fields=["paid_amount", "updated_at"])
 
-        invoice.refresh_from_db()
-        return Response(PurchaseInvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+        return Response(PurchaseInvoiceSerializer(self.get_queryset().get(pk=invoice.pk)).data,
+                        status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])
     def add_return(self, request, pk=None):
-        """POST /api/purchase-invoices/<id>/add_return/  body: {"amount": 500, "notes": "..."}"""
+        """
+        POST /api/purchase-invoices/<id>/add_return/  body: {"amount": 500, "notes": "..."}
+
+        قديم (استرجاع بالمبلغ فقط): مُبقى لنسخ التطبيق الأقدم فقط — التطبيق الحالي
+        يسترجع أصنافاً عبر return-items. الفائض على متبقي الفاتورة يذهب لرصيد
+        المذخر كالاسترجاع الجديد، فلا يصبح متبقي أي فاتورة سالباً.
+        """
         membership = self._membership()
         try:
             amount = Decimal(str(request.data.get("amount")))
@@ -777,29 +902,27 @@ class PurchaseInvoiceViewSet(
             if already_returned + amount > invoice.total_amount:
                 raise ValidationError("مجموع الاسترجاعات لا يمكن أن يتجاوز مبلغ الفاتورة الأصلي.")
 
-            PurchaseInvoiceReturn.objects.create(
-                pharmacy=membership.pharmacy,
-                supplier=invoice.supplier,
-                purchase_invoice=invoice,
-                amount_returned=amount,
-                notes=notes,
-            )
+            Supplier.objects.select_for_update().get(pk=invoice.supplier_id)
+            supplier_ledger.record_return(invoice, amount, notes=notes)
 
-        invoice.refresh_from_db()
-        return Response(PurchaseInvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+        return Response(PurchaseInvoiceSerializer(self.get_queryset().get(pk=invoice.pk)).data,
+                        status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])
     def settle_credit(self, request, pk=None):
-        """POST /api/purchase-invoices/<id>/settle_credit/ — يقابل settlePurchaseInvoiceCredit المحلية."""
+        """
+        POST /api/purchase-invoices/<id>/settle_credit/ — قديم لنسخ التطبيق الأقدم:
+        يصفّر متبقياً سالباً (لم يعد ممكناً بعد ترحيل 0016 والقواعد الجديدة).
+        """
         membership = self._membership()
         with transaction.atomic():
             invoice = self._locked_invoice(pk, membership)
-            returned = invoice.returns.aggregate(s=Sum("amount_returned"))["s"] or Decimal("0")
-            invoice.paid_amount = invoice.total_amount - returned
-            invoice.save(update_fields=["paid_amount", "updated_at"])
+            remaining = supplier_ledger.invoice_remaining(invoice)
+            if remaining < 0:
+                invoice.paid_amount = max(invoice.paid_amount + remaining, Decimal("0"))
+                invoice.save(update_fields=["paid_amount", "updated_at"])
 
-        invoice.refresh_from_db()
-        return Response(PurchaseInvoiceSerializer(invoice).data)
+        return Response(PurchaseInvoiceSerializer(self.get_queryset().get(pk=invoice.pk)).data)
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
@@ -1023,16 +1146,8 @@ class ReportsViewSet(viewsets.ViewSet):
 
         # ديون المذاخر: رصيد قائم حالياً (غير مقيّد بالفترة)، نفس ما تفعله
         # الشاشة الحالية (استعلام remaining_debt بلا فلتر تاريخ).
-        purchase_totals = PurchaseInvoice.objects.filter(pharmacy=pharmacy).aggregate(
-            total_amount=Coalesce(Sum("total_amount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)),
-            total_paid=Coalesce(Sum("paid_amount"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)),
-        )
-        total_returned = PurchaseInvoiceReturn.objects.filter(
-            purchase_invoice__pharmacy=pharmacy
-        ).aggregate(total=Coalesce(Sum("amount_returned"), Value(0), output_field=DecimalField(max_digits=14, decimal_places=2)))["total"]
-        total_supplier_debt = (
-            purchase_totals["total_amount"] - total_returned - purchase_totals["total_paid"]
-        )
+        # مجموع ديون المذاخر لكل مذخر على حدة (رصيد مذخر لصالحنا لا يُطرح من دين آخر).
+        total_supplier_debt = supplier_ledger.total_debt(pharmacy)
 
         # خسائر الأدوية المنتهية: نفس معيار الشاشة الحالية بالضبط — منتهية
         # فعلياً (قبل اليوم الحالي)، لا مجرد الوصول لتاريخ الانتهاء نفسه.

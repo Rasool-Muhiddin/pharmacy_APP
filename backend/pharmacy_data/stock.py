@@ -9,7 +9,7 @@
 
 from decimal import ROUND_HALF_UP, Decimal
 
-from django.db.models import F, Min, Q, Sum
+from django.db.models import Case, F, IntegerField, Min, Q, Sum, Value, When
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -39,6 +39,25 @@ def weighted_avg_cost(old_qty, old_avg, new_qty, new_cost):
     return to_cost(total / Decimal(old_qty + new_qty))
 
 
+def effective_unit_cost(paid_qty, bonus_qty, buy_price):
+    """
+    كلفة الوحدة الفعلية لسطر فيه بونص: (المدفوع × سعر الشراء) / (المدفوع + البونص).
+    سطر مجاني بالكامل (paid_qty == 0) كلفته 0 معروفة، لا NULL.
+    مثال: 10 × 1000 + 2 بونص = 833.3333.
+    """
+    total = paid_qty + bonus_qty
+    if total <= 0:
+        raise ValidationError("الكمية يجب أن تكون أكبر من صفر.")
+    if paid_qty == 0:
+        return to_cost(0)
+    return to_cost(Decimal(paid_qty) * Decimal(buy_price) / Decimal(total))
+
+
+def line_total(paid_qty, buy_price):
+    """إجمالي سطر قائمة المذخر: المدفوع فقط — البونص لا يدخل الإجمالي ولا دين المذخر."""
+    return to_money(Decimal(paid_qty) * Decimal(buy_price or 0))
+
+
 def refresh_stock(medicine):
     """يعيد ضبط quantity وexpiry_date المشتقّين من الدفعات."""
     agg = medicine.batches.filter(quantity__gt=0).aggregate(total=Sum("quantity"), nearest=Min("expiry_date"))
@@ -64,13 +83,16 @@ def reconcile(medicine):
         )
 
 
-def add_batch(medicine, quantity, expiry_date, purchase_price):
+def add_batch(medicine, quantity, expiry_date, purchase_price, *, source="", supplier=None, purchase_invoice=None):
     batch = MedicineBatch.objects.create(
         pharmacy_id=medicine.pharmacy_id,
         medicine=medicine,
         quantity=quantity,
         expiry_date=expiry_date,
         purchase_price=to_cost(purchase_price),
+        source=source,
+        supplier=supplier,
+        purchase_invoice=purchase_invoice,
     )
     refresh_stock(medicine)
     return batch
@@ -91,43 +113,92 @@ def create_initial_batch(medicine):
         )
 
 
-def supply(medicine, quantity, expiry_date, purchase_price, sale_price):
-    """توريد شحنة: متوسط مرجّح + سعر بيع موحّد جديد + دفعة جديدة."""
+def supply(
+    medicine,
+    quantity,
+    expiry_date,
+    purchase_price,
+    sale_price,
+    *,
+    bonus_quantity=0,
+    allow_unknown_cost=False,
+    source="",
+    supplier=None,
+    purchase_invoice=None,
+):
+    """
+    توريد شحنة: متوسط مرجّح + سعر بيع موحّد جديد + دفعة جديدة.
+
+    quantity = المدفوع، bonus_quantity = المجاني فوقه؛ الدفعة = المجموع بكلفة
+    effective_unit_cost. quantity == 0 = سطر مجاني بالكامل: كلفة 0 معروفة تدخل
+    المتوسط، وbuy_price الحالي لا يتغير. sale_price=None يُبقي سعر البيع الحالي.
+    allow_unknown_cost (الرصيد الافتتاحي بسعر شراء 0): كلفة مجهولة لا ترفض
+    التوريد، فالدفعة بلا كلفة ولا يتغير avg_cost. يرجع الدفعة المُنشأة.
+    """
     reconcile(medicine)
-    cost = Decimal(purchase_price) if purchase_price is not None else medicine.avg_cost
-    if cost is None:
+    total = quantity + bonus_quantity
+    if quantity == 0:
+        cost = Decimal(0)
+    else:
+        cost = Decimal(purchase_price) if purchase_price is not None else medicine.avg_cost
+    if cost is None and not allow_unknown_cost:
         raise ValidationError("سعر الشراء مطلوب لأن كلفة هذا الصنف غير معروفة بعد.")
-    medicine.avg_cost = weighted_avg_cost(medicine.quantity, medicine.avg_cost, quantity, cost)
-    medicine.buy_price = to_money(cost)
-    medicine.sell_price = to_money(sale_price)
-    medicine.save(update_fields=["avg_cost", "buy_price", "sell_price", "updated_at"])
-    add_batch(medicine, quantity, expiry_date, cost)
-    return medicine
+    unit_cost = effective_unit_cost(quantity, bonus_quantity, cost) if cost is not None else None
+    update_fields = ["updated_at"]
+    if unit_cost is not None:
+        medicine.avg_cost = weighted_avg_cost(medicine.quantity, medicine.avg_cost, total, unit_cost)
+        update_fields.append("avg_cost")
+    if quantity > 0 and cost is not None:
+        medicine.buy_price = to_money(cost)
+        update_fields.append("buy_price")
+    if sale_price is not None:
+        medicine.sell_price = to_money(sale_price)
+        update_fields.append("sell_price")
+    medicine.save(update_fields=update_fields)
+    return add_batch(
+        medicine, total, expiry_date, unit_cost,
+        source=source, supplier=supplier, purchase_invoice=purchase_invoice,
+    )
 
 
-def _fefo_batches(medicine, sellable_only):
+def _fefo_batches(medicine, sellable_only, prefer_invoice_id=None):
     qs = medicine.batches.filter(quantity__gt=0).select_for_update()
     if sellable_only:
         today = timezone.localdate()
         qs = qs.filter(Q(expiry_date__isnull=True) | Q(expiry_date__gte=today))
     # الأقرب انتهاءً أولاً؛ الدفعات بلا تاريخ انتهاء أخيراً.
-    return qs.order_by(F("expiry_date").asc(nulls_last=True), "id")
+    order = [F("expiry_date").asc(nulls_last=True), "id"]
+    if prefer_invoice_id is not None:
+        # استرجاع لمذخر: دفعات فاتورته أولاً، ثم باقي الدفعات بنفس ترتيب FEFO.
+        order.insert(
+            0,
+            Case(When(purchase_invoice_id=prefer_invoice_id, then=Value(0)), default=Value(1), output_field=IntegerField()),
+        )
+    return qs.order_by(*order)
 
 
-def deduct_fefo(medicine, quantity, *, sellable_only):
+def deduct_fefo(medicine, quantity, *, sellable_only, prefer_invoice_id=None):
     """
     يخصم [quantity] من الدفعات بترتيب FEFO مع التقسيم بين الدفعات، ويحذف
     الدفعات المستنفدة. sellable_only=True (البيع) يتجاهل الدفعات المنتهية.
-    يرجع [(expiry_date, purchase_price, taken)] لاستخدامها في النقل.
+    prefer_invoice_id (استرجاع لمذخر): دفعات تلك الفاتورة تُخصم أولاً.
+    avg_cost لا يتغير (كالبيع والإتلاف).
+    يرجع [(expiry_date, purchase_price, taken, origin)] لاستخدامها في النقل؛
+    origin = مصدر الدفعة (source/supplier/purchase_invoice) كي يبقى التتبّع بعد النقل.
     """
     reconcile(medicine)
     remaining = quantity
     taken = []
-    for batch in _fefo_batches(medicine, sellable_only):
+    for batch in _fefo_batches(medicine, sellable_only, prefer_invoice_id):
         if remaining == 0:
             break
         part = min(batch.quantity, remaining)
-        taken.append((batch.expiry_date, batch.purchase_price, part))
+        origin = {
+            "source": batch.source,
+            "supplier_id": batch.supplier_id,
+            "purchase_invoice_id": batch.purchase_invoice_id,
+        }
+        taken.append((batch.expiry_date, batch.purchase_price, part, origin))
         remaining -= part
         if part == batch.quantity:
             batch.delete()

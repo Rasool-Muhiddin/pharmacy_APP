@@ -1,5 +1,5 @@
 {
-  "description": "Shared by test/profit_tracking_test.dart (DatabaseHelper.getProfitSummary) and backend/pharmacy_data/tests.py (_profit_summary via /api/reports/summary/). Both must produce exactly `expected` for the same data. All rows dated today.",
+  "description": "Shared by test/profit_tracking_test.dart (DatabaseHelper.getProfitSummary) and backend/pharmacy_data/tests.py (_profit_summary via /api/reports/summary/). Both must produce exactly `expected` for the same data. All rows dated today. `purchase_list` is a second shared scenario: test/purchase_list_db_test.dart (DatabaseHelper.createPurchaseList) and backend PurchaseListTests (/api/purchase-invoices/from-list/) must both reach its `expected` (bonus effective cost, free lines at known cost 0, weighted average, invoice total excluding bonus/free, then profit when selling it all). Expiry dates are filled in by the tests (today + 365 days).",
   "medicines": {
     "A": {"avg_cost": 400},
     "B": {"avg_cost": 300},
@@ -57,5 +57,75 @@
     "damage_cost": 400,
     "net_profit": 2230,
     "items_without_cost": 1
+  },
+  "purchase_list": {
+    "existing": {"trade_name": "A", "quantity": 10, "buy_price": 500, "sell_price": 1000},
+    "lines": [
+      {
+        "note": "existing A: 10 paid x 1000 + 2 bonus -> batch 12 @ 833.3333; avg (10*500 + 12*833.3333)/22 = 681.8182",
+        "trade_name": "A", "quantity": 10, "bonus_quantity": 2, "is_free": false, "buy_price": 1000, "sell_price": 1500
+      },
+      {
+        "note": "new N, fully free: 5 units at known cost 0, buy_price 0",
+        "trade_name": "N", "quantity": 0, "bonus_quantity": 5, "is_free": true, "buy_price": null, "sell_price": 200
+      },
+      {
+        "note": "existing A, fully free, no sell price: keeps 1500 and buy_price 1000; avg (22*681.8182 + 3*0)/25 = 600",
+        "trade_name": "A", "quantity": 0, "bonus_quantity": 3, "is_free": true, "buy_price": null, "sell_price": null
+      }
+    ],
+    "sale": [{"medicine": "A", "quantity": 25}, {"medicine": "N", "quantity": 5}],
+    "expected": {
+      "invoice_total": 10000,
+      "item_count": 3,
+      "line_totals": [10000, 0, 0],
+      "effective_unit_costs": [833.3333, 0, 0],
+      "medicines": {
+        "A": {"quantity": 25, "avg_cost": 600, "buy_price": 1000, "sell_price": 1500, "batch_costs": [0, 500, 833.3333]},
+        "N": {"quantity": 5, "avg_cost": 0, "buy_price": 0, "sell_price": 200, "batch_costs": [0]}
+      },
+      "profit": {"revenue": 38500, "cost_of_goods_sold": 15000, "gross_profit": 23500, "items_without_cost": 0}
+    }
+  },
+  "supplier_returns": {
+    "note": "Replayed by test/supplier_returns_db_test.dart and backend tests_supplier_returns.py. After every step both sides must report the same supplier balance (positive = debt, negative = credit for the pharmacy), available credit, invoice remainders and stock, and the statement's debt_added must sum to the balance. Expiry dates are filled in by the tests.",
+    "steps": [
+      {
+        "op": "list", "invoice": "F-1", "paid": 9000,
+        "lines": [
+          {"key": "A", "trade_name": "A", "quantity": 10, "bonus_quantity": 2, "is_free": false, "buy_price": 1000, "sell_price": 1500},
+          {"key": "G", "trade_name": "Gift", "quantity": 0, "bonus_quantity": 3, "is_free": true, "buy_price": null, "sell_price": 200}
+        ],
+        "expect": {"balance": 1000, "available_credit": 0, "remaining": {"F-1": 1000}, "stock": {"A": 12, "Gift": 3}}
+      },
+      {
+        "note": "4 paid units at an edited price 900 = 3600; 1000 settles F-1, the excess 2600 becomes credit",
+        "op": "return", "invoice": "F-1", "lines": [{"key": "A", "quantity": 4, "unit_price": 900}],
+        "expect": {"balance": -2600, "available_credit": 2600, "remaining": {"F-1": 0}, "stock": {"A": 8, "Gift": 3},
+                   "return_credit": 3600, "return_excess": 2600}
+      },
+      {
+        "note": "8 units left on the line: 6 paid at the default price 1000 = 6000, the 2 bonus units and the free line give 0",
+        "op": "return", "invoice": "F-1", "lines": [{"key": "A", "quantity": 8}, {"key": "G", "quantity": 3}],
+        "expect": {"balance": -8600, "available_credit": 8600, "remaining": {"F-1": 0}, "stock": {"A": 0, "Gift": 0},
+                   "return_credit": 6000, "return_excess": 6000}
+      },
+      {
+        "note": "new list 5000: credit applied automatically (partial use of the 8600 credit)",
+        "op": "list", "invoice": "F-2", "paid": 0,
+        "lines": [{"key": "B", "trade_name": "B", "quantity": 5, "bonus_quantity": 0, "is_free": false, "buy_price": 1000, "sell_price": 1300}],
+        "expect": {"balance": -3600, "available_credit": 3600, "remaining": {"F-1": 0, "F-2": 0}, "credit_applied": {"F-2": 5000}}
+      },
+      {
+        "op": "refund", "amount": 1000,
+        "expect": {"balance": -2600, "available_credit": 2600}
+      },
+      {
+        "note": "new list 4000: the whole remaining 2600 credit is applied, 400 paid now, 1000 left",
+        "op": "list", "invoice": "F-3", "paid": 400,
+        "lines": [{"key": "C", "trade_name": "C", "quantity": 2, "bonus_quantity": 0, "is_free": false, "buy_price": 2000, "sell_price": 2500}],
+        "expect": {"balance": 1000, "available_credit": 0, "remaining": {"F-1": 0, "F-2": 0, "F-3": 1000}, "credit_applied": {"F-3": 2600}}
+      }
+    ]
   }
 }

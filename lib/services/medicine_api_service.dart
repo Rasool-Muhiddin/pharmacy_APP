@@ -6,9 +6,13 @@ class MedicineApiException implements Exception {
   final String message;
   final int? statusCode;
 
+  /// رقم السطر المرفوض في قائمة الرصيد الافتتاحي (من 0)، إن أرسله الخادم.
+  final int? line;
+
   const MedicineApiException(
     this.message, {
     this.statusCode,
+    this.line,
   });
 
   @override
@@ -77,26 +81,10 @@ class MedicineApiService {
     );
   }
 
-  /// توريد ذرّي على الخادم (`POST /api/medicines/<id>/supply/`): متوسط كلفة
-  /// مرجّح + سعر بيع جديد + دفعة صلاحية، ويُرجع الدواء المحدَّث مع دفعاته.
-  /// [purchasePrice] null = يستخدم الخادم avg_cost الحالي.
-  Future<Map<String, dynamic>> supplyMedicine(
-    int id, {
-    required int quantity,
-    String? expiryDate,
-    double? purchasePrice,
-    required double salePrice,
-  }) {
-    return _send(
-      method: 'POST',
-      url: '$_baseUrl/medicines/$id/supply/',
-      body: {
-        'quantity': quantity,
-        if (expiryDate != null && expiryDate.isNotEmpty) 'expiry_date': expiryDate,
-        if (purchasePrice != null) 'purchase_price': purchasePrice.toStringAsFixed(4),
-        'sale_price': salePrice.toStringAsFixed(2),
-      },
-    );
+  /// رصيد افتتاحي ذرّي (`POST /api/medicines/opening-stock/`): نفس أسطر قائمة
+  /// المذخر بلا مذخر ولا فاتورة. يرجع {"medicines": [...]} بالأصناف المتأثرة.
+  Future<Map<String, dynamic>> createOpeningStock(Map<String, dynamic> body) {
+    return _send(method: 'POST', url: '$_baseUrl/medicines/opening-stock/', body: body);
   }
 
   Future<void> deleteMedicine(int id) async {
@@ -222,6 +210,7 @@ class MedicineApiService {
       throw MedicineApiException(
         _extractErrorMessage(decoded),
         statusCode: response.statusCode,
+        line: decoded is Map ? int.tryParse(decoded['line']?.toString() ?? '') : null,
       );
     }
 

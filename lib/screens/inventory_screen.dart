@@ -6,10 +6,10 @@ import '../repository/medicine_repository.dart';
 import '../repository/warehouse_repository.dart';
 import '../services/medicine_api_service.dart';
 import '../services/warehouse_api_service.dart';
+import '../models/purchase_list.dart';
 import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
-import '../widgets/unsaved_changes_guard.dart';
-import 'package:sqflite/sqflite.dart';
+import 'purchase_list_dialog.dart';
 
 class InventoryScreen extends StatefulWidget {
   final int pharmacyId;
@@ -594,728 +594,30 @@ class _InventoryScreenState extends State<InventoryScreen> {
       ),
     );
   }
-// --- 1. إضافة صنف جديد (تصميم احترافي معدل) ---
-void _openAddMedicineDialog() {
-    final barcodeCtrl = TextEditingController();
-    final tradeCtrl = TextEditingController();
-    final scientificCtrl = TextEditingController();
-    final qtyCtrl = TextEditingController(text: '0');
-    final buyPriceCtrl = TextEditingController(text: '0');
-    final sellPriceCtrl = TextEditingController(text: '0');
-    final expiryCtrl = TextEditingController();
-    final shelfCtrl = TextEditingController();
-    String selectedCategory = 'tablet';
-
-    // أي حقل عُبّئ أو تغيّر عن قيمته الابتدائية = عمل غير محفوظ يُسأل عنه قبل الإغلاق.
-    bool isDirty() =>
-        barcodeCtrl.text.trim().isNotEmpty ||
-        tradeCtrl.text.trim().isNotEmpty ||
-        scientificCtrl.text.trim().isNotEmpty ||
-        qtyCtrl.text.trim() != '0' ||
-        buyPriceCtrl.text.trim() != '0' ||
-        sellPriceCtrl.text.trim() != '0' ||
-        expiryCtrl.text.trim().isNotEmpty ||
-        shelfCtrl.text.trim().isNotEmpty ||
-        selectedCategory != 'tablet';
-
-    InputDecoration buildInputDecoration({
-      String? hintText,
-      required IconData prefixIcon,
-    }) {
-      return InputDecoration(
-        hintText: hintText,
-        hintStyle: TextStyle(color: Colors.grey.shade400, fontSize: 13),
-        prefixIcon: Icon(prefixIcon, color: const Color(0xFF1ABC9C), size: 20),
-        filled: true,
-        fillColor: const Color(0xFFF8FAFA),
-        isDense: true,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(10),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(10),
-          borderSide: BorderSide(color: Colors.grey.shade300),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(10),
-          borderSide: const BorderSide(color: Color(0xFF1ABC9C), width: 1.5),
-        ),
-      );
-    }
-
-    // تسمية أنيقة فوق الحقل بدل الـ label العائم الذي كان يتقاطع مع
-    // إطار الحقل (المشكلة الظاهرة في لقطة الشاشة). النجمة الحمراء
-    // تظهر تلقائياً فقط للحقول الإلزامية المنتهية بعلامة *.
-    Widget buildFieldLabel(String text) {
-      final isRequired = text.trim().endsWith('*');
-      final baseLabel = isRequired ? text.replaceAll('*', '').trim() : text;
-      return Padding(
-        padding: const EdgeInsets.only(bottom: 7, right: 2),
-        child: RichText(
-          text: TextSpan(
-            style: TextStyle(
-              fontSize: 12.5,
-              fontWeight: FontWeight.w600,
-              color: Colors.grey.shade700,
-            ),
-            children: [
-              TextSpan(text: baseLabel),
-              if (isRequired)
-                const TextSpan(text: ' *', style: TextStyle(color: Color(0xFFDC2626))),
-            ],
-          ),
-        ),
-      );
-    }
-
-    Widget buildLabeledField({required String label, required Widget field}) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          buildFieldLabel(label),
-          field,
-        ],
-      );
-    }
-
-    showDialog(
-      context: context,
-      // يعترض الإلغاء وEsc والنقر خارج النافذة ما دامت هناك بيانات غير محفوظة.
-      builder: (ctx) => UnsavedChangesGuard(
-        isDirty: isDirty,
-        message: 'لم يتم حفظ العنصر، هل تريد الخروج بدون حفظ؟',
-        leaveLabel: 'خروج بدون حفظ',
-        child: StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: Container(
-              padding: const EdgeInsets.only(bottom: 12),
-              decoration: BoxDecoration(
-                border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
-              ),
-              child: const Row(
-                children: [
-                  CircleAvatar(
-                    backgroundColor: Color(0xFFE6F7F5),
-                    child: Icon(Icons.add_box_rounded, color: Color(0xFF1ABC9C)),
-                  ),
-                  SizedBox(width: 12),
-                  Text('إضافة صنف جديد للمخزن', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                ],
-              ),
-            ),
-            content: SingleChildScrollView(
-              child: SizedBox(
-                width: 480,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const SizedBox(height: 6),
-
-                    // 1. الباركود
-                    buildLabeledField(
-                      label: 'الباركود (اختياري)',
-                      field: TextField(
-                        controller: barcodeCtrl,
-                        decoration: buildInputDecoration(
-                          hintText: 'امسح أو اكتب الباركود...',
-                          prefixIcon: Icons.qr_code_scanner,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-
-                    // 2. الاسم التجاري
-                    buildLabeledField(
-                      label: 'الاسم التجاري *',
-                      field: Autocomplete<Map<String, dynamic>>(
-                        displayStringForOption: (option) => option['trade_name'] ?? '',
-                        optionsBuilder: (TextEditingValue textEditingValue) {
-                          if (textEditingValue.text.trim().isEmpty) {
-                            return const Iterable<Map<String, dynamic>>.empty();
-                          }
-                          final query = textEditingValue.text.trim().toLowerCase();
-                          // الاقتراحات حسب الاسم التجاري فقط؛ تطابق الاسم العلمي وحده لا يُظهر الدواء.
-                          return _masterMedicines.where((med) {
-                            final trade = (med['trade_name'] ?? '').toString().toLowerCase();
-                            return trade.contains(query);
-                          });
-                        },
-                        onSelected: (Map<String, dynamic> selection) {
-                          setDialogState(() {
-                            tradeCtrl.text = selection['trade_name'] ?? '';
-                            scientificCtrl.text = selection['scientific_name'] ?? '';
-                            if (selection['category'] != null && _categories.containsKey(selection['category'])) {
-                              selectedCategory = selection['category'];
-                            }
-                          });
-                        },
-                        fieldViewBuilder: (context, textController, focusNode, onFieldSubmitted) {
-                          return TextField(
-                            controller: textController,
-                            focusNode: focusNode,
-                            decoration: buildInputDecoration(
-                              hintText: 'ابحث في القاموس أو اكتب الاسم...',
-                              prefixIcon: Icons.medication_outlined,
-                            ),
-                            onChanged: (val) {
-                              tradeCtrl.text = val; // مزامنة النص مع الكنترولر
-                            },
-                          );
-                        },
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-
-                    // 3. الاسم العلمي
-                    buildLabeledField(
-                      label: 'الاسم العلمي',
-                      field: TextField(
-                        controller: scientificCtrl,
-                        decoration: buildInputDecoration(
-                          hintText: 'المادة الفعالة...',
-                          prefixIcon: Icons.science_outlined,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-
-                    // 4. الشكل الدوائي
-                    buildLabeledField(
-                      label: 'الشكل الدوائي',
-                      field: DropdownButtonFormField<String>(
-                        key: ValueKey(selectedCategory),
-                        initialValue: selectedCategory,
-                        decoration: buildInputDecoration(
-                          prefixIcon: Icons.category_outlined,
-                        ),
-                        dropdownColor: Colors.white,
-                        borderRadius: BorderRadius.circular(10),
-                        items: _categories.entries
-                            .map((e) => DropdownMenuItem<String>(value: e.key, child: Text(e.value)))
-                            .toList(),
-                        onChanged: (val) => setDialogState(() => selectedCategory = val!),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-
-                    // 5. الكمية والرف
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: buildLabeledField(
-                            label: 'الكمية الأولية *',
-                            field: TextField(
-                              controller: qtyCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: buildInputDecoration(
-                                prefixIcon: Icons.inventory_2_outlined,
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: buildLabeledField(
-                            label: 'موقع الرف',
-                            field: TextField(
-                              controller: shelfCtrl,
-                              decoration: buildInputDecoration(
-                                hintText: 'مثال: A12',
-                                prefixIcon: Icons.grid_view_outlined,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-
-                    // 6. الأسعار
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: buildLabeledField(
-                            label: 'سعر الشراء *',
-                            field: TextField(
-                              controller: buyPriceCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: buildInputDecoration(
-                                prefixIcon: Icons.attach_money,
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: buildLabeledField(
-                            label: 'سعر البيع *',
-                            field: TextField(
-                              controller: sellPriceCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: buildInputDecoration(
-                                prefixIcon: Icons.sell_outlined,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-
-                    // 7. تاريخ الانتهاء
-                    buildLabeledField(
-                      label: 'تاريخ الانتهاء *',
-                      field: TextField(
-                        controller: expiryCtrl,
-                        readOnly: true,
-                        decoration: buildInputDecoration(
-                          hintText: 'انقر لاختيار التاريخ',
-                          prefixIcon: Icons.calendar_month_outlined,
-                        ),
-                        onTap: () async {
-                          final DateTime now = DateTime.now();
-                          final DateTime? pickedDate = await showDatePicker(
-                            context: context,
-                            initialDate: now,
-                            firstDate: now,
-                            lastDate: DateTime(2040, 12, 31),
-                            builder: (context, child) {
-                              return Theme(
-                                data: Theme.of(context).copyWith(
-                                  colorScheme: const ColorScheme.light(
-                                    primary: Color(0xFF1ABC9C),
-                                    onPrimary: Colors.white,
-                                    onSurface: Colors.black,
-                                  ),
-                                ),
-                                child: child!,
-                              );
-                            },
-                          );
-
-                          if (pickedDate != null) {
-                            final String formattedDate =
-                                "${pickedDate.year}-${pickedDate.month.toString().padLeft(2, '0')}-${pickedDate.day.toString().padLeft(2, '0')}";
-                            setDialogState(() {
-                              expiryCtrl.text = formattedDate;
-                            });
-                          }
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            actions: [
-              OutlinedButton(
-                style: OutlinedButton.styleFrom(
-                  side: BorderSide(color: Colors.grey.shade400),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                ),
-                // maybePop (لا pop) كي يمر عبر UnsavedChangesGuard.
-                onPressed: () => Navigator.maybePop(ctx),
-                child: const Text('إلغاء', style: TextStyle(color: Colors.black87)),
-              ),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF1ABC9C),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 12),
-                  elevation: 0,
-                ),
-                onPressed: () async {
-                  final tradeName = tradeCtrl.text.trim();
-                  final expiryDate = expiryCtrl.text.trim();
-
-                  // التحقق من الحقول المطلوبة
-                  if (tradeName.isEmpty) {
-                    _showSnackBar('يرجى إدخال الاسم التجاري', Colors.red);
-                    return;
-                  }
-                  if (expiryDate.isEmpty) {
-                    _showSnackBar('يرجى تحديد تاريخ الانتهاء', Colors.red);
-                    return;
-                  }
-
-                  try {
-                    final db = await DatabaseHelper.instance.database;
-                    await db.insert('pharmacy_branch',
-                    {
-                      'id': widget.pharmacyId, 'name': 'الفرع الرئيسي', 'is_active': 1, 'created_at': DateTime.now().toIso8601String(),
-                    },
-                    conflictAlgorithm: ConflictAlgorithm.ignore);
-
-                    // محاولة الحفظ (أونلاين عبر السيرفر، أوفلاين محلياً)
-                    await MedicineRepository.instance.addMedicine(
-                      pharmacyId: widget.pharmacyId,
-                      isOnlineMode: widget.isOnlineMode,
-                      data: {
-                        'barcode': barcodeCtrl.text.trim().isEmpty ? null : barcodeCtrl.text.trim(),
-                        'trade_name': tradeName,
-                        'scientific_name': scientificCtrl.text.trim(),
-                        'category': selectedCategory,
-                        'quantity': int.tryParse(qtyCtrl.text) ?? 0,
-                        'buy_price': double.tryParse(buyPriceCtrl.text) ?? 0.0,
-                        'sell_price': double.tryParse(sellPriceCtrl.text) ?? 0.0,
-                        'expiry_date': expiryDate,
-                        'shelf_location': shelfCtrl.text.trim(),
-                        // يُدخل دائماً في المخزن المختار حالياً (أو الرئيسي
-                        // كاحتياط إن لم يُحمَّل شريط المخازن بعد). أونلاين
-                        // يُرسَل للخادم كحقل "warehouse" (MedicineRepository).
-                        'warehouse_id': _selectedWarehouseId ??
-                            await WarehouseRepository.instance.getMainWarehouseId(
-                              pharmacyId: widget.pharmacyId,
-                              isOnlineMode: widget.isOnlineMode,
-                            ),
-                      },
-                    );
-
-                    // إغلاق النافذة أولاً
-                    if (Navigator.canPop(ctx)) {
-                      Navigator.pop(ctx);
-                    }
-
-                    // مسح شريط البحث وإعادة تحميل القائمة
-                    if (mounted) {
-                      _searchController.clear();
-                      await _loadMedicines();
-                      _showSnackBar('تم إضافة الصنف بنجاح', Colors.green);
-                    }
-                  } catch (e) {
-                    // رسالة واضحة تشرح السبب المباشر بدل نص الخطأ التقني الخام
-                    if (!mounted) return;
-                    _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
-                  }
-                },
-                child: const Text('حفظ الصنف', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          );
-        },
-      ),
-      ),
-    );
-  }
-  // --- 2. تزويد شحنة (مقتصرة على أدوية المخزن المسجلة فقط) ---
-void _openSupplyDialog() {
-  final addQtyCtrl = TextEditingController();
-  final newExpiryCtrl = TextEditingController();
-  // سعر الشراء (للمالك فقط) وسعر البيع الموحّد الجديد، يُعبَّآن بقيم الصنف الحالية.
-  final purchasePriceCtrl = TextEditingController();
-  final salePriceCtrl = TextEditingController();
-  final showPurchasePrice = widget.isOwner;
-  Map<String, dynamic>? selectedMedicine;
-
-  // أسلوب تصميم موحد ومستقل للحقول (متناسق مع الهوية البرتقالية للتزويد)
-  InputDecoration buildInputDecoration({
-    required String labelText,
-    String? hintText,
-    required IconData prefixIcon,
-  }) {
-    return InputDecoration(
-      labelText: labelText,
-      hintText: hintText,
-      prefixIcon: Icon(prefixIcon, color: const Color(0xFFE67E22), size: 20),
-      filled: true,
-      fillColor: Colors.grey.shade50,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
-        borderSide: BorderSide(color: Colors.grey.shade300),
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
-        borderSide: BorderSide(color: Colors.grey.shade300),
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
-        borderSide: const BorderSide(color: Color(0xFFE67E22), width: 1.5),
-      ),
-    );
-  }
-
-  showDialog(
-    context: context,
-    builder: (ctx) => StatefulBuilder(
-      builder: (context, setDialogState) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: Container(
-            padding: const EdgeInsets.only(bottom: 12),
-            decoration: BoxDecoration(
-              border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
-            ),
-            child: const Row(
-              children: [
-                CircleAvatar(
-                  backgroundColor: Color(0xFFFDF2E9),
-                  child: Icon(Icons.inventory_2_rounded, color: Color(0xFFE67E22)),
-                ),
-                SizedBox(width: 12),
-                Text('تزويد شحنة جديدة', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              ],
-            ),
-          ),
-          content: SingleChildScrollView(
-            child: SizedBox(
-              width: 440,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text("اختر الدواء من المخزن الحالي:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                  const SizedBox(height: 8),
-
-                  // 1. حقل البحث الإكمال التلقائي
-                  Autocomplete<Map<String, dynamic>>(
-                    displayStringForOption: (option) =>
-                        '${option['trade_name']} ${option['barcode'] != null ? "(${option['barcode']})" : ""}',
-                    optionsBuilder: (TextEditingValue textEditingValue) {
-                      final query = textEditingValue.text.trim().toLowerCase();
-                      if (query.isEmpty) {
-                        return const Iterable<Map<String, dynamic>>.empty();
-                      }
-                      return _medicines.where((m) {
-                        final trade = (m['trade_name'] ?? '').toString().toLowerCase();
-                        final barcode = (m['barcode'] ?? '').toString().toLowerCase();
-                        return trade.contains(query) || barcode.contains(query);
-                      });
-                    },
-                    onSelected: (Map<String, dynamic> selection) {
-                      setDialogState(() {
-                        selectedMedicine = selection;
-                        final avgCost = (selection['avg_cost'] as num?)?.toDouble();
-                        purchasePriceCtrl.text = avgCost == null ? '' : _formatPriceInput(avgCost);
-                        final sellPrice = (selection['sell_price'] as num?)?.toDouble() ?? 0;
-                        salePriceCtrl.text = sellPrice > 0 ? _formatPriceInput(sellPrice) : '';
-                      });
-                    },
-                    fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
-                      return TextField(
-                        controller: textEditingController,
-                        focusNode: focusNode,
-                        decoration: buildInputDecoration(
-                          labelText: 'البحث عن دواء *',
-                          hintText: 'ابحث باسم الدواء أو الباركود...',
-                          prefixIcon: Icons.search,
-                        ),
-                      );
-                    },
-                  ),
-
-                  // بطاقة تأكيد تحديد الدواء
-                  if (selectedMedicine != null) ...[
-                    const SizedBox(height: 12),
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFFEF3C7),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: const Color(0xFFFCD34D)),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.check_circle, color: Color(0xFFD97706), size: 20),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'تم تحديد: ${selectedMedicine!['trade_name']} (المتاح حالياً: ${selectedMedicine!['quantity']})',
-                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF92400E)),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-
-                  const SizedBox(height: 12),
-
-                  // 2. حقل الكمية المضافة
-                  TextField(
-                    controller: addQtyCtrl,
-                    keyboardType: TextInputType.number,
-                    decoration: buildInputDecoration(
-                      labelText: 'الكمية المضافة *',
-                      hintText: 'أدخل العدد المضاف...',
-                      prefixIcon: Icons.add_box_outlined,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-
-                  // 3. سعر الشراء (المالك فقط) وسعر البيع
-                  if (showPurchasePrice) ...[
-                    TextField(
-                      controller: purchasePriceCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      onChanged: (_) => setDialogState(() {}),
-                      decoration: buildInputDecoration(
-                        labelText: selectedMedicine != null && selectedMedicine!['avg_cost'] == null
-                            ? 'سعر الشراء للوحدة * (مطلوب: كلفة الصنف غير معروفة)'
-                            : 'سعر الشراء للوحدة *',
-                        hintText: 'كلفة الوحدة في هذه الشحنة',
-                        prefixIcon: Icons.shopping_cart_outlined,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                  ],
-                  TextField(
-                    controller: salePriceCtrl,
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    onChanged: (_) => setDialogState(() {}),
-                    decoration: buildInputDecoration(
-                      labelText: 'سعر البيع للوحدة *',
-                      hintText: 'يُطبَّق على كل المخزون للمبيعات القادمة',
-                      prefixIcon: Icons.sell_outlined,
-                    ),
-                  ),
-                  // تحذير غير مانع: البيع بأقل من سعر الشراء.
-                  if (showPurchasePrice &&
-                      (double.tryParse(salePriceCtrl.text.trim()) ?? 0) > 0 &&
-                      (double.tryParse(salePriceCtrl.text.trim()) ?? 0) <
-                          (double.tryParse(purchasePriceCtrl.text.trim()) ?? 0)) ...[
-                    const SizedBox(height: 6),
-                    const Row(
-                      children: [
-                        Icon(Icons.warning_amber_rounded, color: Color(0xFFD97706), size: 16),
-                        SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            'تنبيه: سعر البيع أقل من سعر الشراء.',
-                            style: TextStyle(fontSize: 12, color: Color(0xFF92400E), fontWeight: FontWeight.bold),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                  const SizedBox(height: 12),
-
-                  // 4. تاريخ انتهاء هذه الشحنة (دفعة صلاحية مستقلة)
-                  TextField(
-                    controller: newExpiryCtrl,
-                    readOnly: true,
-                    decoration: buildInputDecoration(
-                      labelText: 'تاريخ انتهاء هذه الشحنة (اختياري)',
-                      hintText: 'انقر لاختيار التاريخ',
-                      prefixIcon: Icons.calendar_month_outlined,
-                    ),
-                    onTap: () async {
-                      final DateTime now = DateTime.now();
-                      final DateTime today = DateTime(now.year, now.month, now.day);
-
-                      final DateTime? pickedDate = await showDatePicker(
-                        context: context,
-                        initialDate: today,
-                        firstDate: today,
-                        lastDate: DateTime(2040, 12, 31),
-                        builder: (context, child) {
-                          return Theme(
-                            data: Theme.of(context).copyWith(
-                              colorScheme: const ColorScheme.light(
-                                primary: Color(0xFFE67E22),
-                                onPrimary: Colors.white,
-                                onSurface: Colors.black,
-                              ),
-                            ),
-                            child: child!,
-                          );
-                        },
-                      );
-
-                      if (pickedDate != null) {
-                        final String formattedDate =
-                            "${pickedDate.year}-${pickedDate.month.toString().padLeft(2, '0')}-${pickedDate.day.toString().padLeft(2, '0')}";
-                        newExpiryCtrl.text = formattedDate;
-                      }
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ),
-          actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          actions: [
-            OutlinedButton(
-              style: OutlinedButton.styleFrom(
-                side: BorderSide(color: Colors.grey.shade400),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-              ),
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('إلغاء', style: TextStyle(color: Colors.black87)),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFE67E22),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 12),
-                elevation: 0,
-              ),
-              onPressed: () async {
-                final qtyToAdd = int.tryParse(addQtyCtrl.text) ?? 0;
-
-                if (selectedMedicine == null) {
-                  _showSnackBar('يرجى اختيار دواء مسجل في المخزن أولاً', Colors.red);
-                  return;
-                }
-
-                if (qtyToAdd <= 0) {
-                  _showSnackBar('يرجى إدخال كمية صحيحة', Colors.red);
-                  return;
-                }
-
-                // غير المالك لا يرى سعر الشراء: يُستخدم avg_cost الحالي تلقائياً (null).
-                double? purchasePrice;
-                if (showPurchasePrice) {
-                  purchasePrice = double.tryParse(purchasePriceCtrl.text.trim());
-                  if (purchasePrice == null || purchasePrice <= 0) {
-                    _showSnackBar('يرجى إدخال سعر شراء أكبر من صفر', Colors.red);
-                    return;
-                  }
-                }
-                final salePrice = double.tryParse(salePriceCtrl.text.trim());
-                if (salePrice == null || salePrice <= 0) {
-                  _showSnackBar('يرجى إدخال سعر بيع أكبر من صفر', Colors.red);
-                  return;
-                }
-
-                try {
-                  await MedicineRepository.instance.supplyMedicine(
-                    pharmacyId: widget.pharmacyId,
-                    isOnlineMode: widget.isOnlineMode,
-                    medicineId: selectedMedicine!['id'],
-                    addedQuantity: qtyToAdd,
-                    newExpiryDate: newExpiryCtrl.text.trim().isEmpty ? null : newExpiryCtrl.text.trim(),
-                    purchasePrice: purchasePrice,
-                    salePrice: salePrice,
-                  );
-
-                  if (Navigator.canPop(ctx)) Navigator.pop(ctx);
-                  if (mounted) {
-                    _loadMedicines();
-                    _showSnackBar('تم إضافة الشحنة بنجاح', Colors.green);
-                  }
-                } catch (e) {
-                  if (!mounted) return;
-                  _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
-                }
-              },
-              child: const Text('إضافة الشحنة', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            ),
-          ],
+// --- 1. إضافة قائمة مذخر / رصيد افتتاحي (الطريق الوحيد لإدخال المخزون) ---
+  Future<void> _openPurchaseListDialog() async {
+    final warehouseId = _selectedWarehouseId ??
+        await WarehouseRepository.instance.getMainWarehouseId(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: widget.isOnlineMode,
         );
-      },
-    ),
-  );
-}
+    if (!mounted) return;
+    final saved = await showPurchaseListDialog(
+      context,
+      pharmacyId: widget.pharmacyId,
+      isOnlineMode: widget.isOnlineMode,
+      warehouses: _warehouses,
+      initialWarehouseId: warehouseId,
+      allowWarehouseChoice: !_multiWarehouseLocked,
+      masterMedicines: _masterMedicines,
+      categories: _categories,
+    );
+    if (!saved || !mounted) return;
+    _searchController.clear();
+    await _loadMedicines();
+    if (mounted) _showSnackBar('تم حفظ القائمة وتحديث المخزون بنجاح', Colors.green);
+  }
+
   /// تفاصيل دفعات الصلاحية لصنف (للعرض فقط). سعر شراء الدفعة للمالك فقط.
   Future<void> _showBatchesDialog(Map<String, dynamic> med) async {
     final batches = await DatabaseHelper.instance.getMedicineBatches(med['id'] as int);
@@ -1327,7 +629,7 @@ void _openSupplyDialog() {
       builder: (ctx) => AlertDialog(
         title: Text('دفعات الصلاحية — ${med['trade_name']}', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         content: SizedBox(
-          width: 420,
+          width: 480,
           child: batches.isEmpty
               ? const Text('لا توجد كمية متوفرة حالياً.')
               : Column(
@@ -1348,9 +650,15 @@ void _openSupplyDialog() {
                             'الانتهاء: ${b['expiry_date'] ?? 'غير محدد'}${expired ? ' (منتهية)' : ''}',
                             style: TextStyle(fontSize: 13, color: expired ? Colors.red : null),
                           ),
-                          subtitle: widget.isOwner && price != null
-                              ? Text('سعر الشراء: ${AppFormatter.iqdWithCurrency(price)}', style: const TextStyle(fontSize: 12))
-                              : null,
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(_batchSourceText(b), style: const TextStyle(fontSize: 12, color: Color(0xFF475569))),
+                              if (widget.isOwner && price != null)
+                                Text('سعر الشراء: ${AppFormatter.iqdWithCurrency(price)}', style: const TextStyle(fontSize: 12)),
+                            ],
+                          ),
                           trailing: Text('${b['quantity']} قطعة', style: const TextStyle(fontWeight: FontWeight.bold)),
                         );
                       }),
@@ -1362,10 +670,13 @@ void _openSupplyDialog() {
     );
   }
 
-  /// قيمة سعر لحقل إدخال: بلا كسور زائدة (666.6667، 1250).
-  String _formatPriceInput(double value) {
-    if (value == value.roundToDouble()) return value.toStringAsFixed(0);
-    return value.toStringAsFixed(4).replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+  /// مصدر الدفعة للتتبّع (إرجاع لمذخر / إيقاف التعامل معه).
+  String _batchSourceText(Map<String, dynamic> batch) {
+    if (batch['source'] == BatchSource.openingStock) return 'رصيد افتتاحي';
+    final supplier = (batch['supplier_name'] ?? '').toString().trim();
+    final invoice = (batch['invoice_number'] ?? '').toString().trim();
+    if (supplier.isEmpty && invoice.isEmpty) return 'المصدر: غير مسجّل (قبل قوائم المذاخر)';
+    return 'المذخر: ${supplier.isEmpty ? '-' : supplier}${invoice.isEmpty ? '' : '  •  فاتورة #$invoice'}';
   }
 
 // --- 3. تعديل بيانات الدواء ---
@@ -1437,7 +748,7 @@ void _openSupplyDialog() {
                       ],
                     ),
                     const SizedBox(height: 10),
-                    // الصلاحية تُدار لكل شحنة (دفعة) عبر "تزويد شحنة"؛ هنا أقربها للعرض فقط.
+                    // الصلاحية تُدار لكل دفعة عبر "إضافة قائمة مذخر"؛ هنا أقربها للعرض فقط.
                     TextField(
                       controller: expiryCtrl,
                       readOnly: true,
@@ -1719,21 +1030,9 @@ void _openSupplyDialog() {
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                       elevation: 0,
                     ),
-                    onPressed: _openAddMedicineDialog,
-                    icon: const Icon(Icons.add, color: Colors.white),
-                    label: const Text('صنف جديد', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFE67E22),
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                      elevation: 0,
-                    ),
-                    onPressed: _openSupplyDialog,
-                    icon: const Icon(Icons.inventory, color: Colors.white),
-                    label: const Text('تزويد شحنة', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    onPressed: _openPurchaseListDialog,
+                    icon: const Icon(Icons.playlist_add_rounded, color: Colors.white),
+                    label: const Text('إضافة قائمة مذخر', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                   ),
                 ],
               ],
