@@ -307,6 +307,22 @@ class SupplierSerializer(serializers.ModelSerializer):
         # pharmacy يُحدَّد تلقائياً من صيدلية المستخدم — نفس نمط MedicineSerializer.
         read_only_fields = ["id", "created_at", "updated_at"]
 
+    def validate_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("اسم المذخر مطلوب.")
+        # تصحيح الاسم: قائمة المذخر تطابق المذخر بالاسم (بلا حساسية لحالة
+        # الأحرف)، فلا يُسمح باسم مذخر آخر في نفس الصيدلية. الإنشاء بلا تغيير.
+        if self.instance is not None:
+            taken = (
+                Supplier.objects.filter(pharmacy=self.instance.pharmacy, name__iexact=name)
+                .exclude(pk=self.instance.pk)
+                .exists()
+            )
+            if taken:
+                raise serializers.ValidationError("يوجد مذخر آخر بنفس الاسم.")
+        return name
+
 
 class SupplierSummarySerializer(serializers.Serializer):
     """
@@ -325,6 +341,10 @@ class SupplierSummarySerializer(serializers.Serializer):
     balance = serializers.DecimalField(max_digits=14, decimal_places=2)
     credit_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
     available_credit = serializers.DecimalField(max_digits=14, decimal_places=2)
+    # إجمالي المدفوع، تاريخ آخر فاتورة، ومشتريات الشهر الحالي (شاشة المذاخر).
+    total_paid = serializers.DecimalField(max_digits=14, decimal_places=2)
+    last_invoice_date = serializers.DateField(allow_null=True)
+    month_purchases = serializers.DecimalField(max_digits=14, decimal_places=2)
 
 
 class PurchaseListItemInputSerializer(serializers.Serializer):

@@ -124,6 +124,25 @@ class SuppliersRepository {
     return created['id'] as int;
   }
 
+  /// تصحيح اسم المذخر (الاسم فقط). أخطاء التحقق ترمي [PurchaseListException].
+  Future<void> renameSupplier({
+    required bool isOnlineMode,
+    required int id,
+    required String name,
+  }) async {
+    if (!isOnlineMode) {
+      await _db.updateSupplierName(id, name);
+      return;
+    }
+
+    await _assertOnlineWritable();
+    try {
+      await _api.updateSupplierName(id, name.trim());
+    } on SuppliersApiException catch (e) {
+      throw PurchaseListException(e.message.replaceFirst(RegExp(r'^name: '), ''));
+    }
+  }
+
   Future<void> deleteSupplier({
     required bool isOnlineMode,
     required int id,
@@ -381,6 +400,10 @@ class SuppliersRepository {
       'balance': _numOf(row['balance']).toDouble(),
       'credit_balance': _numOf(row['credit_balance']).toDouble(),
       'available_credit': _numOf(row['available_credit']).toDouble(),
+      // null = خادم أقدم لا يرسل هذه الحقول.
+      'total_paid': row['total_paid'] == null ? null : _numOf(row['total_paid']).toDouble(),
+      'last_invoice_date': row['last_invoice_date'],
+      'month_purchases': row['month_purchases'] == null ? null : _numOf(row['month_purchases']).toDouble(),
     };
   }
 

@@ -2550,6 +2550,23 @@ Future<double> totalSalesToday(int pharmacyId) async {
     return await db.insert('pharmacy_supplier', supplier);
   }
 
+  /// تصحيح اسم المذخر فقط (الهاتف لا يُعرض ولا يُعدَّل). نفس قواعد قائمة
+  /// المذخر: الاسم مطلوب بعد التشذيب، ولا يطابق (بلا حساسية لحالة الأحرف)
+  /// اسم مذخر آخر في نفس الصيدلية.
+  Future<void> updateSupplierName(int id, String name) async {
+    final db = await database;
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) throw const PurchaseListException('اسم المذخر مطلوب.');
+    final rows = await db.query('pharmacy_supplier', where: 'id = ?', whereArgs: [id], limit: 1);
+    if (rows.isEmpty) throw const PurchaseListException('المذخر غير موجود.');
+    final taken = await db.query('pharmacy_supplier',
+        where: 'pharmacy_id = ? AND id != ? AND name = ? COLLATE NOCASE',
+        whereArgs: [rows.first['pharmacy_id'], id, trimmed],
+        limit: 1);
+    if (taken.isNotEmpty) throw const PurchaseListException('يوجد مذخر آخر بنفس الاسم.');
+    await db.update('pharmacy_supplier', {'name': trimmed}, where: 'id = ?', whereArgs: [id]);
+  }
+
   // حذف مورد
   Future<int> deleteSupplier(int id) async {
     final db = await database;
@@ -2797,6 +2814,8 @@ Future<double> _invoiceRemaining(DatabaseExecutor db, int invoiceId) async {
 ///   available_credit = ما يمكن استخدامه/استلامه منه.
 /// مجموع debt_added في كشف الحساب = balance دائماً.
 Future<List<Map<String, dynamic>>> _supplierFigures(DatabaseExecutor db, int pharmacyId, {int? supplierId}) async {
+  final now = DateTime.now();
+  final month = '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}';
   final rows = await db.rawQuery('''
     SELECT s.id, s.pharmacy_id, s.name, s.phone, s.created_at,
       (SELECT COUNT(*) FROM purchase_invoice pi WHERE pi.supplier_id = s.id) AS invoice_count,
@@ -2810,11 +2829,16 @@ Future<List<Map<String, dynamic>>> _supplierFigures(DatabaseExecutor db, int pha
       COALESCE((SELECT SUM(f.amount) FROM supplier_refund f WHERE f.supplier_id = s.id), 0.0) AS refunds,
       -- دفعات قديمة غير مرتبطة بفاتورة تبقى محسوبة للحفاظ على البيانات السابقة.
       COALESCE((SELECT SUM(sp.amount_paid) FROM supplier_payment sp
-                WHERE sp.supplier_id = s.id AND sp.purchase_invoice_id IS NULL), 0.0) AS unlinked_paid
+                WHERE sp.supplier_id = s.id AND sp.purchase_invoice_id IS NULL), 0.0) AS unlinked_paid,
+      -- تاريخ آخر فاتورة ومشتريات الشهر الحالي (تاريخ الفاتورة وإلا تاريخ الإنشاء).
+      (SELECT MAX(COALESCE(NULLIF(pi.invoice_date, ''), pi.created_at)) FROM purchase_invoice pi
+                WHERE pi.supplier_id = s.id) AS last_invoice_date,
+      COALESCE((SELECT SUM(pi.total_amount) FROM purchase_invoice pi WHERE pi.supplier_id = s.id
+                AND substr(COALESCE(NULLIF(pi.invoice_date, ''), pi.created_at), 1, 7) = ?), 0.0) AS month_total
     FROM pharmacy_supplier s
     WHERE s.pharmacy_id = ? ${supplierId != null ? 'AND s.id = ?' : ''}
     ORDER BY s.name ASC
-  ''', [pharmacyId, if (supplierId != null) supplierId]);
+  ''', [month, pharmacyId, if (supplierId != null) supplierId]);
 
   double n(Object? v) => (v as num).toDouble();
   return rows.map((row) {
@@ -2835,6 +2859,9 @@ Future<List<Map<String, dynamic>>> _supplierFigures(DatabaseExecutor db, int pha
       'balance': balance,
       'credit_balance': credit,
       'available_credit': available > 0 ? available : 0.0,
+      'total_paid': roundMoney(n(row['paid']) + n(row['unlinked_paid'])),
+      'last_invoice_date': row['last_invoice_date'],
+      'month_purchases': n(row['month_total']),
     };
   }).toList();
 }

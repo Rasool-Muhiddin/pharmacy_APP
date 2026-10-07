@@ -30,14 +30,14 @@ Future<bool> showPurchaseReturnDialog(
   return saved == true;
 }
 
-const _primary = Color(0xFF1ABC9C);
-const _primaryDark = Color(0xFF16A085);
-const _textMain = Color(0xFF2C3E50);
-const _textSecondary = Color(0xFF7F8C8D);
+const _primary = Color(0xFF1ABC9C); // نفس ألوان شاشة المذاخر/التقارير
+const _primaryDark = Color(0xFF117A65);
+const _textMain = Color(0xFF1E293B);
+const _textSecondary = Color(0xFF64748B);
 const _border = Color(0xFFE2E8F0);
 const _danger = Color(0xFFDC2626);
-const _free = Color(0xFF2ECC71);
-const _returnColor = Color(0xFF2980B9);
+const _free = Color(0xFF15803D);
+const _returnColor = Color(0xFF1D4ED8);
 
 class PurchaseReturnDialog extends StatefulWidget {
   final int pharmacyId;
@@ -191,7 +191,7 @@ class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
         textDirection: TextDirection.rtl,
         child: Dialog(
           insetPadding: const EdgeInsets.all(16),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
           child: ConstrainedBox(
             constraints: BoxConstraints(
               maxWidth: (size.width * 0.85).clamp(640.0, 1200.0).clamp(0.0, size.width - 32),
@@ -206,7 +206,7 @@ class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
                   child: Row(
                     children: [
                       const CircleAvatar(
-                        backgroundColor: Color(0xFFE8F1FA),
+                        backgroundColor: Color(0xFFDBEAFE),
                         child: Icon(Icons.keyboard_return_rounded, color: _returnColor),
                       ),
                       const SizedBox(width: 12),
@@ -364,9 +364,9 @@ class _PurchaseReturnDialogState extends State<PurchaseReturnDialog> {
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
       margin: const EdgeInsets.only(top: 10),
       decoration: const BoxDecoration(
-        color: Color(0xFFF1F8F8),
+        color: Color(0xFFF8FAFC),
         border: Border(top: BorderSide(color: _border)),
-        borderRadius: BorderRadius.vertical(bottom: Radius.circular(16)),
+        borderRadius: BorderRadius.vertical(bottom: Radius.circular(14)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,

@@ -513,3 +513,45 @@ class PurchaseInvoiceDedupeMigrationTests(TransactionTestCase):
             PurchaseInvoice.objects.all().delete()
             with connection.schema_editor() as editor:
                 editor.add_constraint(PurchaseInvoice, unique)
+
+
+class SupplierScreenApiTests(PurchaseListTestBase):
+    """شاشة المذاخر: حقول الملخص الإضافية، وتصحيح اسم المذخر (الاسم فقط)."""
+
+    def summary_row(self, name):
+        return next(r for r in self.api("get", "/api/suppliers/summary/").json() if r["name"] == name)
+
+    def test_summary_has_paid_last_invoice_date_and_month_purchases(self):
+        r = self.post_list([self.line("Panadol", quantity=10, buy="1000")], paid_amount="4000",
+                           invoice_date=self.today.isoformat())
+        self.assertEqual(r.status_code, 201, r.content)
+        old = (self.today.replace(day=1) - timedelta(days=40)).isoformat()
+        r = self.post_list([self.line("Brufen", quantity=5, buy="1000")], invoice_number="F-OLD", invoice_date=old)
+        self.assertEqual(r.status_code, 201, r.content)
+
+        row = self.summary_row("مذخر الشفاء")
+        self.assertEqual(Decimal(row["total_paid"]), Decimal("4000"))
+        self.assertEqual(row["last_invoice_date"], self.today.isoformat())
+        self.assertEqual(Decimal(row["month_purchases"]), Decimal("10000"))
+
+        Supplier.objects.create(pharmacy=self.pharmacy, name="بلا فواتير")
+        empty = self.summary_row("بلا فواتير")
+        self.assertIsNone(empty["last_invoice_date"])
+        self.assertEqual(Decimal(empty["month_purchases"]), Decimal("0"))
+
+    def test_rename_supplier_name_only_with_validation(self):
+        target = Supplier.objects.create(pharmacy=self.pharmacy, name="مذخر النور", phone="0770")
+        Supplier.objects.create(pharmacy=self.pharmacy, name="Alpha")
+        url = f"/api/suppliers/{target.pk}/"
+
+        self.assertEqual(self.api("patch", url, {"name": "  "}).status_code, 400)
+        self.assertEqual(self.api("patch", url, {"name": "alpha"}).status_code, 400)
+        r = self.api("patch", url, {"name": "  مذخر النور الجديد "})
+        self.assertEqual(r.status_code, 200, r.content)
+        target.refresh_from_db()
+        self.assertEqual(target.name, "مذخر النور الجديد")
+        self.assertEqual(target.phone, "0770")
+        # نفس الاسم لنفس المذخر (تغيير حالة الأحرف فقط) مسموح.
+        self.assertEqual(self.api("patch", url, {"name": "مذخر النور الجديد"}).status_code, 200)
+        # الإنشاء القديم (إصدارات سابقة من التطبيق) بلا تغيير.
+        self.assertEqual(self.api("post", "/api/suppliers/", {"name": "Alpha", "phone": ""}).status_code, 201)

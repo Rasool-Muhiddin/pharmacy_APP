@@ -660,7 +660,12 @@ class SupplierViewSet(viewsets.ModelViewSet):
         membership = self._membership()
         suppliers = list(Supplier.objects.filter(pharmacy=membership.pharmacy).order_by("name"))
         figures = supplier_ledger.supplier_figures(s.pk for s in suppliers)
-        return Response(SupplierSummarySerializer([_summary_row(s, figures[s.pk]) for s in suppliers], many=True).data)
+        activity = _supplier_invoice_activity(s.pk for s in suppliers)
+        return Response(
+            SupplierSummarySerializer(
+                [_summary_row(s, figures[s.pk], activity[s.pk]) for s in suppliers], many=True
+            ).data
+        )
 
     @action(detail=True, methods=["get"])
     def statement(self, request, pk=None):
@@ -770,7 +775,9 @@ class SupplierViewSet(viewsets.ModelViewSet):
                 raise NotFound("المذخر غير موجود.")
             purchase_returns.receive_refund(supplier, data["amount"], data.get("notes"), data.get("received_date"))
         return Response(
-            SupplierSummarySerializer(_summary_row(supplier, supplier_ledger.figures_for(supplier))).data,
+            SupplierSummarySerializer(
+                _summary_row(supplier, supplier_ledger.figures_for(supplier), _supplier_invoice_activity([supplier.pk])[supplier.pk])
+            ).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -786,7 +793,29 @@ class SupplierViewSet(viewsets.ModelViewSet):
         return Response(PurchaseInvoiceItemSerializer(items, many=True).data)
 
 
-def _summary_row(supplier, figures):
+def _supplier_invoice_activity(supplier_ids):
+    """
+    {supplier_id: {"last_invoice_date", "month_purchases"}}: تاريخ آخر فاتورة
+    (invoice_date وإلا تاريخ الإنشاء المحلي) ومجموع فواتير الشهر الحالي —
+    نفس حساب _supplierFigures المحلي.
+    """
+    supplier_ids = list(supplier_ids)
+    result = {sid: {"last_invoice_date": None, "month_purchases": Decimal("0")} for sid in supplier_ids}
+    today = timezone.localdate()
+    rows = PurchaseInvoice.objects.filter(supplier_id__in=supplier_ids).values(
+        "supplier_id", "invoice_date", "created_at", "total_amount"
+    )
+    for row in rows:
+        day = row["invoice_date"] or timezone.localtime(row["created_at"]).date()
+        entry = result[row["supplier_id"]]
+        if entry["last_invoice_date"] is None or day > entry["last_invoice_date"]:
+            entry["last_invoice_date"] = day
+        if day.year == today.year and day.month == today.month:
+            entry["month_purchases"] += row["total_amount"] or 0
+    return result
+
+
+def _summary_row(supplier, figures, activity):
     return {
         "id": supplier.id,
         "name": supplier.name,
@@ -797,6 +826,9 @@ def _summary_row(supplier, figures):
         "balance": figures["balance"],
         "credit_balance": figures["credit"],
         "available_credit": figures["available_credit"],
+        "total_paid": figures["paid"],
+        "last_invoice_date": activity["last_invoice_date"],
+        "month_purchases": activity["month_purchases"],
     }
 
 

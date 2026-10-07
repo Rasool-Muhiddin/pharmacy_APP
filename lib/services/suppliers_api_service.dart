@@ -68,6 +68,11 @@ class SuppliersApiService {
     return _send(method: 'POST', url: '$_baseUrl/suppliers/', body: data);
   }
 
+  /// `PATCH /api/suppliers/{id}/` — تصحيح اسم المذخر فقط.
+  Future<Map<String, dynamic>> updateSupplierName(int id, String name) {
+    return _send(method: 'PATCH', url: '$_baseUrl/suppliers/$id/', body: {'name': name});
+  }
+
   Future<void> deleteSupplier(int id) => _delete(url: '$_baseUrl/suppliers/$id/');
 
   // ================== فواتير الشراء (Purchase Invoices) ==================
