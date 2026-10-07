@@ -16,6 +16,7 @@ void main() {
   late Directory tempDir;
   final helper = DatabaseHelper.instance;
   late int warehouseId;
+  late int branchWarehouseId;
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('pharmacy_dialog_test');
@@ -52,6 +53,18 @@ void main() {
       await helper.insertMedicine({
         'pharmacy_id': 1, 'warehouse_id': warehouseId, 'trade_name': 'Panadol', 'quantity': 10,
         'buy_price': 500, 'sell_price': 1000, 'expiry_date': '2030-01-01',
+      });
+      await helper.insertMedicine({
+        'pharmacy_id': 1, 'warehouse_id': warehouseId, 'trade_name': 'Amoxil', 'barcode': '6221',
+        'scientific_name': 'Amoxicillin', 'category': 'syrup', 'quantity': 4,
+        'buy_price': 2000, 'sell_price': 3000, 'expiry_date': '2030-01-01',
+      });
+      // صنف في مخزن آخر فقط (للمسح من مخزن غير المختار).
+      branchWarehouseId = await helper.addWarehouse(pharmacyId: 1, name: 'الفرع', maxWarehouses: 5);
+      await helper.insertMedicine({
+        'pharmacy_id': 1, 'warehouse_id': branchWarehouseId, 'trade_name': 'Augmentin', 'barcode': 'AUG-1g',
+        'scientific_name': 'Co-amoxiclav', 'category': 'tablet', 'quantity': 2,
+        'buy_price': 4000, 'sell_price': 6000, 'expiry_date': '2030-01-01',
       });
     });
     await tester.pumpWidget(MaterialApp(
@@ -90,6 +103,160 @@ void main() {
 
   Finder field(String label) => find.widgetWithText(TextField, label);
 
+  // حقل الباركود في سطر الصنف الجديد (آخر سطر دائماً).
+  Finder barcodeField() => field('الباركود').last;
+
+  bool focused(WidgetTester tester, Finder finder) => tester.widget<TextField>(finder).focusNode!.hasFocus;
+
+  String text(WidgetTester tester, Finder finder) => tester.widget<TextField>(finder).controller!.text;
+
+  Future<void> scan(WidgetTester tester, String code) async {
+    await tester.enterText(barcodeField(), code);
+    await tester.testTextInput.receiveAction(TextInputAction.next); // الماسح يرسل Enter
+    await tester.pumpAndSettle();
+  }
+
+  Future<void> fillHeader(WidgetTester tester, String invoice) async {
+    await tester.enterText(field('المذخر * (ابحث أو اكتب اسماً جديداً)'), 'مذخر');
+    await tester.enterText(field('رقم فاتورة المذخر *'), invoice);
+    await tester.pump();
+  }
+
+  group('barcode-first entry', () {
+    testWidgets('scanning an existing barcode fills the item, focuses quantity, edited prices are saved',
+        (tester) async {
+      bool? result;
+      await pumpDialog(tester, onClosed: (saved) => result = saved);
+      expect(focused(tester, barcodeField()), isTrue); // الباركود أول حقل ويأخذ التركيز
+      await fillHeader(tester, 'B-1');
+
+      await scan(tester, ' 6221 ');
+      expect(find.text('صنف موجود'), findsOneWidget);
+      expect(text(tester, field('الباركود').first), '6221'); // بلا مسافات
+      expect(find.widgetWithText(TextField, 'Amoxil'), findsOneWidget);
+      expect(text(tester, field('الاسم العلمي')), 'Amoxicillin');
+      expect(tester.widget<DropdownButtonFormField<String>>(find.byType(DropdownButtonFormField<String>)).initialValue,
+          'syrup');
+      expect(text(tester, field('سعر البيع *')), '3000');
+      expect(text(tester, field('سعر الشراء *')), '2000');
+      expect(focused(tester, field('الكمية المدفوعة *')), isTrue);
+      // الحقول المعبّأة قابلة للتعديل.
+      expect(tester.widget<TextField>(field('الاسم العلمي')).enabled ?? true, isTrue);
+
+      expect(find.text('سيُطبَّق سعر البيع الجديد على كل مخزون هذا الصنف'), findsNothing);
+      await tester.enterText(field('الكمية المدفوعة *'), '5');
+      await tester.enterText(field('سعر الشراء *'), '2200');
+      await tester.enterText(field('سعر البيع *'), '3500');
+      await tester.pump();
+      expect(find.text('سيُطبَّق سعر البيع الجديد على كل مخزون هذا الصنف'), findsOneWidget);
+      await tester.enterText(field('الصلاحية *'), '2029-06');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+      expect(find.text('6221'), findsOneWidget); // السطر المطوي يعرض الباركود
+      expect(focused(tester, barcodeField()), isTrue); // الصنف التالي يبدأ بالباركود
+
+      await tester.tap(find.text('حفظ القائمة والفاتورة'));
+      await settleIo(tester);
+      expect(result, isTrue);
+      await tester.runAsync(() async {
+        final db = await helper.database;
+        final amoxil = (await db.query('medicine', where: "trade_name = 'Amoxil'")).single;
+        expect([amoxil['quantity'], amoxil['sell_price']], [9, 3500]);
+        final item = (await db.query('purchase_invoice_item')).single;
+        expect([item['buy_price'], item['quantity'], item['line_total']], [2200, 5, 11000]);
+      });
+    });
+
+    testWidgets('unknown barcode keeps the code and focuses trade name', (tester) async {
+      await pumpDialog(tester, onClosed: (_) {});
+      await scan(tester, 'XY-900');
+      expect(find.text('صنف موجود'), findsNothing);
+      expect(text(tester, barcodeField()), 'XY-900');
+      expect(text(tester, field('اسم الصنف الأول')), '');
+      expect(focused(tester, field('اسم الصنف الأول')), isTrue);
+
+      await tester.enterText(field('اسم الصنف الأول'), 'Brand new');
+      await tester.testTextInput.receiveAction(TextInputAction.next);
+      await tester.pumpAndSettle();
+      expect(find.text('صنف جديد'), findsOneWidget);
+      expect(text(tester, field('الباركود').first), 'XY-900');
+    });
+
+    testWidgets('empty barcode + Enter focuses trade name and keeps the name flow', (tester) async {
+      await pumpDialog(tester, onClosed: (_) {});
+      await scan(tester, '');
+      expect(focused(tester, field('اسم الصنف الأول')), isTrue);
+      await tester.enterText(field('اسم الصنف الأول'), 'panadol');
+      await tester.testTextInput.receiveAction(TextInputAction.next);
+      await tester.pumpAndSettle();
+      expect(find.text('صنف موجود'), findsOneWidget); // كشف الصنف بالاسم كما قبل
+    });
+
+    testWidgets('barcode from another warehouse prefills but is a new item here; edits are saved', (tester) async {
+      bool? result;
+      await pumpDialog(tester, onClosed: (saved) => result = saved);
+      await fillHeader(tester, 'B-2');
+      await scan(tester, 'AUG-1g');
+      expect(find.text('صنف جديد في هذا المخزن'), findsOneWidget);
+      expect(find.text('صنف موجود'), findsNothing);
+      expect(text(tester, field('الاسم العلمي')), 'Co-amoxiclav');
+      expect(text(tester, field('سعر البيع *')), '6000');
+      expect(focused(tester, field('الكمية المدفوعة *')), isTrue);
+
+      await tester.enterText(find.widgetWithText(TextField, 'Augmentin'), 'Augmentin 1g');
+      await tester.enterText(field('الاسم العلمي'), 'Amoxicillin/Clavulanate');
+      await tester.enterText(field('الكمية المدفوعة *'), '3');
+      await tester.enterText(field('سعر البيع *'), '6500');
+      await tester.enterText(field('الصلاحية *'), '2028-01');
+      await tester.pump();
+
+      await tester.tap(find.text('حفظ القائمة والفاتورة'));
+      await settleIo(tester);
+      expect(result, isTrue);
+      await tester.runAsync(() async {
+        final db = await helper.database;
+        final created = (await db.query('medicine', where: 'warehouse_id = ? AND barcode = ?',
+                whereArgs: [warehouseId, 'AUG-1g']))
+            .single;
+        expect([created['trade_name'], created['scientific_name'], created['quantity'], created['sell_price']],
+            ['Augmentin 1g', 'Amoxicillin/Clavulanate', 3, 6500]);
+        final original = (await db.query('medicine', where: 'warehouse_id = ?', whereArgs: [branchWarehouseId])).single;
+        expect([original['trade_name'], original['quantity'], original['sell_price']], ['Augmentin', 2, 6000]);
+      });
+    });
+
+    testWidgets('scanning a barcode already in the list focuses that row instead of adding one', (tester) async {
+      await pumpDialog(tester, onClosed: (_) {});
+      await scan(tester, '6221');
+      await tester.enterText(field('الكمية المدفوعة *'), '2');
+      await tester.enterText(field('الصلاحية *'), '2029-06');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+      expect(field('الكمية المدفوعة *'), findsNothing); // مطوي
+
+      await scan(tester, '6221');
+      expect(find.text('هذا الصنف موجود في القائمة'), findsOneWidget);
+      expect(find.text('صنف موجود'), findsOneWidget); // سطر واحد فقط
+      expect(focused(tester, field('الكمية المدفوعة *')), isTrue); // السطر الموجود مفتوح
+      expect(text(tester, field('الكمية المدفوعة *')), '2');
+      expect(text(tester, barcodeField()), ''); // السطر الجديد فارغ
+    });
+
+    testWidgets('picking an existing item by name after an unknown scan asks before assigning the barcode',
+        (tester) async {
+      await pumpDialog(tester, onClosed: (_) {});
+      await scan(tester, 'P-77');
+      await tester.enterText(field('اسم الصنف الأول'), 'panadol');
+      await tester.testTextInput.receiveAction(TextInputAction.next);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('موجود في المخزن بلا باركود'), findsOneWidget);
+      await tester.tap(find.text('نعم، استخدم P-77'));
+      await tester.pumpAndSettle();
+      expect(find.text('صنف موجود'), findsOneWidget);
+      expect(text(tester, field('الباركود').first), 'P-77');
+    });
+  });
+
   testWidgets('supplier list: existing item with bonus + free new item, saved in one go', (tester) async {
     bool? result;
     await pumpDialog(tester, onClosed: (saved) => result = saved);
@@ -102,7 +269,7 @@ void main() {
     await tester.enterText(field('رقم فاتورة المذخر *'), 'F-1');
 
     // الصنف 1: موجود في المخزن (نفس الاسم) + بونص.
-    await tester.enterText(field('اكتب اسم الصنف الأول أو امسح الباركود...'), 'panadol');
+    await tester.enterText(field('اسم الصنف الأول'), 'panadol');
     await tester.testTextInput.receiveAction(TextInputAction.next);
     await tester.pumpAndSettle();
     expect(find.text('صنف موجود'), findsOneWidget);
@@ -121,7 +288,7 @@ void main() {
     expect(find.text('10 (+2)'), findsOneWidget); // السطر المطوي
 
     // الصنف 2: جديد ومجاني.
-    await tester.enterText(field('الصنف التالي: اكتب الاسم أو امسح الباركود...'), 'Sample X');
+    await tester.enterText(field('الصنف التالي: اسم الصنف'), 'Sample X');
     await tester.testTextInput.receiveAction(TextInputAction.next);
     await tester.pumpAndSettle();
     expect(find.text('صنف جديد'), findsOneWidget);
@@ -161,7 +328,7 @@ void main() {
     await pumpDialog(tester, onClosed: (saved) => result = saved);
     await tester.enterText(field('المذخر * (ابحث أو اكتب اسماً جديداً)'), 'S');
     await tester.enterText(field('رقم فاتورة المذخر *'), 'F-2');
-    await tester.enterText(field('اكتب اسم الصنف الأول أو امسح الباركود...'), 'Brufen');
+    await tester.enterText(field('اسم الصنف الأول'), 'Brufen');
     await tester.pumpAndSettle();
     await tester.tap(find.text('Brufen 400')); // من القاموس
     await tester.pumpAndSettle();
@@ -186,7 +353,7 @@ void main() {
     await tester.tap(find.text('رصيد افتتاحي'));
     await tester.pumpAndSettle();
     expect(field('رقم فاتورة المذخر *'), findsNothing);
-    await tester.enterText(field('اكتب اسم الصنف الأول أو امسح الباركود...'), 'Shelf item');
+    await tester.enterText(field('اسم الصنف الأول'), 'Shelf item');
     await tester.testTextInput.receiveAction(TextInputAction.next);
     await tester.pumpAndSettle();
     expect(find.widgetWithText(FilterChip, 'مجاني'), findsNothing);

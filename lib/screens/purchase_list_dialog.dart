@@ -103,7 +103,13 @@ class _Line {
   Map<String, dynamic>? existing;
   String? error;
 
-  bool get isBlank => !committed && name.text.trim().isEmpty;
+  /// رسالة معلومة قصيرة (مثل: مسح باركود صنف موجود في القائمة).
+  String? notice;
+
+  /// آخر باركود بُحث عنه لهذا السطر (لا يُعاد البحث عند فقدان التركيز بعد Enter).
+  String? lookedUpBarcode;
+
+  bool get isBlank => !committed && name.text.trim().isEmpty && barcode.text.trim().isEmpty;
 
   void dispose() {
     for (final c in [name, barcode, scientific, quantity, bonus, buyPrice, sellPrice, expiry]) {
@@ -148,7 +154,9 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
   /// أرقام فواتير المذخر المختار (للتحذير من التكرار قبل الحفظ).
   Set<String> _supplierInvoiceNumbers = {};
 
-  // أصناف المخزن المختار (للإكمال التلقائي وشارة "صنف موجود").
+  // أصناف كل المخازن من الكاش المحلي (يُحدَّث من الخادم عند فتح النافذة أونلاين)،
+  // وأصناف المخزن المختار منها (للإكمال التلقائي والباركود وشارة "صنف موجود").
+  List<Map<String, dynamic>> _allMedicines = [];
   List<Map<String, dynamic>> _inventory = [];
 
   final List<_Line> _lines = [];
@@ -171,7 +179,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
   @override
   void initState() {
     super.initState();
-    _lines.add(_Line());
+    _lines.add(_newLine());
     _loadSuppliers();
     _loadInventory();
     _invoiceNumber.addListener(() => setState(() {}));
@@ -204,10 +212,24 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
   }
 
   Future<void> _loadInventory() async {
-    final rows = await DatabaseHelper.instance.getMedicines(widget.pharmacyId, warehouseId: _warehouseId);
+    List<Map<String, dynamic>> rows;
+    try {
+      // أونلاين: يحدّث كاش الأصناف من الخادم مرة واحدة؛ البحث بالباركود بعدها محلي.
+      rows = await MedicineRepository.instance.getMedicines(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+    } catch (_) {
+      rows = await DatabaseHelper.instance.getMedicines(widget.pharmacyId);
+    }
     if (!mounted) return;
+    _allMedicines = rows;
+    _applyWarehouse();
+  }
+
+  void _applyWarehouse() {
     setState(() {
-      _inventory = rows;
+      _inventory = _allMedicines.where((m) => m['warehouse_id'] == _warehouseId).toList();
       for (final line in _lines.where((l) => l.committed)) {
         line.existing = _matchExisting(line);
       }
@@ -232,14 +254,15 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
 
   /// نفس قاعدة الحفظ (findPurchaseListMedicine / find_existing_medicine):
   /// نفس الباركود في المخزن، وإلا نفس الاسم التجاري بلا حساسية لحالة الأحرف.
-  Map<String, dynamic>? _matchExisting(_Line line) {
-    final barcode = line.barcode.text.trim();
+  Map<String, dynamic>? _matchExisting(_Line line) => _findExisting(line.barcode.text, line.name.text);
+
+  Map<String, dynamic>? _findExisting(String barcodeText, String nameText) {
+    final barcode = barcodeText.trim();
     if (barcode.isNotEmpty) {
-      for (final m in _inventory) {
-        if ((m['barcode'] ?? '').toString().trim() == barcode) return m;
-      }
+      final match = _inventoryByBarcode(barcode);
+      if (match != null) return match;
     }
-    final name = line.name.text.trim().toLowerCase();
+    final name = nameText.trim().toLowerCase();
     if (name.isEmpty) return null;
     Map<String, dynamic>? best;
     for (final m in _inventory) {
@@ -249,6 +272,26 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
     }
     return best;
   }
+
+  Map<String, dynamic>? _inventoryByBarcode(String barcode) {
+    for (final m in _inventory) {
+      if ((m['barcode'] ?? '').toString().trim() == barcode) return m;
+    }
+    return null;
+  }
+
+  /// صنف بنفس الباركود في مخزن غير المختار (أول مطابقة).
+  Map<String, dynamic>? _otherWarehouseByBarcode(String barcode) {
+    if (barcode.isEmpty) return null;
+    for (final m in _allMedicines) {
+      if (m['warehouse_id'] != _warehouseId && (m['barcode'] ?? '').toString().trim() == barcode) return m;
+    }
+    return null;
+  }
+
+  /// صنف جديد في هذا المخزن لكن باركوده مسجّل في مخزن آخر.
+  bool _isFromOtherWarehouse(_Line line) =>
+      line.existing == null && _otherWarehouseByBarcode(line.barcode.text.trim()) != null;
 
   bool get _duplicateInvoiceNumber {
     if (!_isSupplierList || _selectedSupplier == null) return false;
@@ -263,9 +306,115 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
 
   // ================== منطق الأسطر ==================
 
+  /// سطر جديد: الباركود أول حقل فيه؛ فقدان تركيزه بقيمة لم يُبحث عنها يبحث عنها.
+  _Line _newLine() {
+    final line = _Line();
+    line.barcodeFocus.addListener(() {
+      if (line.barcodeFocus.hasFocus || !mounted || line.committed || !_lines.contains(line)) return;
+      final code = line.barcode.text.trim();
+      if (code.isNotEmpty && code != line.lookedUpBarcode) _lookupBarcode(line, moveFocusIfUnknown: false);
+    });
+    return line;
+  }
+
+  /// Enter في حقل الباركود (الماسح يكتب الأرقام ثم Enter): بحث فوري في الكاش
+  /// المحلي. موجود في المخزن المختار ← يعبّئ الصنف وينتقل للكمية؛ في مخزن آخر
+  /// ← يعبّئ كصنف جديد هنا؛ غير موجود أو فارغ ← ينتقل لحقل الاسم.
+  void _lookupBarcode(_Line line, {bool moveFocusIfUnknown = true}) {
+    if (line.committed || !_lines.contains(line)) return;
+    final code = line.barcode.text.trim();
+    if (line.barcode.text != code) line.barcode.text = code;
+    line.lookedUpBarcode = code;
+
+    if (code.isNotEmpty) {
+      for (final other in _lines) {
+        if (identical(other, line) || !other.committed || other.barcode.text.trim() != code) continue;
+        // لا سطر مكرر: يُفرَّغ السطر الجديد ويُفتح السطر الموجود على كميته.
+        setState(() {
+          line.barcode.clear();
+          line.lookedUpBarcode = null;
+          for (final l in _lines) {
+            l.notice = null;
+          }
+          other.expanded = true;
+          other.notice = 'هذا الصنف موجود في القائمة';
+        });
+        _focusQuantity(other);
+        return;
+      }
+
+      final here = _inventoryByBarcode(code);
+      if (here != null) {
+        _commitName(line, option: {...here, '_inventory': true});
+        return;
+      }
+      final elsewhere = _otherWarehouseByBarcode(code);
+      if (elsewhere != null) {
+        _commitPrefill(line, elsewhere);
+        return;
+      }
+    }
+    if (moveFocusIfUnknown) line.nameFocus.requestFocus();
+  }
+
+  /// باركود من مخزن آخر: تُنسخ بياناته الثابتة، والسطر صنف جديد في هذا المخزن
+  /// (إلا إن طابق اسمه صنفاً هنا — نفس قاعدة الحفظ).
+  void _commitPrefill(_Line line, Map<String, dynamic> source) {
+    setState(() {
+      line.name.text = (source['trade_name'] ?? '').toString();
+      line.scientific.text = (source['scientific_name'] ?? '').toString();
+      final category = source['category']?.toString();
+      if (category != null && widget.categories.containsKey(category)) line.category = category;
+      final sell = (source['sell_price'] as num?)?.toDouble() ?? 0;
+      if (sell > 0) line.sellPrice.text = _fmtInput(sell);
+      final buy = (source['buy_price'] as num?)?.toDouble() ?? 0;
+      if (buy > 0 && !line.isFree) line.buyPrice.text = _fmtInput(buy);
+      line.committed = true;
+      line.expanded = true;
+      line.error = null;
+      line.existing = _matchExisting(line);
+      if (identical(line, _lines.last)) _lines.add(_newLine());
+    });
+    _focusQuantity(line);
+  }
+
+  void _focusQuantity(_Line line) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      (_isSupplierList && line.isFree ? line.bonusFocus : line.quantityFocus).requestFocus();
+    });
+    _revealLine(line);
+  }
+
+  /// صنف موجود اختير بالاسم وباركوده يختلف عن الممسوح: يسأل أي باركود يُعتمد.
+  /// true = الباركود الممسوح، false = باركود الصنف الحالي، null = إلغاء.
+  Future<bool?> _askBarcode(String tradeName, String scanned, String current) {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text('باركود الصنف'),
+          content: Text(current.isEmpty
+              ? 'الصنف "$tradeName" موجود في المخزن بلا باركود.\nهل تريد تعيين الباركود $scanned له؟'
+              : 'الصنف "$tradeName" مسجّل بالباركود $current.\nهل تريد استبداله بالباركود $scanned؟'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: Text(current.isEmpty ? 'لا، بدون باركود' : 'لا، أبقِ $current'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: Text('نعم، استخدم $scanned'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// يثبّت اسم الصنف: يفتح لوحة الحقول، ويعبّئ ما يُعرف مسبقاً (من الصنف
   /// الموجود أو من القاموس)، وينقل التركيز لحقل الكمية.
-  void _commitName(_Line line, {Map<String, dynamic>? option}) {
+  Future<void> _commitName(_Line line, {Map<String, dynamic>? option}) async {
     final typed = line.name.text.trim();
     if (typed.isEmpty && option == null) return;
 
@@ -279,10 +428,26 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
       }
     }
 
+    // باركود ممسوح غير مسجّل هنا ثم اختيار صنف موجود بالاسم: يُسأل المستخدم
+    // قبل تعيين/استبدال باركود ذلك الصنف.
+    var keepScanned = false;
+    final scanned = line.barcode.text.trim();
+    if (scanned.isNotEmpty && _inventoryByBarcode(scanned) == null) {
+      final target = option?['_inventory'] == true
+          ? option
+          : _findExisting('', (option?['trade_name'] ?? typed).toString());
+      final current = (target?['barcode'] ?? '').toString().trim();
+      if (target != null && current != scanned) {
+        final answer = await _askBarcode((target['trade_name'] ?? '').toString(), scanned, current);
+        if (answer == null || !mounted || !_lines.contains(line)) return;
+        keepScanned = answer;
+      }
+    }
+
     setState(() {
       if (option != null) {
         line.name.text = (option['trade_name'] ?? typed).toString();
-        if (option['_inventory'] == true) line.barcode.text = (option['barcode'] ?? '').toString();
+        if (option['_inventory'] == true && !keepScanned) line.barcode.text = (option['barcode'] ?? '').toString();
         final scientific = (option['scientific_name'] ?? '').toString();
         if (scientific.isNotEmpty) line.scientific.text = scientific;
         final category = option['category']?.toString();
@@ -294,8 +459,8 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
       line.existing = _matchExisting(line);
       final existing = line.existing;
       if (existing != null) {
-        // بيانات الصنف الموجود للعرض؛ سعر البيع الحالي اقتراح قابل للتعديل.
-        line.barcode.text = (existing['barcode'] ?? '').toString();
+        // بيانات الصنف الموجود اقتراح قابل للتعديل (سعر البيع الجديد يُطبَّق على مخزونه).
+        if (!keepScanned) line.barcode.text = (existing['barcode'] ?? '').toString();
         line.scientific.text = (existing['scientific_name'] ?? '').toString();
         final category = existing['category']?.toString();
         if (category != null && widget.categories.containsKey(category)) line.category = category;
@@ -305,11 +470,9 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
         if (line.buyPrice.text.trim().isEmpty && buy > 0 && !line.isFree) line.buyPrice.text = _fmtInput(buy);
       }
       // كل سطر مكتمل الاسم يضمن وجود سطر فارغ بعده للصنف التالي.
-      if (identical(line, _lines.last)) _lines.add(_Line());
+      if (identical(line, _lines.last)) _lines.add(_newLine());
     });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      (line.isFree ? line.bonusFocus : line.quantityFocus).requestFocus();
-    });
+    _focusQuantity(line);
   }
 
   /// إنهاء الصنف: طيّ لوحته وتركيز سطر الصنف التالي الفارغ.
@@ -317,12 +480,13 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
     final error = validatePurchaseLine(_lineData(line), _mode, isNew: line.existing == null);
     setState(() {
       line.error = error;
+      line.notice = null;
       line.expanded = error != null;
-      if (_lines.last.committed) _lines.add(_Line());
+      if (_lines.last.committed) _lines.add(_newLine());
     });
     if (error != null) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _lines.last.nameFocus.requestFocus();
+      _lines.last.barcodeFocus.requestFocus();
       _scrollToEnd();
     });
   }
@@ -331,12 +495,15 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
     setState(() {
       _lines.remove(line);
       line.dispose();
-      if (_lines.isEmpty || _lines.last.committed) _lines.add(_Line());
+      if (_lines.isEmpty || _lines.last.committed) _lines.add(_newLine());
     });
   }
 
   void _toggleLine(_Line line) {
-    setState(() => line.expanded = !line.expanded);
+    setState(() {
+      line.expanded = !line.expanded;
+      line.notice = null;
+    });
     if (line.expanded) {
       WidgetsBinding.instance.addPostFrameCallback((_) => line.quantityFocus.requestFocus());
     }
@@ -365,9 +532,9 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
     });
   }
 
-  Future<void> _changeWarehouse(int id) async {
-    setState(() => _warehouseId = id);
-    await _loadInventory();
+  void _changeWarehouse(int id) {
+    _warehouseId = id;
+    _applyWarehouse();
   }
 
   /// بيانات السطر بمفاتيح الخادم نفسها (تُرسل كما هي أونلاين وتُحفظ محلياً أوفلاين).
@@ -759,7 +926,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           return const Padding(
             padding: EdgeInsets.only(top: 6),
             child: Text(
-              'Enter للانتقال بين الحقول • Enter في حقل الصلاحية ينهي الصنف ويبدأ صنفاً جديداً • الصلاحية: 2027-05 أو 05/2027 أو تاريخ كامل',
+              'امسح الباركود (أو Enter بدونه) • Enter للانتقال بين الحقول • Enter في حقل الصلاحية ينهي الصنف ويبدأ صنفاً جديداً • الصلاحية: 2027-05 أو 05/2027 أو تاريخ كامل',
               style: TextStyle(color: _textSecondary, fontSize: 12),
             ),
           );
@@ -791,7 +958,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (!line.committed)
-            Padding(padding: const EdgeInsets.all(10), child: _buildNameField(line, index))
+            Padding(padding: const EdgeInsets.all(10), child: _buildEntryRow(line, index))
           else if (!line.expanded)
             _buildSummaryRow(line, index)
           else ...[
@@ -806,8 +973,41 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
               child: Text(line.error!, style: const TextStyle(color: _danger, fontWeight: FontWeight.w600)),
             ),
+          if (line.notice != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+              child: Text(line.notice!, style: const TextStyle(color: _existing, fontWeight: FontWeight.w600)),
+            ),
         ],
       ),
+    );
+  }
+
+  /// سطر صنف جديد: الباركود أولاً (يأخذ التركيز تلقائياً) ثم اسم الصنف.
+  Widget _buildEntryRow(_Line line, int index) {
+    return Row(
+      children: [
+        _indexBadge(index),
+        const SizedBox(width: 10),
+        SizedBox(
+          width: 230,
+          child: TextField(
+            controller: line.barcode,
+            focusNode: line.barcodeFocus,
+            autofocus: index == 0,
+            textInputAction: TextInputAction.next,
+            onChanged: (_) => setState(() {}),
+            // التركيز يحدده البحث نفسه لا حركة Enter الافتراضية.
+            onEditingComplete: () {},
+            onSubmitted: (_) => _lookupBarcode(line),
+            decoration: _decoration('الباركود', Icons.qr_code_scanner).copyWith(
+              hintText: 'امسح الباركود أو Enter بدونه',
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(child: _buildNameField(line, index)),
+      ],
     );
   }
 
@@ -872,27 +1072,16 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           ),
         ),
       ),
-      fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) => Row(
-        children: [
-          _indexBadge(index),
-          const SizedBox(width: 10),
-          Expanded(
-            child: TextField(
-              controller: controller,
-              focusNode: focusNode,
-              autofocus: index == 0,
-              textInputAction: TextInputAction.next,
-              onChanged: (_) => setState(() {}),
-              onSubmitted: (_) => _commitName(line),
-              decoration: _decoration(
-                index == 0
-                    ? 'اكتب اسم الصنف الأول أو امسح الباركود...'
-                    : 'الصنف التالي: اكتب الاسم أو امسح الباركود...',
-                Icons.medication_outlined,
-              ),
-            ),
-          ),
-        ],
+      fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) => TextField(
+        controller: controller,
+        focusNode: focusNode,
+        textInputAction: TextInputAction.next,
+        onChanged: (_) => setState(() {}),
+        onSubmitted: (_) => _commitName(line),
+        decoration: _decoration(
+          index == 0 ? 'اسم الصنف الأول' : 'الصنف التالي: اسم الصنف',
+          Icons.medication_outlined,
+        ),
       ),
     );
   }
@@ -903,6 +1092,18 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
       child: Row(
         children: [
           _indexBadge(index),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 200,
+            child: TextField(
+              controller: line.barcode,
+              focusNode: line.barcodeFocus,
+              textInputAction: TextInputAction.next,
+              onChanged: (_) => setState(() => line.existing = _matchExisting(line)),
+              onSubmitted: (_) => line.quantityFocus.requestFocus(),
+              decoration: _decoration('الباركود', Icons.qr_code_scanner),
+            ),
+          ),
           const SizedBox(width: 10),
           Expanded(
             child: TextField(
@@ -967,7 +1168,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           _numField(line.buyPrice, line.buyFocus, _isSupplierList ? 'سعر الشراء *' : 'سعر الشراء (0 = غير معروف)', 160,
               next: line.sellFocus),
         _numField(line.sellPrice, line.sellFocus, existing && isFree ? 'سعر البيع (اختياري)' : 'سعر البيع *', 140,
-            next: line.expiryFocus),
+            next: line.expiryFocus, helper: _sellPriceChanged(line) ? 'سيُطبَّق سعر البيع الجديد على كل مخزون هذا الصنف' : null),
         SizedBox(
           width: 190,
           child: TextField(
@@ -995,23 +1196,10 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
       runSpacing: 10,
       children: [
         SizedBox(
-          width: 190,
-          child: TextField(
-            controller: line.barcode,
-            focusNode: line.barcodeFocus,
-            enabled: !existing,
-            textInputAction: TextInputAction.next,
-            onChanged: (_) => setState(() => line.existing = _matchExisting(line)),
-            onSubmitted: (_) => line.scientificFocus.requestFocus(),
-            decoration: _decoration('الباركود', Icons.qr_code_scanner),
-          ),
-        ),
-        SizedBox(
           width: 220,
           child: TextField(
             controller: line.scientific,
             focusNode: line.scientificFocus,
-            enabled: !existing,
             textInputAction: TextInputAction.next,
             onSubmitted: (_) => _finishLine(line),
             decoration: _decoration('الاسم العلمي', Icons.science_outlined),
@@ -1027,14 +1215,14 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
             items: widget.categories.entries
                 .map((e) => DropdownMenuItem(value: e.key, child: Text(e.value, overflow: TextOverflow.ellipsis)))
                 .toList(),
-            onChanged: existing ? null : (v) => setState(() => line.category = v ?? line.category),
+            onChanged: (v) => setState(() => line.category = v ?? line.category),
           ),
         ),
         if (existing)
           const Padding(
             padding: EdgeInsets.only(top: 12),
             child: Text(
-              'بيانات الصنف الموجود تُعدَّل من نافذة "تعديل" في المخزون.',
+              'الاسم والاسم العلمي والشكل الدوائي لصنف موجود لا تتغير في بطاقته بالحفظ؛ تُعدَّل من نافذة "تعديل" في المخزون.',
               style: TextStyle(color: _textSecondary, fontSize: 12),
             ),
           ),
@@ -1066,6 +1254,10 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           children: [
             _indexBadge(index),
             const SizedBox(width: 10),
+            Expanded(
+              flex: 2,
+              child: _summaryCell('الباركود', line.barcode.text.trim().isEmpty ? '-' : line.barcode.text.trim()),
+            ),
             Expanded(
               flex: 4,
               child: Text(line.name.text.trim(),
@@ -1211,7 +1403,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
   }
 
   Widget _numField(TextEditingController c, FocusNode f, String label, double width,
-      {required FocusNode next, bool integer = false}) {
+      {required FocusNode next, bool integer = false, String? helper}) {
     return SizedBox(
       width: width,
       child: TextField(
@@ -1222,9 +1414,20 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
         textInputAction: TextInputAction.next,
         onChanged: (_) => setState(() {}),
         onSubmitted: (_) => next.requestFocus(),
-        decoration: _decoration(label, null),
+        decoration: _decoration(label, null).copyWith(
+          helperText: helper,
+          helperMaxLines: 3,
+          helperStyle: const TextStyle(color: _newItem, fontSize: 11),
+        ),
       ),
     );
+  }
+
+  /// سعر بيع صنف موجود عُدِّل عن سعره الحالي (يُطبَّق على كل مخزونه عند الحفظ).
+  bool _sellPriceChanged(_Line line) {
+    final current = (line.existing?['sell_price'] as num?)?.toDouble();
+    final typed = _parseNum(line.sellPrice.text);
+    return current != null && typed != null && (typed - current).abs() > 0.001;
   }
 
   String? _expiryHelper(String text) {
@@ -1235,6 +1438,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
 
   Widget _statusBadge(_Line line) {
     final existing = line.existing != null;
+    final otherWarehouse = _isFromOtherWarehouse(line);
     final color = existing ? _existing : _newItem;
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -1244,8 +1448,10 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
         Tooltip(
           message: existing
               ? 'يُضاف للصنف الموجود (الكمية الحالية ${line.existing!['quantity'] ?? 0}) كدفعة جديدة، وسعر البيع الجديد يحل محل القديم'
-              : 'صنف جديد يُنشأ في المخزن عند الحفظ',
-          child: _badge(existing ? 'صنف موجود' : 'صنف جديد', color),
+              : otherWarehouse
+                  ? 'الباركود مسجّل في مخزن آخر؛ يُنشأ صنفاً جديداً في هذا المخزن عند الحفظ'
+                  : 'صنف جديد يُنشأ في المخزن عند الحفظ',
+          child: _badge(existing ? 'صنف موجود' : (otherWarehouse ? 'صنف جديد في هذا المخزن' : 'صنف جديد'), color),
         ),
       ],
     );
