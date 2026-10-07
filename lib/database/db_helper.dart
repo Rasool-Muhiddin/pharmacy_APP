@@ -1153,6 +1153,26 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     return roundCost((oldQty * oldAvg + newQty * newCost) / (oldQty + newQty))!;
   }
 
+  /// avg_cost بعد استرجاع لمذخر: الوحدات المسترجعة تخرج بمبلغ رصيدها
+  /// ([costRemoved] = الوحدات المحسوبة × سعر الاسترجاع؛ البونص/المجاني = 0)،
+  /// فيبقى على الباقي ما دُفع فعلاً صافياً من الأرصدة. نفس stock.avg_cost_after_return.
+  /// - لا يبقى مخزون أو كلفة غير معروفة: avg_cost كما هو.
+  /// - نتيجة سالبة: 0.
+  static double? avgCostAfterReturn({
+    required int oldQty,
+    required double? oldAvg,
+    required int returnedQty,
+    required double costRemoved,
+  }) {
+    final left = oldQty - returnedQty;
+    if (left <= 0 || oldAvg == null) return oldAvg;
+    // حساب صحيح بوحدات 0.0001 (avg_cost بأربع منازل والرصيد بمنزلتين) كي يطابق
+    // Decimal في الخادم حرفياً (ROUND_HALF_UP) بلا أخطاء الفاصلة العائمة.
+    final numerator = oldQty * (oldAvg * 10000).round() - (costRemoved * 10000).round();
+    if (numerator <= 0) return 0;
+    return ((2 * numerator + left) ~/ (2 * left)) / 10000;
+  }
+
   static const String _sellableBatch =
       "(b.expiry_date IS NULL OR b.expiry_date = '' OR date(b.expiry_date) >= date('now', 'localtime'))";
 
@@ -3271,7 +3291,8 @@ static String _movementMoment(DateTime? day) {
 /// POST /api/purchase-invoices/{id}/return-items/، backend/pharmacy_data/purchase_returns.py):
 /// لكل سطر: الحد = min(المتبقي من السطر، المخزون الحالي)، الرصيد للوحدات المدفوعة
 /// فقط × سعر الاسترجاع (افتراضياً سعر الشراء). المخزون يُخصم من دفعات الفاتورة
-/// أولاً ثم FEFO، وavg_cost لا يتغير. الرصيد يخفّض متبقي الفاتورة، والفائض يسدّد
+/// أولاً ثم FEFO، والوحدات تخرج بمبلغ رصيدها فيُعاد حساب avg_cost
+/// ([avgCostAfterReturn]). الرصيد يخفّض متبقي الفاتورة، والفائض يسدّد
 /// فواتير المذخر الأخرى (الأقدم أولاً) ثم يبقى رصيداً لصالح الصيدلية.
 /// الكل أو لا شيء؛ أخطاء الأسطر ترمي [PurchaseListException] (line = السطر).
 ///
@@ -3336,6 +3357,11 @@ Future<Map<String, dynamic>> returnPurchaseItems({
         await _deductFefo(txn, medicineId, quantity, sellableOnly: false, preferInvoiceId: purchaseInvoiceId);
       } on StateError catch (e) {
         throw PurchaseListException(e.message, line: index);
+      }
+      final oldAvg = (medicine['avg_cost'] as num?)?.toDouble();
+      final newAvg = avgCostAfterReturn(oldQty: stock, oldAvg: oldAvg, returnedQty: quantity, costRemoved: credit);
+      if (newAvg != oldAvg) {
+        await txn.update('medicine', {'avg_cost': newAvg}, where: 'id = ?', whereArgs: [medicineId]);
       }
       medicineIds.add(medicineId);
       totalCredit += credit;

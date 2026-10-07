@@ -126,6 +126,95 @@
         "lines": [{"key": "C", "trade_name": "C", "quantity": 2, "bonus_quantity": 0, "is_free": false, "buy_price": 2000, "sell_price": 2500}],
         "expect": {"balance": 1000, "available_credit": 0, "remaining": {"F-1": 0, "F-2": 0, "F-3": 1000}, "credit_applied": {"F-3": 2600}}
       }
+    ],
+    "final_avg_cost": {"A": 800}
+  },
+  "return_cost": {
+    "note": "Replayed by test/supplier_returns_db_test.dart and backend tests_supplier_returns.py. One medicine 'A' (sell price 1500). Returned units leave at their credit: avg = (avg*qty_before - credit)/qty_after; qty_after 0 keeps avg; negative -> 0. 'list' lines: quantity/bonus/buy/expiry_days. 'sell' uses the sell price. 'return' takes that invoice's batches first, then FEFO. When 'profit' is given everything has been sold: lifetime profit (sum of (unit_price - unit_cost) * qty) must equal it and, when 'cash_profit' is true, equal sales - purchases + credits.",
+    "cases": [
+      {
+        "name": "credit at purchase cost (2,250)",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "return", "invoice": "F-2", "quantity": 3, "unit_price": 750, "expect": {"avg_cost": 500, "stock": 3, "credit": 2250}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 500, "stock": 0}}
+        ],
+        "profit": 3000, "cash_profit": true
+      },
+      {
+        "name": "supplier credited less (2,100)",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "return", "invoice": "F-2", "quantity": 3, "unit_price": 700, "expect": {"avg_cost": 550, "stock": 3, "credit": 2100}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 550, "stock": 0}}
+        ],
+        "profit": 2850, "cash_profit": true
+      },
+      {
+        "name": "supplier credited more (2,400)",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "return", "invoice": "F-2", "quantity": 3, "unit_price": 800, "expect": {"avg_cost": 450, "stock": 3, "credit": 2400}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 450, "stock": 0}}
+        ],
+        "profit": 3150, "cash_profit": true
+      },
+      {
+        "name": "line batch present: return 2 of F-2 after a sale took the F-1 batch",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 200, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 400, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 625, "stock": 3}},
+          {"op": "return", "invoice": "F-2", "quantity": 2, "unit_price": 750, "expect": {"avg_cost": 375, "stock": 1, "credit": 1500, "batch_prices": [750]}},
+          {"op": "sell", "quantity": 1, "expect": {"avg_cost": 375, "stock": 0}}
+        ],
+        "profit": 3750, "cash_profit": true
+      },
+      {
+        "name": "line batch already consumed by FEFO: same return taken from the F-1 batch gives the same numbers",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 625, "stock": 3}},
+          {"op": "return", "invoice": "F-2", "quantity": 2, "unit_price": 750, "expect": {"avg_cost": 375, "stock": 1, "credit": 1500, "batch_prices": [500]}},
+          {"op": "sell", "quantity": 1, "expect": {"avg_cost": 375, "stock": 0}}
+        ],
+        "profit": 3750, "cash_profit": true
+      },
+      {
+        "name": "bonus units returned with 0 credit raise avg",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 2, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 468.75, "stock": 8}},
+          {"op": "return", "invoice": "F-2", "quantity": 3, "expect": {"avg_cost": 300, "stock": 5, "credit": 2250}},
+          {"op": "return", "invoice": "F-2", "quantity": 2, "expect": {"avg_cost": 500, "stock": 3, "credit": 0}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 500, "stock": 0}}
+        ],
+        "profit": 3000, "cash_profit": true
+      },
+      {
+        "name": "returning everything keeps avg (qty_after = 0); the next purchase starts fresh",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "return", "invoice": "F-2", "quantity": 3, "unit_price": 700, "expect": {"avg_cost": 550, "stock": 3, "credit": 2100}},
+          {"op": "return", "invoice": "F-1", "quantity": 3, "expect": {"avg_cost": 550, "stock": 0, "credit": 1500}},
+          {"op": "list", "invoice": "F-3", "quantity": 2, "bonus": 0, "buy": 900, "expiry_days": 300, "expect": {"avg_cost": 900, "stock": 2}}
+        ]
+      },
+      {
+        "name": "negative result is floored at 0",
+        "steps": [
+          {"op": "list", "invoice": "F-1", "quantity": 3, "bonus": 0, "buy": 500, "expiry_days": 400, "expect": {"avg_cost": 500, "stock": 3}},
+          {"op": "list", "invoice": "F-2", "quantity": 3, "bonus": 0, "buy": 750, "expiry_days": 200, "expect": {"avg_cost": 625, "stock": 6}},
+          {"op": "return", "invoice": "F-2", "quantity": 3, "unit_price": 1300, "expect": {"avg_cost": 0, "stock": 3, "credit": 3900}},
+          {"op": "sell", "quantity": 3, "expect": {"avg_cost": 0, "stock": 0}}
+        ],
+        "profit": 4500
+      }
     ]
   }
 }

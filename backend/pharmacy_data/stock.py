@@ -39,6 +39,21 @@ def weighted_avg_cost(old_qty, old_avg, new_qty, new_cost):
     return to_cost(total / Decimal(old_qty + new_qty))
 
 
+def avg_cost_after_return(old_qty, old_avg, returned_qty, cost_removed):
+    """
+    avg_cost بعد استرجاع لمذخر: الوحدات المسترجعة تخرج بمبلغ رصيدها
+    (cost_removed = الوحدات المحسوبة × سعر الاسترجاع؛ البونص/المجاني = 0)،
+    فيبقى على الباقي ما دُفع فعلاً صافياً من الأرصدة.
+    if old_qty - returned_qty <= 0 or avg_cost is null: avg لا يتغير
+    else: avg = max(0, (old_qty*avg - cost_removed) / (old_qty - returned_qty))
+    """
+    left = old_qty - returned_qty
+    if left <= 0 or old_avg is None:
+        return old_avg
+    value = (Decimal(old_qty) * Decimal(old_avg) - Decimal(cost_removed)) / Decimal(left)
+    return to_cost(max(value, Decimal(0)))
+
+
 def effective_unit_cost(paid_qty, bonus_qty, buy_price):
     """
     كلفة الوحدة الفعلية لسطر فيه بونص: (المدفوع × سعر الشراء) / (المدفوع + البونص).

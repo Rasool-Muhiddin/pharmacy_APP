@@ -181,7 +181,70 @@ void main() {
         expect(rows.single['t'], closeTo(entry.value as num, 0.001));
       }
     }
-    expect((await db.query('medicine', where: "trade_name = 'A'")).single['avg_cost'], 833.3333);
+    // الوحدات المسترجعة تخرج بمبلغ رصيدها: (12 × 833.3333 − 3600) / 8 = 800، ثم الباقي كله (الكمية 0) لا يغيّره.
+    expect((await db.query('medicine', where: "trade_name = 'A'")).single['avg_cost'],
+        ((jsonDecode(File('test/fixtures/profit_parity.json').readAsStringSync()) as Map)['supplier_returns']
+            as Map)['final_avg_cost']['A']);
+  });
+
+  group('return cost (avg_cost after a supplier return)', () {
+    test('avgCostAfterReturn rules', () {
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 6, oldAvg: 625, returnedQty: 3, costRemoved: 2100), 550);
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 3, oldAvg: 550, returnedQty: 3, costRemoved: 1500), 550);
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 6, oldAvg: 625, returnedQty: 3, costRemoved: 3900), 0);
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 6, oldAvg: null, returnedQty: 3, costRemoved: 100), isNull);
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 12, oldAvg: 833.3333, returnedQty: 4, costRemoved: 3600), 800);
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 3, oldAvg: 100, returnedQty: 1, costRemoved: 0.01), 149.995);
+      expect(DatabaseHelper.avgCostAfterReturn(oldQty: 7, oldAvg: 1, returnedQty: 4, costRemoved: 0), 2.3333);
+    });
+
+    final cases = ((jsonDecode(File('test/fixtures/profit_parity.json').readAsStringSync()) as Map)['return_cost']
+        as Map)['cases'] as List;
+    for (final c in cases.cast<Map<String, dynamic>>()) {
+      test('shared parity: ${c['name']}', () async {
+        final db = await freshDb();
+        var sales = 0.0, purchases = 0.0, credits = 0.0, sold = 0;
+        for (final step in (c['steps'] as List).cast<Map<String, dynamic>>()) {
+          final exp = step['expect'] as Map<String, dynamic>;
+          switch (step['op']) {
+            case 'list':
+              await postList([
+                {...line('A', qty: step['quantity'] as int, buy: step['buy'] as num, bonus: step['bonus'] as int),
+                  'expiry_date': inDays(step['expiry_days'] as int)},
+              ], invoice: step['invoice'] as String);
+              purchases += (step['quantity'] as int) * (step['buy'] as num).toDouble();
+            case 'sell':
+              final medicine = (await db.query('medicine', where: "trade_name = 'A'")).single;
+              final qty = step['quantity'] as int;
+              await helper.completeSale(invoice: {
+                'pharmacy_id': pharmacyId, 'invoice_number': 'INV-${++sold}',
+                'created_at': DateTime.now().toIso8601String(),
+                'total_amount': qty * 1500, 'discount': 0, 'final_amount': qty * 1500,
+              }, items: [
+                {'medicine_id': medicine['id'], 'trade_name': 'A', 'quantity': qty, 'unit_price': 1500, 'total_price': qty * 1500},
+              ]);
+              sales += qty * 1500;
+            case 'return':
+              final result = await doReturn(db, step['invoice'] as String, [('A', step['quantity'] as int, step['unit_price'] as num?)]);
+              expect(result['amount_returned'], exp['credit'], reason: '$step');
+              credits += (result['amount_returned'] as num).toDouble();
+          }
+          final medicine = (await db.query('medicine', where: "trade_name = 'A'")).single;
+          expect(medicine['avg_cost'], exp['avg_cost'], reason: '$step');
+          expect(medicine['quantity'], exp['stock'], reason: '$step');
+          if (exp['batch_prices'] != null) {
+            final batches = await db.query('medicine_batch', where: 'medicine_id = ?', whereArgs: [medicine['id']]);
+            expect(batches.map((b) => b['purchase_price']).toList()..sort(), exp['batch_prices'], reason: '$step');
+          }
+        }
+        if (c['profit'] != null) {
+          final profit = (await db.rawQuery('SELECT SUM((unit_price - unit_cost) * quantity) AS p FROM invoice_item'))
+              .single['p'] as num;
+          expect(profit, closeTo(c['profit'] as num, 0.001));
+          if (c['cash_profit'] == true) expect(profit, closeTo(sales - purchases + credits, 0.001));
+        }
+      });
+    }
   });
 
   test('return within limits reduces stock and debt; invoice batches are taken first', () async {

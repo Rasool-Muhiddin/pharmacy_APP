@@ -8,6 +8,7 @@
   الوحدات المحسوبة = min(الكمية، max(0, المدفوع − المسترجع سابقاً))
       (المسترجع يُحسب من الوحدات المدفوعة أولاً؛ البونص والمجاني بلا رصيد)
   الرصيد = الوحدات المحسوبة × سعر الاسترجاع (افتراضياً سعر الشراء، قابل للتعديل)
+  avg_cost: الوحدات تخرج بمبلغ رصيدها (stock.avg_cost_after_return)
 """
 
 from datetime import datetime, time
@@ -84,7 +85,12 @@ def return_items(invoice, lines, notes="", return_date=None):
             raise line_error(index, "سعر الاسترجاع لا يمكن أن يكون سالباً.")
         credited = credited_units(item.quantity, already, quantity)
         credit = stock.to_money(Decimal(credited) * Decimal(price))
+        old_qty = medicine.quantity
         stock.deduct_fefo(medicine, quantity, sellable_only=False, prefer_invoice_id=invoice.pk)
+        new_avg = stock.avg_cost_after_return(old_qty, medicine.avg_cost, quantity, credit)
+        if new_avg != medicine.avg_cost:
+            medicine.avg_cost = new_avg
+            Medicine.objects.filter(pk=medicine.pk).update(avg_cost=new_avg)
         touched[medicine.pk] = medicine
         total_credit += credit
         prepared.append((item, medicine, quantity, credited, stock.to_money(price), credit))

@@ -11,8 +11,10 @@ from decimal import Decimal
 from django.test import TransactionTestCase
 
 from desktop_api.models import DesktopLicense, Pharmacy
-from pharmacy_data import supplier_ledger
+from pharmacy_data import stock, supplier_ledger
 from pharmacy_data.models import (
+    Invoice,
+    InvoiceItem,
     Medicine,
     MedicineBatch,
     PurchaseInvoice,
@@ -107,8 +109,68 @@ class SupplierReturnsTests(PurchaseListTestBase):
             for number, value in exp.get("credit_applied", {}).items():
                 applied = sum(a.amount for a in SupplierCreditApplication.objects.filter(purchase_invoice=self.invoice(number)))
                 self.assertEqual(applied, Decimal(str(value)))
-        # avg_cost لا يتغير بالاسترجاع (كالبيع والإتلاف).
-        self.assertEqual(Medicine.objects.get(trade_name="A").avg_cost, Decimal("833.3333"))
+        # الوحدات المسترجعة تخرج بمبلغ رصيدها: (12 × 833.3333 − 3600) / 8 = 800، ثم الباقي كله (الكمية 0) لا يغيّره.
+        final = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))["supplier_returns"]["final_avg_cost"]["A"]
+        self.assertEqual(Medicine.objects.get(trade_name="A").avg_cost, Decimal(str(final)))
+
+    # --- كلفة الاسترجاع (avg_cost بعد الاسترجاع) ---
+
+    def test_avg_cost_after_return_rules(self):
+        f = stock.avg_cost_after_return
+        self.assertEqual(f(6, Decimal("625"), 3, Decimal("2100")), Decimal("550.0000"))
+        self.assertEqual(f(3, Decimal("550"), 3, Decimal("1500")), Decimal("550"))
+        self.assertEqual(f(6, Decimal("625"), 3, Decimal("3900")), Decimal("0.0000"))
+        self.assertIsNone(f(6, None, 3, Decimal("100")))
+        self.assertEqual(f(12, Decimal("833.3333"), 4, Decimal("3600")), Decimal("800.0000"))
+        self.assertEqual(f(3, Decimal("100"), 1, Decimal("0.01")), Decimal("149.9950"))
+        self.assertEqual(f(7, Decimal("1"), 4, Decimal("0")), Decimal("2.3333"))
+
+    @unittest.skipUnless(PARITY_FIXTURE.exists(), "Flutter test fixture not available")
+    def test_return_cost_parity_cases(self):
+        cases = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))["return_cost"]["cases"]
+        for case in cases:
+            with self.subTest(case["name"]):
+                self._replay_return_cost(case)
+
+    def _replay_return_cost(self, case):
+        # كل حالة على بيانات نظيفة داخل نفس الاختبار.
+        InvoiceItem.objects.all().delete()
+        Invoice.objects.all().delete()
+        PurchaseInvoice.objects.all().delete()
+        Medicine.objects.all().delete()
+        Supplier.objects.all().delete()
+        sales = purchases = credits = Decimal(0)
+        for step in case["steps"]:
+            exp = step["expect"]
+            if step["op"] == "list":
+                line = self.line("A", quantity=step["quantity"], buy=str(step["buy"]), sell="1500",
+                                 bonus_quantity=step["bonus"], expiry_date=self.expiry(step["expiry_days"]))
+                r = self.post_list([line], invoice_number=step["invoice"])
+                self.assertEqual(r.status_code, 201, r.content)
+                purchases += step["quantity"] * Decimal(str(step["buy"]))
+            elif step["op"] == "sell":
+                medicine = Medicine.objects.get(pharmacy=self.pharmacy, trade_name="A")
+                r = self.api("post", "/api/invoices/checkout/",
+                             {"items": [{"medicine_id": medicine.pk, "quantity": step["quantity"]}]})
+                self.assertEqual(r.status_code, 201, r.content)
+                sales += step["quantity"] * Decimal("1500")
+            elif step["op"] == "return":
+                r = self.post_return(step["invoice"], [("A", step["quantity"], step.get("unit_price"))])
+                self.assertEqual(r.status_code, 201, r.content)
+                credit = Decimal(r.json()["return"]["amount_returned"])
+                self.assertEqual(credit, Decimal(str(exp["credit"])), step)
+                credits += credit
+            medicine = Medicine.objects.get(pharmacy=self.pharmacy, trade_name="A")
+            self.assertEqual(medicine.avg_cost, Decimal(str(exp["avg_cost"])), step)
+            self.assertEqual(medicine.quantity, exp["stock"], step)
+            if "batch_prices" in exp:
+                prices = sorted(b.purchase_price for b in MedicineBatch.objects.filter(medicine=medicine, quantity__gt=0))
+                self.assertEqual(prices, [Decimal(str(p)) for p in exp["batch_prices"]], step)
+        if "profit" in case:
+            profit = sum(((i.unit_price - i.unit_cost) * i.quantity for i in InvoiceItem.objects.all()), Decimal(0))
+            self.assertEqual(profit, Decimal(str(case["profit"])))
+            if case.get("cash_profit"):
+                self.assertEqual(profit, sales - purchases + credits)
 
     # --- حدود الكمية والسعر ---
 
