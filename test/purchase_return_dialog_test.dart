@@ -7,6 +7,8 @@ import 'package:pharmacy_app/models/purchase_list.dart';
 import 'package:pharmacy_app/screens/purchase_return_dialog.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'helpers/text_fit.dart';
+
 /// نافذة "إضافة استرجاع" فعلياً (أوفلاين): التحديد، الحدود، الرصيد الحي، الحفظ.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -39,8 +41,9 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  Future<void> pumpDialog(WidgetTester tester, void Function(bool) onClosed) async {
-    tester.view.physicalSize = const Size(1600, 1000);
+  Future<void> pumpDialog(WidgetTester tester, void Function(bool) onClosed,
+      {Size size = const Size(1600, 1000), ThemeData? theme}) async {
+    tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
     await tester.runAsync(() async {
@@ -65,6 +68,7 @@ void main() {
       items = await helper.getPurchaseInvoiceItems(invoiceId);
     });
     await tester.pumpWidget(MaterialApp(
+      theme: theme,
       home: Builder(
         builder: (context) => Scaffold(
           body: Center(
@@ -148,5 +152,34 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('اختر صنفاً واحداً على الأقل لاسترجاعه.'), findsOneWidget);
     expect(result, isNull);
+  });
+
+  group('layout: no text is cut', () {
+    // أصغر نافذة للحوار 640 عرضاً (+ هامش 16 من كل جهة).
+    final sizes = {...laptopSizes, 'minimum dialog': const Size(672, 560)};
+    for (final entry in sizes.entries) {
+      testWidgets('selected paid + free lines at ${entry.key}', (tester) async {
+        await tester.runAsync(loadAppFont);
+        await pumpDialog(tester, (_) {}, size: entry.value, theme: appTheme());
+        // الشرح أعلى النافذة يلتف إن لزم؛ الباقي سطر واحد كامل.
+        const wrapping = ['حدد الأدوية المسترجعة'];
+        void expectNothingCut(String where) {
+          expect(tester.takeException(), isNull, reason: '$where: overflow');
+          expect(cutTexts(tester, find.byType(PurchaseReturnDialog), multiLine: wrapping), isEmpty, reason: where);
+        }
+
+        expectNothingCut('${entry.key}: nothing selected');
+        await tester.tap(find.byType(Checkbox).first);
+        await tester.tap(find.byType(Checkbox).last);
+        await tester.pumpAndSettle();
+        await tester.enterText(field('الكمية المسترجعة').first, '12');
+        await tester.enterText(field('سعر الاسترجاع للوحدة'), '1250.50');
+        await tester.pump();
+        expect(find.text('10 وحدة مدفوعة + 2 بونص بلا رصيد'), findsOneWidget);
+        expect(find.text('تاريخ الاسترجاع'), findsOneWidget);
+        expect(find.text('حفظ الاسترجاع'), findsOneWidget);
+        expectNothingCut('${entry.key}: selected');
+      });
+    }
   });
 }

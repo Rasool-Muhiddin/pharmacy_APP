@@ -1,10 +1,14 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pharmacy_app/database/db_helper.dart';
+import 'package:pharmacy_app/models/medicine_categories.dart';
 import 'package:pharmacy_app/screens/purchase_list_dialog.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'helpers/text_fit.dart';
 
 /// تدفّق نافذة "إضافة قائمة مذخر" فعلياً (أوفلاين): كتابة الاسم، الحقول،
 /// Enter لإنهاء الصنف، المجاني، ثم الحفظ — وأن الحفظ يصل للقاعدة كاملاً.
@@ -40,9 +44,13 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  Future<void> pumpDialog(WidgetTester tester, {required void Function(bool) onClosed}) async {
+  Future<void> pumpDialog(WidgetTester tester,
+      {required void Function(bool) onClosed,
+      Size size = const Size(1600, 1000),
+      ThemeData? theme,
+      Map<String, String> categories = const {'tablet': 'حبوب / كبسول', 'syrup': 'شراب / معلق'}}) async {
     // نافذة سطح مكتب واقعية (النافذة 90% منها).
-    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
     await tester.runAsync(() async {
@@ -68,6 +76,7 @@ void main() {
       });
     });
     await tester.pumpWidget(MaterialApp(
+      theme: theme,
       home: Builder(
         builder: (context) => Scaffold(
           body: Center(
@@ -85,7 +94,7 @@ void main() {
                   masterMedicines: const [
                     {'trade_name': 'Brufen 400', 'scientific_name': 'Ibuprofen', 'category': 'tablet'},
                   ],
-                  categories: const {'tablet': 'حبوب / كبسول', 'syrup': 'شراب / معلق'},
+                  categories: categories,
                 );
                 onClosed(saved);
               },
@@ -117,7 +126,7 @@ void main() {
   }
 
   Future<void> fillHeader(WidgetTester tester, String invoice) async {
-    await tester.enterText(field('المذخر * (ابحث أو اكتب اسماً جديداً)'), 'مذخر');
+    await tester.enterText(field('المذخر *'), 'مذخر');
     await tester.enterText(field('رقم فاتورة المذخر *'), invoice);
     await tester.pump();
   }
@@ -262,7 +271,7 @@ void main() {
     await pumpDialog(tester, onClosed: (saved) => result = saved);
     expect(find.text('إضافة قائمة مذخر'), findsOneWidget);
 
-    await tester.enterText(field('المذخر * (ابحث أو اكتب اسماً جديداً)'), 'مذخر الشفاء');
+    await tester.enterText(field('المذخر *'), 'مذخر الشفاء');
     await tester.pump();
     expect(find.text('مذخر جديد — سيُنشأ عند الحفظ'), findsOneWidget);
     expect(field('هاتف المذخر (اختياري)'), findsNothing); // أُزيل من الواجهة
@@ -303,7 +312,7 @@ void main() {
     // التذييل: البونص والمجاني خارج الإجمالي.
     expect(find.text('2'), findsWidgets);
     expect(find.text('أصناف مجانية: '), findsOneWidget);
-    await tester.enterText(field('المدفوع الآن (اختياري)'), '4000');
+    await tester.enterText(field('المدفوع الآن'), '4000');
     await tester.pump();
 
     await tester.tap(find.text('حفظ القائمة والفاتورة'));
@@ -326,7 +335,7 @@ void main() {
   testWidgets('invalid line is highlighted and nothing is saved', (tester) async {
     bool? result;
     await pumpDialog(tester, onClosed: (saved) => result = saved);
-    await tester.enterText(field('المذخر * (ابحث أو اكتب اسماً جديداً)'), 'S');
+    await tester.enterText(field('المذخر *'), 'S');
     await tester.enterText(field('رقم فاتورة المذخر *'), 'F-2');
     await tester.enterText(field('اسم الصنف الأول'), 'Brufen');
     await tester.pumpAndSettle();
@@ -359,7 +368,7 @@ void main() {
     expect(find.widgetWithText(FilterChip, 'مجاني'), findsNothing);
     expect(field('بونص (مجاني)'), findsNothing);
     await tester.enterText(field('الكمية *'), '7');
-    await tester.enterText(field('سعر الشراء (0 = غير معروف)'), '0');
+    await tester.enterText(field('سعر الشراء'), '0');
     await tester.enterText(field('سعر البيع *'), '90');
     await tester.enterText(field('الصلاحية *'), '2027-12-31');
     await tester.tap(find.text('حفظ الرصيد الافتتاحي'));
@@ -371,5 +380,80 @@ void main() {
       expect([med['quantity'], med['avg_cost']], [7, null]);
       expect(await db.query('purchase_invoice'), isEmpty);
     });
+  });
+
+  group('layout: no text is cut', () {
+    // الشرح الطويل تحت الأصناف وحده يلتف، لسطرين على الأكثر.
+    const wrapping = ['امسح الباركود (أو Enter بدونه)'];
+
+    Future<void> expectNothingCut(WidgetTester tester, String where) async {
+      expect(tester.takeException(), isNull, reason: '$where: overflow');
+      expect(cutTexts(tester, find.byType(PurchaseListDialog), multiLine: wrapping), isEmpty, reason: where);
+      final help = find.descendant(
+          of: find.textContaining(wrapping.first, findRichText: true), matching: find.byType(RichText), matchRoot: true);
+      if (help.evaluate().isEmpty) return; // سطر الشرح آخر القائمة: خارج المعروض في النافذة الصغرى
+      final paragraph = tester.renderObject<RenderParagraph>(help.first);
+      final painter = TextPainter(text: paragraph.text, textDirection: paragraph.textDirection)
+        ..layout(maxWidth: paragraph.size.width);
+      final lines = painter.computeLineMetrics().length;
+      painter.dispose();
+      expect(lines, lessThanOrEqualTo(2), reason: '$where: help line');
+    }
+
+    // أصغر نافذة للحوار 720×520 (+ هامش 12 من كل جهة).
+    final sizes = {...laptopSizes, 'minimum dialog': const Size(744, 544)};
+    for (final entry in sizes.entries) {
+      testWidgets('both modes, collapsed + expanded rows at ${entry.key}', (tester) async {
+        await tester.runAsync(loadAppFont);
+        await pumpDialog(tester,
+            onClosed: (_) {}, size: entry.value, theme: appTheme(), categories: medicineCategories);
+
+        expect(find.text('المذخر *'), findsOneWidget);
+        expect(find.text('ابحث أو أضف مذخراً جديداً'), findsOneWidget);
+        expect(find.text('الباركود'), findsOneWidget);
+        expect(find.text('امسح أو اكتب ثم Enter'), findsOneWidget);
+        expect(find.text('المدفوع الآن'), findsOneWidget);
+        expect(find.text('د.ع'), findsOneWidget);
+        await expectNothingCut(tester, '${entry.key}: empty');
+
+        await tester.enterText(field('المذخر *'), 'مذخر الشفاء للأدوية والمستلزمات');
+        await tester.enterText(field('رقم فاتورة المذخر *'), 'F-2026-000123');
+        await tester.enterText(field('المدفوع الآن'), '125000');
+        // صنف من مخزن آخر يُطوى (شارته الأطول)، ثم صنف موجود مفتوح بسعر بيع معدّل وبونص.
+        await scan(tester, 'AUG-1g');
+        await tester.enterText(field('الكمية المدفوعة *'), '120');
+        await tester.enterText(field('سعر الشراء *'), '4250');
+        await tester.enterText(field('الصلاحية *'), '05/2028');
+        await tester.testTextInput.receiveAction(TextInputAction.done);
+        await tester.pumpAndSettle();
+        expect(find.text('صنف جديد في هذا المخزن'), findsOneWidget); // السطر المطوي
+        expect(find.text('AUG-1g'), findsOneWidget);
+        await expectNothingCut(tester, '${entry.key}: collapsed row');
+
+        await scan(tester, '6221');
+        await tester.enterText(field('الكمية المدفوعة *'), '100');
+        await tester.enterText(field('بونص (مجاني)'), '10');
+        await tester.enterText(field('سعر البيع *'), '3500');
+        await tester.enterText(field('الصلاحية *'), '2029-06');
+        await tester.pumpAndSettle();
+        expect(find.text('سيُطبَّق سعر البيع الجديد على كل مخزون هذا الصنف'), findsOneWidget);
+        expect(find.text('قائمة مذخر'), findsOneWidget);
+        expect(find.text('رصيد افتتاحي'), findsOneWidget);
+        await expectNothingCut(tester, '${entry.key}: supplier list');
+
+        await tester.tap(find.widgetWithText(FilterChip, 'مجاني'));
+        await tester.pumpAndSettle();
+        expect(find.text('الكمية المجانية *'), findsOneWidget);
+        await expectNothingCut(tester, '${entry.key}: free item');
+
+        await tester.tap(find.text('رصيد افتتاحي'));
+        await tester.pumpAndSettle();
+        expect(find.text('الكمية *'), findsOneWidget);
+        expect(find.text('سعر الشراء'), findsOneWidget);
+        expect(find.text('0 = غير معروف'), findsOneWidget);
+        expect(find.text('حفظ الرصيد الافتتاحي'), findsOneWidget);
+        await expectNothingCut(tester, '${entry.key}: opening stock');
+      });
+    }
   });
 }

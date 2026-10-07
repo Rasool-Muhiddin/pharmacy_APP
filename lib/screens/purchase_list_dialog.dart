@@ -836,12 +836,10 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
                   ),
                 ),
               ] else
-                const SizedBox(
-                  width: 520,
-                  child: Text(
-                    'رصيد افتتاحي: المخزون الموجود على الرفوف عند بدء استخدام النظام. لا مذخر ولا فاتورة ولا دين.',
-                    style: TextStyle(color: _textSecondary),
-                  ),
+                const Text(
+                  'مخزون الرفوف عند بدء استخدام النظام — بلا مذخر ولا فاتورة ولا دين.',
+                  softWrap: false,
+                  style: TextStyle(color: _textSecondary),
                 ),
               warehouseField,
             ],
@@ -905,7 +903,9 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           controller: controller,
           focusNode: focusNode,
           onChanged: (v) => setState(() => _supplierName.text = v),
-          decoration: _decoration('المذخر * (ابحث أو اكتب اسماً جديداً)', Icons.local_shipping_outlined).copyWith(
+          decoration: _decoration('المذخر *', Icons.local_shipping_outlined).copyWith(
+            hintText: 'ابحث أو أضف مذخراً جديداً',
+            floatingLabelBehavior: FloatingLabelBehavior.always,
             helperText: _suppliersError != null
                 ? 'تعذر تحميل المذاخر: يمكنك كتابة الاسم مباشرة'
                 : (isNew ? 'مذخر جديد — سيُنشأ عند الحفظ' : null),
@@ -1001,7 +1001,8 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
             onEditingComplete: () {},
             onSubmitted: (_) => _lookupBarcode(line),
             decoration: _decoration('الباركود', Icons.qr_code_scanner).copyWith(
-              hintText: 'امسح الباركود أو Enter بدونه',
+              hintText: 'امسح أو اكتب ثم Enter',
+              floatingLabelBehavior: FloatingLabelBehavior.always,
             ),
           ),
         ),
@@ -1165,10 +1166,11 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           _numField(line.bonus, line.bonusFocus, isFree ? 'الكمية المجانية *' : 'بونص (مجاني)', 130,
               next: isFree ? line.sellFocus : line.buyFocus, integer: true),
         if (!isFree)
-          _numField(line.buyPrice, line.buyFocus, _isSupplierList ? 'سعر الشراء *' : 'سعر الشراء (0 = غير معروف)', 160,
+          _numField(line.buyPrice, line.buyFocus, _isSupplierList ? 'سعر الشراء *' : 'سعر الشراء', 160,
+              hint: _isSupplierList ? null : '0 = غير معروف',
               next: line.sellFocus),
         _numField(line.sellPrice, line.sellFocus, existing && isFree ? 'سعر البيع (اختياري)' : 'سعر البيع *', 140,
-            next: line.expiryFocus, helper: _sellPriceChanged(line) ? 'سيُطبَّق سعر البيع الجديد على كل مخزون هذا الصنف' : null),
+            next: line.expiryFocus),
         SizedBox(
           width: 190,
           child: TextField(
@@ -1206,7 +1208,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           ),
         ),
         SizedBox(
-          width: 210,
+          width: 310, // أطول شكل دوائي ("مستحضرات فموية / عناية بالفم") كاملاً
           child: DropdownButtonFormField<String>(
             key: ValueKey('${line.hashCode}-${line.category}-$existing'),
             initialValue: widget.categories.containsKey(line.category) ? line.category : null,
@@ -1231,7 +1233,25 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [numbers, const SizedBox(height: 10), details],
+      children: [
+        numbers,
+        if (_sellPriceChanged(line))
+          const Padding(
+            padding: EdgeInsets.only(top: 6),
+            child: Row(
+              children: [
+                Icon(Icons.info_outline_rounded, size: 15, color: _newItem),
+                SizedBox(width: 6),
+                Expanded(
+                  child: Text('سيُطبَّق سعر البيع الجديد على كل مخزون هذا الصنف',
+                      style: TextStyle(color: _newItem, fontSize: 12, fontWeight: FontWeight.w600)),
+                ),
+              ],
+            ),
+          ),
+        const SizedBox(height: 10),
+        details,
+      ],
     );
   }
 
@@ -1254,31 +1274,32 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
           children: [
             _indexBadge(index),
             const SizedBox(width: 10),
+            _summaryCell('الباركود', line.barcode.text.trim().isEmpty ? '-' : line.barcode.text.trim()),
+            // الاسم يأخذ ما تبقى من العرض (ويلتف لسطر ثانٍ بدل القص)، والشارة تحته.
             Expanded(
-              flex: 2,
-              child: _summaryCell('الباركود', line.barcode.text.trim().isEmpty ? '-' : line.barcode.text.trim()),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(line.name.text.trim(), style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 3),
+                  _statusBadge(line),
+                ],
+              ),
             ),
-            Expanded(
-              flex: 4,
-              child: Text(line.name.text.trim(),
-                  style: const TextStyle(fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
-            ),
-            _statusBadge(line),
-            const SizedBox(width: 12),
-            Expanded(flex: 2, child: _summaryCell('الكمية', qtyText)),
-            Expanded(
-              flex: 2,
-              child: _summaryCell('الشراء', isFree ? '-' : (buy == null ? '-' : AppFormatter.iqd(buy))),
-            ),
-            Expanded(flex: 2, child: _summaryCell('الصلاحية', expiry.isEmpty ? '-' : expiry)),
-            Expanded(flex: 2, child: _summaryCell('الإجمالي', AppFormatter.iqd(_lineTotal(data)))),
+            _summaryCell('الكمية', qtyText),
+            _summaryCell('الشراء', isFree ? '-' : (buy == null ? '-' : AppFormatter.iqd(buy))),
+            _summaryCell('الصلاحية', expiry.isEmpty ? '-' : expiry),
+            _summaryCell('الإجمالي', AppFormatter.iqd(_lineTotal(data))),
             IconButton(
               tooltip: 'تعديل',
+              visualDensity: VisualDensity.compact,
               onPressed: () => _toggleLine(line),
               icon: const Icon(Icons.edit_outlined, size: 18, color: _primaryDark),
             ),
             IconButton(
               tooltip: 'حذف الصنف',
+              visualDensity: VisualDensity.compact,
               onPressed: () => _removeLine(line),
               icon: const Icon(Icons.delete_outline_rounded, size: 18, color: _danger),
             ),
@@ -1337,7 +1358,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.,]'))],
                     onChanged: (_) => setState(() {}),
-                    decoration: _decoration('المدفوع الآن (اختياري)', Icons.payments_outlined),
+                    decoration: _decoration('المدفوع الآن', Icons.payments_outlined).copyWith(suffixText: 'د.ع'),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -1403,7 +1424,7 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
   }
 
   Widget _numField(TextEditingController c, FocusNode f, String label, double width,
-      {required FocusNode next, bool integer = false, String? helper}) {
+      {required FocusNode next, bool integer = false, String? hint}) {
     return SizedBox(
       width: width,
       child: TextField(
@@ -1415,9 +1436,8 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
         onChanged: (_) => setState(() {}),
         onSubmitted: (_) => next.requestFocus(),
         decoration: _decoration(label, null).copyWith(
-          helperText: helper,
-          helperMaxLines: 3,
-          helperStyle: const TextStyle(color: _newItem, fontSize: 11),
+          hintText: hint,
+          floatingLabelBehavior: hint == null ? null : FloatingLabelBehavior.always,
         ),
       ),
     );
@@ -1470,13 +1490,20 @@ class _PurchaseListDialogState extends State<PurchaseListDialog> {
             style: const TextStyle(fontSize: 12, color: _primaryDark, fontWeight: FontWeight.bold)),
       );
 
-  Widget _summaryCell(String label, String value) => Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(label, style: const TextStyle(fontSize: 11, color: _textSecondary)),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis),
-        ],
+  /// خلية السطر المطوي بعرض محتواها (أعمدة متقاربة بحد أدنى) — لا قص.
+  Widget _summaryCell(String label, String value) => Padding(
+        padding: const EdgeInsetsDirectional.only(end: 10),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minWidth: 60),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(label, softWrap: false, style: const TextStyle(fontSize: 11, color: _textSecondary)),
+              Text(value, softWrap: false, style: const TextStyle(fontWeight: FontWeight.w600)),
+            ],
+          ),
+        ),
       );
 
   Widget _footerStat(String label, String value, {Color color = _textMain}) => Row(
