@@ -691,10 +691,13 @@ class SupplierViewSet(viewsets.ModelViewSet):
                     "debt_added": inv.total_amount - (inv.paid_amount - inv.linked_paid),
                     "date_time": inv.created_at,
                     "notes": "",
+                    **_statement_invoice_link(inv),
+                    "total_amount": inv.total_amount,
+                    "item_count": inv.item_count,
                 }
             )
 
-        for pay in supplier.payments.all():
+        for pay in supplier.payments.select_related("purchase_invoice"):
             rows.append(
                 {
                     "id": pay.id,
@@ -705,6 +708,7 @@ class SupplierViewSet(viewsets.ModelViewSet):
                     "debt_added": -pay.amount_paid,
                     "date_time": pay.paid_at,
                     "notes": pay.notes,
+                    **_statement_invoice_link(pay.purchase_invoice),
                 }
             )
 
@@ -720,6 +724,7 @@ class SupplierViewSet(viewsets.ModelViewSet):
                     "date_time": ret.returned_at,
                     "notes": ret.notes,
                     "excess_credit": ret.excess_credit,
+                    **_statement_invoice_link(ret.purchase_invoice),
                     # استرجاع قديم بالمبلغ فقط: قائمة فارغة.
                     "items": PurchaseReturnItemSerializer(ret.items.all(), many=True).data,
                 }
@@ -738,6 +743,7 @@ class SupplierViewSet(viewsets.ModelViewSet):
                     "debt_added": 0,
                     "date_time": app.applied_at,
                     "notes": app.notes,
+                    **_statement_invoice_link(app.purchase_invoice),
                 }
             )
 
@@ -752,10 +758,11 @@ class SupplierViewSet(viewsets.ModelViewSet):
                     "debt_added": refund.amount,
                     "date_time": refund.received_at,
                     "notes": refund.notes,
+                    **_statement_invoice_link(None),
                 }
             )
 
-        rows.sort(key=lambda r: r["date_time"], reverse=True)
+        rows.sort(key=_statement_sort_key)
         return Response(rows)
 
     @action(detail=True, methods=["post"], url_path="receive-refund")
@@ -791,6 +798,30 @@ class SupplierViewSet(viewsets.ModelViewSet):
             raise NotFound("المذخر غير موجود.")
         items = purchase_list.supplier_purchased_items(supplier)
         return Response(PurchaseInvoiceItemSerializer(items, many=True).data)
+
+
+def _statement_invoice_link(invoice):
+    """الفاتورة المرتبطة بحركة كشف الحساب (لا شيء لاستلام الأموال/دفعة غير مرتبطة)."""
+    if invoice is None:
+        return {"purchase_invoice_id": None, "invoice_number": None, "invoice_created_at": None}
+    return {
+        "purchase_invoice_id": invoice.pk,
+        "invoice_number": invoice.invoice_number,
+        "invoice_created_at": invoice.created_at,
+    }
+
+
+# نفس ترتيب lib/models/supplier_statement.dart: زمنياً، والحركة المرتبطة لا تسبق
+# فاتورتها، وفي اللحظة نفسها: الفاتورة ثم خصم الرصيد ثم دفعتها ثم الاسترجاع ثم الاستلام.
+_STATEMENT_RANK = {"invoice": 0, "credit_applied": 1, "payment": 2, "return": 3, "refund": 4}
+
+
+def _statement_sort_key(row):
+    moment = row["date_time"]
+    if row["invoice_created_at"] is not None and row["transaction_type"] != "invoice":
+        moment = max(moment, row["invoice_created_at"])
+    invoice_id = row["purchase_invoice_id"]
+    return (moment, invoice_id if invoice_id is not None else float("inf"), _STATEMENT_RANK[row["transaction_type"]], row["id"])
 
 
 def _supplier_invoice_activity(supplier_ids):

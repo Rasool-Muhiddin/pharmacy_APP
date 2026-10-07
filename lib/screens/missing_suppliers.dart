@@ -1,10 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:intl/intl.dart' show DateFormat;
+
 import '../models/purchase_list.dart';
+import '../models/subscription_plan.dart';
+import '../models/supplier_statement.dart';
 import '../repository/suppliers_repository.dart';
 import 'purchase_return_dialog.dart';
+import 'reports/export/report_export_controller.dart';
 import 'reports/report_widgets.dart';
+import 'supplier_statement_export.dart';
 
 /// فلاتر قائمة المذاخر.
 enum _SupplierFilter { all, debt, credit }
@@ -39,10 +45,20 @@ class MissingSuppliersScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOnlineMode; // من license.mode القادم من main_layout.dart
 
+  /// لقيد "طباعة PDF" لكشف الحساب (نفس تصدير التقارير). null = Basic.
+  final SubscriptionEntitlements? entitlements;
+  final String pharmacyName;
+
+  /// حفظ ملف PDF — قابل للاستبدال في الاختبارات.
+  final ReportFileSaver exportSaver;
+
   const MissingSuppliersScreen({
     super.key,
     this.pharmacyId = 1, // معرف الفرع الافتراضي
     this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين)
+    this.entitlements,
+    this.pharmacyName = '',
+    this.exportSaver = const NativeReportFileSaver(),
   });
 
   @override
@@ -67,6 +83,14 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
 
   /// استرجاعات مفتوحة في كشف الحساب لعرض أدويتها (المفتاح = معرّف الاسترجاع).
   final Set<Object?> _expandedReturns = <Object?>{};
+
+  /// فترة كشف الحساب (افتراضياً: الكل).
+  StatementPeriod _statementPeriod = const StatementPeriod.all();
+
+  /// كشف الحساب + الفواتير (للأعمار وفتح الفاتورة) لنفس طلبات التبويبات.
+  Future<List<List<Map<String, dynamic>>>>? _statementBundle;
+  Future<List<Map<String, dynamic>>>? _bundleStatementSource;
+  Future<List<Map<String, dynamic>>>? _bundleInvoicesSource;
 
   // نفس ألوان شاشتي التقارير والبيع.
   static const Color primary = RC.teal;
@@ -676,7 +700,7 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
       case _DetailsTab.invoices:
         content = _invoicesTab(supplierId, supplierName);
       case _DetailsTab.statement:
-        content = _statementTab(supplierId);
+        content = _statementTab(supplier, supplierName);
       case _DetailsTab.items:
         content = _purchasedItemsTab(supplierId);
     }
@@ -842,61 +866,355 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
     ];
   }
 
-  // --- تبويب كشف الحساب ---
-  Widget _statementTab(int supplierId) {
-    return _tabSection(
-      _DetailsTab.statement,
-      supplierId,
-      emptyText: 'لا توجد تعاملات مسجلة لهذا المذخر.',
-      builder: (rows) {
-        final statement = _computeRunningBalance(rows);
-        double totalInvoice = 0;
-        double totalPayment = 0;
-        double totalReturn = 0;
-        for (final row in statement) {
-          final type = row['transaction_type']?.toString();
-          final amount = _number(row['amount']);
-          // المبلغ المستلم من المذخر يُعرض في عمود المدين (يرفع الرصيد).
-          if (type == 'invoice' || type == 'refund') totalInvoice += amount;
-          if (type == 'payment') totalPayment += amount;
-          if (type == 'return') totalReturn += amount;
+  // --- تبويب كشف الحساب (كشف حساب مورد بالطريقة المحاسبية) ---
+  Widget _statementTab(Map<String, dynamic> supplier, String supplierName) {
+    final supplierId = supplier['id'] as int;
+    final statementSource = _detailFuture(_DetailsTab.statement, supplierId);
+    final invoicesSource = _detailFuture(_DetailsTab.invoices, supplierId);
+    if (!identical(statementSource, _bundleStatementSource) || !identical(invoicesSource, _bundleInvoicesSource)) {
+      _bundleStatementSource = statementSource;
+      _bundleInvoicesSource = invoicesSource;
+      _statementBundle = Future.wait([statementSource, invoicesSource]);
+    }
+    return FutureBuilder<List<List<Map<String, dynamic>>>>(
+      future: _statementBundle,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return SectionError(
+            error: snapshot.error!,
+            onRetry: () => setState(() {
+              _detailFutures.remove(_DetailsTab.statement);
+              _detailFutures.remove(_DetailsTab.invoices);
+            }),
+          );
         }
-        final finalBalance = _number(statement.last['balance']);
-
-        // Table يحسب عرض الأعمدة تلقائياً؛ تحت 620px يُمرَّر أفقياً بعرض ثابت.
-        final table = Table(
-          columnWidths: const {
-            0: FixedColumnWidth(84),
-            1: FlexColumnWidth(2.5),
-            2: FlexColumnWidth(1),
-            3: FlexColumnWidth(1),
-            4: FlexColumnWidth(1),
-            5: FlexColumnWidth(1.25),
-          },
-          defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+        if (snapshot.connectionState != ConnectionState.done || !snapshot.hasData) {
+          return const SkeletonBlock(height: 160, lines: 4);
+        }
+        final statement = buildSupplierStatement(snapshot.data![0], _statementPeriod);
+        final invoices = snapshot.data![1];
+        // أعمار الديون فقط عندما تكون الصيدلية مدينة للمذخر (الرصيد الحالي).
+        final owes = _number(supplier['remaining_debt']) > 0.001;
+        final aging = owes ? computeAging(invoices) : null;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _statementHeaderRow(),
-            for (final row in statement) ...[
-              _statementRow(
-                row,
-                expanded: _expandedReturns.contains(row['id']),
-                onToggle: () => setState(() {
-                  _expandedReturns.contains(row['id'])
-                      ? _expandedReturns.remove(row['id'])
-                      : _expandedReturns.add(row['id']);
-                }),
+            _statementToolbar(statement, supplierName, aging),
+            const SizedBox(height: 12),
+            if (statement.entries.isEmpty) ...[
+              const EmptyState('لا توجد حركات في هذه الفترة', icon: Icons.event_busy_outlined),
+              if (statement.showOpening)
+                Text(
+                  'الرصيد في هذه الفترة: ${balanceWords(statement.closing)}',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontWeight: FontWeight.bold, color: _balanceColor(statement.closing)),
+                ),
+            ] else ...[
+              LayoutBuilder(builder: (context, c) {
+                final table = _statementTable(statement, invoices, supplierId, supplierName);
+                // يتسع للوحة التفاصيل عند 1366×768؛ التمرير الأفقي للنوافذ الضيقة جداً فقط.
+                if (c.maxWidth >= 520) return table;
+                return _HorizontalScroll(child: SizedBox(width: 620, child: table));
+              }),
+              const SizedBox(height: 12),
+              Container(
+                key: const Key('statement-closing'),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                decoration: BoxDecoration(
+                  color: RC.faint,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: borderCol),
+                ),
+                child: Text(
+                  'الرصيد الختامي: ${balanceWords(statement.closing)}',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: _balanceColor(statement.closing)),
+                ),
               ),
-              if (row['transaction_type'] == 'return' && _expandedReturns.contains(row['id']))
-                _statementReturnItemsRow(row),
             ],
-            _statementTotalsRow(totalInvoice, totalPayment, totalReturn, finalBalance),
+            if (aging != null) ...[
+              const SizedBox(height: 16),
+              _agingSection(aging),
+            ],
           ],
         );
-        return LayoutBuilder(builder: (context, c) {
-          if (c.maxWidth >= 620) return table;
-          return _HorizontalScroll(child: SizedBox(width: 620, child: table));
-        });
       },
+    );
+  }
+
+  Widget _statementToolbar(SupplierStatement statement, String supplierName, List<AgingBucket>? aging) {
+    final entitlements = widget.entitlements ?? SubscriptionEntitlements.basic();
+    final locked = !entitlements.allows(AppFeature.reportExport);
+    final custom = _statementPeriod.preset == StatementPreset.custom;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            for (final preset in StatementPreset.values.where((p) => p != StatementPreset.custom))
+              ChoiceChip(
+                key: Key('statement-period-${preset.name}'),
+                label: Text(statementPresetLabels[preset]!),
+                selected: _statementPeriod.preset == preset,
+                showCheckmark: false,
+                visualDensity: VisualDensity.compact,
+                labelStyle: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: _statementPeriod.preset == preset ? Colors.white : textMain,
+                ),
+                selectedColor: primaryDark,
+                backgroundColor: RC.faint,
+                side: const BorderSide(color: borderCol),
+                onSelected: (_) => setState(() => _statementPeriod = StatementPeriod.fromPreset(preset)),
+              ),
+            ActionChip(
+              key: const Key('statement-period-custom'),
+              avatar: Icon(Icons.date_range, size: 16, color: custom ? Colors.white : primaryDark),
+              label: Text(custom ? _statementPeriod.label : statementPresetLabels[StatementPreset.custom]!),
+              visualDensity: VisualDensity.compact,
+              labelStyle: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: custom ? Colors.white : primaryDark),
+              backgroundColor: custom ? primaryDark : tealBg,
+              side: const BorderSide(color: RC.tealLight),
+              onPressed: _pickStatementRange,
+            ),
+            OutlinedButton.icon(
+              key: const Key('statement-pdf'),
+              onPressed: () => exportSupplierStatementPdf(
+                context,
+                entitlements: entitlements,
+                saver: widget.exportSaver,
+                data: () => SupplierStatementPdfData.from(
+                  statement,
+                  pharmacyName: widget.pharmacyName.trim().isEmpty ? 'الصيدلية' : widget.pharmacyName.trim(),
+                  supplierName: supplierName,
+                  aging: aging,
+                ),
+              ),
+              icon: Icon(locked ? Icons.lock_outline : Icons.picture_as_pdf_outlined, size: 16),
+              label: const Text('طباعة PDF'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: locked ? const Color(0xFFD97706) : primaryDark,
+                side: BorderSide(color: locked ? const Color(0xFFFCD34D) : RC.tealLight),
+                visualDensity: VisualDensity.compact,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text('الفترة: ${_statementPeriod.label}', style: const TextStyle(fontSize: 12, color: textSecondary)),
+      ],
+    );
+  }
+
+  Future<void> _pickStatementRange() async {
+    final now = DateTime.now();
+    final current = _statementPeriod;
+    final range = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2015),
+      lastDate: DateTime(now.year, now.month, now.day),
+      initialDateRange: current.start != null && current.end != null
+          ? DateTimeRange(start: current.start!, end: current.end!)
+          : null,
+      builder: (context, child) => Directionality(textDirection: TextDirection.rtl, child: child!),
+    );
+    if (range == null || !mounted) return;
+    setState(() => _statementPeriod = StatementPeriod.custom(range.start, range.end));
+  }
+
+  Color _balanceColor(double balance) => balance > 0.001 ? danger : (balance < -0.001 ? success : textSecondary);
+
+  static final DateFormat _shortDate = DateFormat('dd/MM/yy');
+
+  _Badge _entryBadge(StatementEntry e) {
+    switch (e.type) {
+      case StatementEntryType.invoice:
+        return _Badge(e.typeLabel, color: const Color(0xFF9A6B00), background: const Color(0xFFFEF3C7));
+      case StatementEntryType.payment:
+        return _Badge(e.typeLabel, color: success, background: RC.greenBg);
+      case StatementEntryType.purchaseReturn:
+        return _Badge(e.typeLabel, color: warning, background: RC.orangeBg);
+      case StatementEntryType.creditApplied:
+        return _Badge(e.typeLabel, color: RC.blue, background: RC.blueBg);
+      case StatementEntryType.refund:
+        return _Badge(e.typeLabel, color: const Color(0xFF6D28D9), background: const Color(0xFFEDE9FE));
+    }
+  }
+
+  Widget _statementTable(
+    SupplierStatement statement,
+    List<Map<String, dynamic>> invoices,
+    int supplierId,
+    String supplierName,
+  ) {
+    Widget cell(Widget child, {VoidCallback? onTap}) {
+      final padded = Padding(
+        padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 5),
+        child: Align(alignment: AlignmentDirectional.centerStart, child: child),
+      );
+      return onTap == null ? padded : TableRowInkWell(onTap: onTap, child: padded);
+    }
+
+    Text small(String text, {Color color = textMain, bool bold = false}) => Text(
+          text,
+          style: TextStyle(fontSize: 11.5, color: color, fontWeight: bold ? FontWeight.bold : FontWeight.w500),
+        );
+    Text amount(double v, Color color) => v.abs() < 0.001 ? small('—', color: textSecondary) : small(statementAmount(v), color: color, bold: true);
+    Text balance(double v) => small(balanceWords(v), color: _balanceColor(v), bold: true);
+
+    final rows = <TableRow>[
+      TableRow(
+        decoration: BoxDecoration(color: RC.headerBg, borderRadius: BorderRadius.circular(8)),
+        children: [
+          for (final label in const ['التاريخ', 'نوع الحركة', 'رقم المستند', 'البيان', 'يزيد الدين (+)', 'ينقص الدين (−)', 'الرصيد'])
+            cell(Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11.5, color: Color(0xFF4A5568)))),
+        ],
+      ),
+    ];
+    const rowBorder = BoxDecoration(border: Border(bottom: BorderSide(color: Color(0xFFEDF2F7))));
+
+    if (statement.showOpening) {
+      rows.add(TableRow(
+        key: const ValueKey('statement-opening'),
+        decoration: const BoxDecoration(color: RC.faint, border: Border(bottom: BorderSide(color: Color(0xFFEDF2F7)))),
+        children: [
+          cell(small(statement.period.start == null ? '' : _shortDate.format(statement.period.start!), color: textSecondary)),
+          cell(const SizedBox()),
+          cell(const SizedBox()),
+          cell(small('الرصيد الافتتاحي', bold: true)),
+          cell(const SizedBox()),
+          cell(const SizedBox()),
+          cell(balance(statement.opening)),
+        ],
+      ));
+    }
+
+    for (final e in statement.entries) {
+      final key = '${e.type.name}-${e.id}-${e.synthetic}';
+      final expanded = _expandedReturns.contains(key);
+      final invoice = e.type == StatementEntryType.invoice
+          ? invoices.where((i) => i['id'] == e.invoiceId).firstOrNull
+          : null;
+      final onTap = invoice == null ? null : () => _showInvoiceItemsDialog(context, invoice, supplierId, supplierName);
+      rows.add(TableRow(
+        decoration: rowBorder,
+        children: [
+          cell(small(_shortDate.format(e.at), color: textSecondary), onTap: onTap),
+          cell(_entryBadge(e), onTap: onTap),
+          cell(small(e.invoiceNumber ?? '—', color: e.invoiceNumber == null ? textSecondary : textMain), onTap: onTap),
+          cell(
+            Wrap(
+              spacing: 4,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (e.items.isNotEmpty)
+                  InkWell(
+                    onTap: () => setState(() => expanded ? _expandedReturns.remove(key) : _expandedReturns.add(key)),
+                    child: Icon(expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                        size: 18, color: primaryDark),
+                  ),
+                Text(
+                  e.description,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: invoice != null ? primaryDark : textMain,
+                    decoration: invoice != null ? TextDecoration.underline : null,
+                  ),
+                ),
+              ],
+            ),
+            onTap: onTap,
+          ),
+          cell(amount(e.increase, danger), onTap: onTap),
+          cell(amount(e.decrease, success), onTap: onTap),
+          cell(balance(e.balance), onTap: onTap),
+        ],
+      ));
+      if (expanded) {
+        rows.add(TableRow(
+          decoration: const BoxDecoration(color: RC.faint, border: Border(bottom: BorderSide(color: Color(0xFFEDF2F7)))),
+          children: [
+            const SizedBox(),
+            const SizedBox(),
+            const SizedBox(),
+            Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(18, 6, 4, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [for (final line in e.itemLines) small('• $line')],
+              ),
+            ),
+            const SizedBox(),
+            const SizedBox(),
+            const SizedBox(),
+          ],
+        ));
+      }
+    }
+
+    rows.add(TableRow(
+      key: const ValueKey('statement-totals'),
+      decoration: BoxDecoration(color: RC.headerBg, borderRadius: BorderRadius.circular(8)),
+      children: [
+        cell(const SizedBox()),
+        cell(const SizedBox()),
+        cell(const SizedBox()),
+        cell(small('الإجمالي', bold: true)),
+        cell(small(statementAmount(statement.totalIncrease), color: danger, bold: true)),
+        cell(small(statementAmount(statement.totalDecrease), color: success, bold: true)),
+        cell(balance(statement.closing)),
+      ],
+    ));
+
+    return Table(
+      columnWidths: const {
+        0: FixedColumnWidth(62),
+        1: FlexColumnWidth(1.15),
+        2: FlexColumnWidth(0.85),
+        3: FlexColumnWidth(2.3),
+        4: FlexColumnWidth(1),
+        5: FlexColumnWidth(1),
+        6: FlexColumnWidth(1.2),
+      },
+      defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+      children: rows,
+    );
+  }
+
+  Widget _agingSection(List<AgingBucket> aging) {
+    return Container(
+      key: const Key('statement-aging'),
+      padding: const EdgeInsets.all(14),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text('أعمار الديون', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: textMain)),
+          const Text(
+            'المتبقي من الفواتير المفتوحة حسب عمرها من تاريخ الفاتورة',
+            style: TextStyle(fontSize: 12, color: textSecondary),
+          ),
+          const SizedBox(height: 10),
+          StatGrid(
+            maxColumns: 4,
+            minTileWidth: 130,
+            tiles: [
+              for (final (i, b) in aging.indexed)
+                StatTile(
+                  label: b.label,
+                  value: iqd(b.amount),
+                  color: b.amount > 0.001 && i >= 2 ? danger : textMain,
+                  hint: '${b.count} فاتورة',
+                ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 
@@ -918,63 +1236,6 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
   }
 
   double _number(dynamic value) => (value as num?)?.toDouble() ?? 0.0;
-
-  /// يرتّب الحركات زمنياً (الأقدم فالأحدث) ويحسب الرصيد التراكمي بعد كل
-  /// حركة، تماماً كما يُعرض كشف الحساب الورقي/المطبوع (الأقدم في الأعلى).
-  /// كما يضيف فرزاً ثانوياً بالمعرّف عند تساوي التاريخ للحفاظ على ترتيب
-  /// الإدخال الفعلي (مثال: فاتورة ثم دفعاتها بنفس اليوم).
-  List<Map<String, dynamic>> _computeRunningBalance(
-    List<Map<String, dynamic>> rows,
-  ) {
-    final chronological = List<Map<String, dynamic>>.from(rows)
-      ..sort((a, b) {
-        final dateA = DateTime.tryParse(a['date_time']?.toString() ?? '') ?? DateTime(1970);
-        final dateB = DateTime.tryParse(b['date_time']?.toString() ?? '') ?? DateTime(1970);
-        final cmp = dateA.compareTo(dateB);
-        if (cmp != 0) return cmp;
-        final idA = int.tryParse(a['id']?.toString() ?? '') ?? 0;
-        final idB = int.tryParse(b['id']?.toString() ?? '') ?? 0;
-        return idA.compareTo(idB);
-      });
-
-    double runningBalance = 0;
-    final withBalance = <Map<String, dynamic>>[];
-
-    for (final row in chronological) {
-      runningBalance += _number(row['debt_added']);
-      withBalance.add({...row, 'balance': runningBalance});
-    }
-
-    return withBalance;
-  }
-
-  /// نص عمود "البيان" لكل حركة. الملاحظات أُزيلت من الواجهة (تبقى في القاعدة/API
-  /// فقط)، فالبيان من نوع الحركة ومرجعها.
-  String _statementDescription(Map<String, dynamic> row) {
-    final type = row['transaction_type']?.toString() ?? '';
-    final reference = row['reference']?.toString().trim() ?? '';
-
-    switch (type) {
-      case 'invoice':
-        if (reference.isEmpty || reference.contains('بدون رقم')) {
-          return 'فاتورة شراء #${row['id'] ?? ''}';
-        }
-        return 'فاتورة رقم $reference';
-      case 'payment':
-        return 'دفعة نقدية للمذخر';
-      case 'return':
-        final items = row['items'] is List ? (row['items'] as List).length : 0;
-        final base = reference.isNotEmpty ? reference : 'استرجاع بضاعة للمذخر';
-        final withItems = items > 0 ? '$base ($items صنف)' : base;
-        return withItems;
-      case 'credit_applied':
-        return '$reference: ${_formatAmount(_number(row['amount']))} د.ع';
-      case 'refund':
-        return 'استلام أموال من المذخر';
-      default:
-        return reference.isEmpty ? '-' : reference;
-    }
-  }
 
   String _formatAmount(double amount) {
     final raw = amount.toStringAsFixed(0);
@@ -1464,190 +1725,6 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
       ),
     );
     return saved == true;
-  }
-
-  // ==========================================
-  // 📖 كشف الحساب — صفوف الجدول
-  // ==========================================
-  /// خلية جدول عامة تُستخدم داخل TableRow — بلا عرض ثابت، لأن عرض كل عمود
-  /// يُحسب تلقائياً بواسطة Table نفسه عبر columnWidths.
-  Widget _statementCell(
-    Widget child, {
-    AlignmentGeometry alignment = AlignmentDirectional.centerStart,
-    EdgeInsetsGeometry padding = const EdgeInsets.symmetric(vertical: 11, horizontal: 8),
-  }) {
-    return Padding(
-      padding: padding,
-      child: Align(alignment: alignment, child: child),
-    );
-  }
-
-  // --- صف عناوين الأعمدة ---
-  TableRow _statementHeaderRow() {
-    Widget label(String text) => _statementCell(
-          Text(
-            text,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Color(0xFF4A5568)),
-          ),
-        );
-
-    return TableRow(
-      decoration: BoxDecoration(color: RC.headerBg, borderRadius: BorderRadius.circular(8)),
-      children: [
-        label('التاريخ'),
-        label('البيان'),
-        label('مدين (فاتورة / استلام)'),
-        label('دائن - دفعة'),
-        label('دائن - استرجاع'),
-        label('الرصيد بعد الحركة'),
-      ],
-    );
-  }
-
-  // --- صف بيانات لحركة واحدة (فاتورة / دفعة / استرجاع) ---
-  TableRow _statementRow(Map<String, dynamic> row, {bool expanded = false, VoidCallback? onToggle}) {
-    final type = row['transaction_type']?.toString() ?? '';
-    final isInvoice = type == 'invoice';
-    final isPayment = type == 'payment';
-    final isReturn = type == 'return';
-    final isRefund = type == 'refund';
-    final isCreditApplied = type == 'credit_applied';
-    final returnItems = isReturn && row['items'] is List ? row['items'] as List : const [];
-
-    final amount = _number(row['amount']);
-    final balance = _number(row['balance']);
-
-    final _Badge badge;
-    if (isInvoice) {
-      badge = const _Badge('فاتورة', color: Color(0xFF9A6B00), background: Color(0xFFFEF3C7));
-    } else if (isPayment) {
-      badge = const _Badge('دفعة', color: success, background: RC.greenBg);
-    } else if (isRefund) {
-      badge = const _Badge('استلام', color: Color(0xFF6D28D9), background: Color(0xFFEDE9FE));
-    } else if (isCreditApplied) {
-      badge = const _Badge('خصم رصيد', color: RC.blue, background: RC.blueBg);
-    } else {
-      badge = const _Badge('استرجاع', color: warning, background: RC.orangeBg);
-    }
-
-    Widget amountText(double v, Color color) {
-      return Text(
-        v == 0 ? '—' : _formatAmount(v),
-        style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5, color: v == 0 ? textSecondary : color),
-      );
-    }
-
-    return TableRow(
-      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: Color(0xFFEDF2F7)))),
-      children: [
-        _statementCell(
-          Text(_formatDate(row['date_time']?.toString()), style: const TextStyle(fontSize: 12, color: textSecondary)),
-        ),
-        _statementCell(
-          Wrap(
-            spacing: 6,
-            runSpacing: 4,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              badge,
-              if (returnItems.isNotEmpty)
-                InkWell(
-                  onTap: onToggle,
-                  child: Icon(expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
-                      size: 18, color: primaryDark),
-                ),
-              Text(
-                _statementDescription(row),
-                style: const TextStyle(fontSize: 12.5, color: textMain, fontWeight: FontWeight.w600),
-              ),
-            ],
-          ),
-        ),
-        _statementCell(amountText(isInvoice || isRefund ? amount : 0, textMain)),
-        _statementCell(amountText(isPayment ? amount : 0, success)),
-        _statementCell(amountText(isReturn ? amount : 0, warning)),
-        _statementCell(
-          Text(
-            _balanceText(balance),
-            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12.5, color: _balanceColor(balance)),
-          ),
-        ),
-      ],
-    );
-  }
-
-  /// أدوية استرجاع (يظهر تحت سطره في كشف الحساب عند فتحه).
-  TableRow _statementReturnItemsRow(Map<String, dynamic> row) {
-    final items = (row['items'] as List).whereType<Map>().toList();
-    return TableRow(
-      decoration: const BoxDecoration(
-        color: RC.faint,
-        border: Border(bottom: BorderSide(color: Color(0xFFEDF2F7))),
-      ),
-      children: [
-        const SizedBox(),
-        Padding(
-          padding: const EdgeInsetsDirectional.fromSTEB(24, 6, 6, 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final item in items)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text(
-                    '• ${item['trade_name']} × ${_number(item['quantity']).toInt()}'
-                    '${_number(item['credited_quantity']) < _number(item['quantity']) ? ' (${(_number(item['quantity']) - _number(item['credited_quantity'])).toInt()} بلا رصيد)' : ''}'
-                    ' — ${_formatAmount(_number(item['credit_amount']))} د.ع',
-                    style: const TextStyle(fontSize: 12, color: textMain),
-                  ),
-                ),
-            ],
-          ),
-        ),
-        const SizedBox(),
-        const SizedBox(),
-        const SizedBox(),
-        const SizedBox(),
-      ],
-    );
-  }
-
-  /// الرصيد السالب = المذخر مدين للصيدلية: "لصالحك" بلون مختلف بدل رقم سالب.
-  String _balanceText(double balance) =>
-      balance < -0.001 ? 'لصالحك ${_formatAmount(-balance)}' : _formatAmount(balance);
-
-  Color _balanceColor(double balance) => balance > 0.001 ? danger : (balance < -0.001 ? success : textSecondary);
-
-  // --- صف الإجمالي أسفل الجدول ---
-  TableRow _statementTotalsRow(
-    double totalInvoice,
-    double totalPayment,
-    double totalReturn,
-    double finalBalance,
-  ) {
-    Widget total(double v, {Color? color}) => Text(
-          _formatAmount(v),
-          style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: color ?? textMain),
-        );
-
-    return TableRow(
-      decoration: BoxDecoration(color: RC.headerBg, borderRadius: BorderRadius.circular(8)),
-      children: [
-        _statementCell(const SizedBox()),
-        _statementCell(
-          const Text('الإجمالي', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: textMain)),
-        ),
-        _statementCell(total(totalInvoice)),
-        _statementCell(total(totalPayment, color: success)),
-        _statementCell(total(totalReturn, color: warning)),
-        _statementCell(
-          Text(
-            finalBalance < -0.001 ? 'رصيد لصالحك: ${_formatAmount(-finalBalance)}' : _formatAmount(finalBalance),
-            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: _balanceColor(finalBalance)),
-          ),
-        ),
-      ],
-    );
   }
 
   // ==========================================

@@ -127,7 +127,23 @@
         "expect": {"balance": 1000, "available_credit": 0, "remaining": {"F-1": 0, "F-2": 0, "F-3": 1000}, "credit_applied": {"F-3": 2600}}
       }
     ],
-    "final_avg_cost": {"A": 800}
+    "final_avg_cost": {"A": 800},
+    "statement": {
+      "note": "Final statement after all steps, chronological: [type, invoice number, increase (+), decrease (-), info amount (credit applied, no effect on the balance), balance after]. Both sides must produce exactly this order (an invoice before its own credit application and 'paid now' payment); the closing balance equals the supplier balance.",
+      "rows": [
+        ["invoice", "F-1", 10000, 0, 0, 10000],
+        ["payment", "F-1", 0, 9000, 0, 1000],
+        ["return", "F-1", 0, 3600, 0, -2600],
+        ["return", "F-1", 0, 6000, 0, -8600],
+        ["invoice", "F-2", 5000, 0, 0, -3600],
+        ["credit_applied", "F-2", 0, 0, 5000, -3600],
+        ["refund", null, 1000, 0, 0, -2600],
+        ["invoice", "F-3", 4000, 0, 0, 1400],
+        ["credit_applied", "F-3", 0, 0, 2600, 1400],
+        ["payment", "F-3", 0, 400, 0, 1000]
+      ],
+      "closing": 1000
+    }
   },
   "return_cost": {
     "note": "Replayed by test/supplier_returns_db_test.dart and backend tests_supplier_returns.py. One medicine 'A' (sell price 1500). Returned units leave at their credit: avg = (avg*qty_before - credit)/qty_after; qty_after 0 keeps avg; negative -> 0. 'list' lines: quantity/bonus/buy/expiry_days. 'sell' uses the sell price. 'return' takes that invoice's batches first, then FEFO. When 'profit' is given everything has been sold: lifetime profit (sum of (unit_price - unit_cost) * qty) must equal it and, when 'cash_profit' is true, equal sales - purchases + credits.",

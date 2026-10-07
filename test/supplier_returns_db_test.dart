@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:pharmacy_app/database/db_helper.dart';
 import 'package:pharmacy_app/models/purchase_list.dart';
 import 'package:pharmacy_app/models/purchase_return.dart';
+import 'package:pharmacy_app/models/supplier_statement.dart';
 import 'package:pharmacy_app/repository/suppliers_repository.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -181,6 +182,31 @@ void main() {
         expect(rows.single['t'], closeTo(entry.value as num, 0.001));
       }
     }
+    // كشف الحساب: نفس الترتيب والمبالغ كالخادم، والرصيد الختامي = رصيد المذخر.
+    final expected = ((jsonDecode(File('test/fixtures/profit_parity.json').readAsStringSync()) as Map)['supplier_returns']
+        as Map)['statement'] as Map;
+    final statement = buildSupplierStatement(
+        await helper.getSupplierStatementOfAccount(await supplierId()), const StatementPeriod.all());
+    const types = {
+      StatementEntryType.invoice: 'invoice',
+      StatementEntryType.payment: 'payment',
+      StatementEntryType.purchaseReturn: 'return',
+      StatementEntryType.creditApplied: 'credit_applied',
+      StatementEntryType.refund: 'refund',
+    };
+    expect(
+      [
+        for (final e in statement.entries)
+          [types[e.type], e.invoiceNumber, e.increase, e.decrease, e.infoAmount, e.balance]
+      ],
+      [
+        for (final r in (expected['rows'] as List).cast<List>())
+          [r[0], r[1], (r[2] as num).toDouble(), (r[3] as num).toDouble(), (r[4] as num).toDouble(), (r[5] as num).toDouble()]
+      ],
+    );
+    expect(statement.closing, closeTo(expected['closing'] as num, 0.001));
+    expect(statement.closing, closeTo((await figures())['balance'] as num, 0.001));
+
     // الوحدات المسترجعة تخرج بمبلغ رصيدها: (12 × 833.3333 − 3600) / 8 = 800، ثم الباقي كله (الكمية 0) لا يغيّره.
     expect((await db.query('medicine', where: "trade_name = 'A'")).single['avg_cost'],
         ((jsonDecode(File('test/fixtures/profit_parity.json').readAsStringSync()) as Map)['supplier_returns']

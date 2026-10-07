@@ -53,6 +53,26 @@ class SupplierReturnsTests(PurchaseListTestBase):
         self.assertEqual(Decimal(row["credit_balance"]), max(-expected, Decimal("0")))
         self.assertEqual(self.statement_balance(name), expected, "statement final balance must equal supplier balance")
 
+    def assert_statement_matches_fixture(self):
+        """كشف الحساب بنفس ترتيب ومبالغ test/fixtures (ونفس lib/models/supplier_statement.dart)."""
+        expected = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))["supplier_returns"]["statement"]
+        rows = self.api("get", f"/api/suppliers/{self.supplier().pk}/statement/").json()
+        actual, balance = [], Decimal("0")
+        for r in rows:
+            kind, amount, debt = r["transaction_type"], Decimal(str(r["amount"])), Decimal(str(r["debt_added"]))
+            balance += debt
+            increase = Decimal(str(r["total_amount"])) if kind == "invoice" else (amount if kind == "refund" else Decimal("0"))
+            decrease = amount if kind in ("payment", "return") else Decimal("0")
+            info = amount if kind == "credit_applied" else Decimal("0")
+            if kind == "invoice":
+                self.assertEqual(increase - debt, Decimal("0"), "server invoices have no unlinked paid amount")
+            actual.append([kind, r["invoice_number"], increase, decrease, info, balance])
+        self.assertEqual(
+            actual, [[k, n, Decimal(str(i)), Decimal(str(d)), Decimal(str(f)), Decimal(str(b))] for k, n, i, d, f, b in expected["rows"]]
+        )
+        self.assertEqual(balance, Decimal(str(expected["closing"])))
+        self.assertEqual(Decimal(self.summary_row()["balance"]), balance)
+
     def invoice(self, number):
         return PurchaseInvoice.objects.get(pharmacy=self.pharmacy, invoice_number=number)
 
@@ -109,6 +129,7 @@ class SupplierReturnsTests(PurchaseListTestBase):
             for number, value in exp.get("credit_applied", {}).items():
                 applied = sum(a.amount for a in SupplierCreditApplication.objects.filter(purchase_invoice=self.invoice(number)))
                 self.assertEqual(applied, Decimal(str(value)))
+        self.assert_statement_matches_fixture()
         # الوحدات المسترجعة تخرج بمبلغ رصيدها: (12 × 833.3333 − 3600) / 8 = 800، ثم الباقي كله (الكمية 0) لا يغيّره.
         final = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))["supplier_returns"]["final_avg_cost"]["A"]
         self.assertEqual(Medicine.objects.get(trade_name="A").avg_cost, Decimal(str(final)))

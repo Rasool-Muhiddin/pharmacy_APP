@@ -36,32 +36,10 @@ const _totalBg = PdfColor.fromInt(0xFFF1F5F9);
 Future<Uint8List> buildReportPdf(ReportPdfInput input) {
   final d = input.data;
   final doc = pw.Document(title: d.fileName('pdf'), author: d.pharmacyName, creator: 'Tera Pharmacy');
-  final theme = pw.ThemeData.withFont(
-    base: pw.Font.ttf(input.regularFont.buffer.asByteData()),
-    bold: pw.Font.ttf(input.boldFont.buffer.asByteData()),
-  );
-
   doc.addPage(
     pw.MultiPage(
-      pageTheme: pw.PageTheme(
-        pageFormat: PdfPageFormat.a4,
-        textDirection: pw.TextDirection.rtl,
-        theme: theme,
-        margin: const pw.EdgeInsets.fromLTRB(32, 32, 32, 28),
-      ),
-      footer: (context) => pw.Container(
-        margin: const pw.EdgeInsets.only(top: 10),
-        padding: const pw.EdgeInsets.only(top: 6),
-        decoration: const pw.BoxDecoration(border: pw.Border(top: pw.BorderSide(color: _border))),
-        child: pw.Row(
-          mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-          children: [
-            pw.Text(d.pharmacyName, style: const pw.TextStyle(fontSize: 8, color: _muted)),
-            pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}',
-                style: const pw.TextStyle(fontSize: 8, color: _muted)),
-          ],
-        ),
-      ),
+      pageTheme: reportPdfPageTheme(input.regularFont, input.boldFont),
+      footer: (context) => reportPdfFooter(context, d.pharmacyName),
       build: (context) => [
         _header(d),
         _section('المؤشرات الرئيسية (مقارنة بالفترة السابقة)'),
@@ -83,6 +61,49 @@ Future<Uint8List> buildReportPdf(ReportPdfInput input) {
   );
   return doc.save();
 }
+
+// ---------------------------------------------------------------------------
+// عناصر مشتركة مع ملفات PDF أخرى (كشف حساب المذخر)
+// ---------------------------------------------------------------------------
+
+/// صفحة A4 عمودية من اليمين لليسار بالخط العربي المضمَّن.
+pw.PageTheme reportPdfPageTheme(Uint8List regularFont, Uint8List boldFont) => pw.PageTheme(
+      pageFormat: PdfPageFormat.a4,
+      textDirection: pw.TextDirection.rtl,
+      theme: pw.ThemeData.withFont(
+        base: pw.Font.ttf(regularFont.buffer.asByteData()),
+        bold: pw.Font.ttf(boldFont.buffer.asByteData()),
+      ),
+      margin: const pw.EdgeInsets.fromLTRB(32, 32, 32, 28),
+    );
+
+pw.Widget reportPdfFooter(pw.Context context, String pharmacyName) => pw.Container(
+      margin: const pw.EdgeInsets.only(top: 10),
+      padding: const pw.EdgeInsets.only(top: 6),
+      decoration: const pw.BoxDecoration(border: pw.Border(top: pw.BorderSide(color: _border))),
+      child: pw.Row(
+        mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+        children: [
+          pw.Text(pharmacyName, style: const pw.TextStyle(fontSize: 8, color: _muted)),
+          pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}',
+              style: const pw.TextStyle(fontSize: 8, color: _muted)),
+        ],
+      ),
+    );
+
+/// عنوان قسم بلون التطبيق.
+pw.Widget reportPdfSection(String title) => _section(title);
+
+/// جدول من اليمين لليسار (انظر [_table]).
+pw.Widget reportPdfTable(
+  List<String> headers,
+  List<List<String>> rows, {
+  required List<int> flex,
+  Set<int> boldRows = const {},
+  Set<int> redRows = const {},
+  String emptyText = 'لا توجد بيانات في هذه الفترة.',
+}) =>
+    _table(headers, rows, flex: flex, boldRows: boldRows, redRows: redRows, emptyText: emptyText);
 
 // ---------------------------------------------------------------------------
 // الأقسام
@@ -299,9 +320,10 @@ pw.Widget _table(
   required List<int> flex,
   Set<int> boldRows = const {},
   Set<int> redRows = const {},
+  String emptyText = 'لا توجد بيانات في هذه الفترة.',
 }) {
   if (rows.isEmpty) {
-    return pw.Text('لا توجد بيانات في هذه الفترة.', style: const pw.TextStyle(fontSize: 9, color: _muted));
+    return pw.Text(emptyText, style: const pw.TextStyle(fontSize: 9, color: _muted));
   }
   final n = headers.length;
   List<T> mirror<T>(List<T> cells) => cells.reversed.toList();

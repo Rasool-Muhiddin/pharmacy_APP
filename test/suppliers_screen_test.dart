@@ -3,13 +3,34 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pharmacy_app/database/db_helper.dart';
+import 'dart:typed_data';
+
 import 'package:pharmacy_app/models/purchase_list.dart';
+import 'package:pharmacy_app/models/subscription_plan.dart';
 import 'package:pharmacy_app/screens/missing_suppliers.dart';
+import 'package:pharmacy_app/screens/reports/export/report_export_controller.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 /// شاشة المذاخر (أوفلاين): الملخص، الفلاتر والبحث، لوحة التفاصيل وتبويباتها،
 /// الفاتورة تفتح أصنافها مع الدفع/الاسترجاع، "رصيد لصالحك" واستلام الأموال،
 /// كشف الحساب، تصحيح الاسم، وعدم ظهور الهاتف إطلاقاً.
+class RecordingSaver implements ReportFileSaver {
+  final List<String> picked = [];
+  final Map<String, Uint8List> written = {};
+
+  @override
+  Future<String?> pickPath(String suggestedName, ReportExportFormat format) async {
+    picked.add(suggestedName);
+    return 'C:/tmp/$suggestedName';
+  }
+
+  @override
+  Future<void> write(String path, Uint8List bytes) async => written[path] = bytes;
+
+  @override
+  Future<void> open(String path) async {}
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   sqfliteFfiInit();
@@ -78,7 +99,11 @@ void main() {
     });
   }
 
-  Future<void> pumpScreen(WidgetTester tester, {Size size = const Size(1600, 1100), bool seeded = true}) async {
+  Future<void> pumpScreen(WidgetTester tester,
+      {Size size = const Size(1600, 1100),
+      bool seeded = true,
+      SubscriptionEntitlements? entitlements,
+      ReportFileSaver saver = const NativeReportFileSaver()}) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -87,7 +112,14 @@ void main() {
     } else {
       await seedBranch(tester);
     }
-    await tester.pumpWidget(const MaterialApp(home: MissingSuppliersScreen(pharmacyId: 1)));
+    await tester.pumpWidget(MaterialApp(
+      home: MissingSuppliersScreen(
+        pharmacyId: 1,
+        pharmacyName: 'صيدلية الشفاء',
+        entitlements: entitlements,
+        exportSaver: saver,
+      ),
+    ));
     await settleIo(tester);
   }
 
@@ -178,7 +210,7 @@ void main() {
 
     await openTab(tester, 'كشف الحساب');
     expect(find.text('البيان'), findsOneWidget);
-    expect(find.text('رصيد لصالحك: 200'), findsOneWidget);
+    expect(find.text('الرصيد الختامي: لك 200'), findsOneWidget);
 
     await openTab(tester, 'الأصناف المشتراة');
     expect(find.text('Panadol'), findsOneWidget);
@@ -234,11 +266,87 @@ void main() {
 
     // كشف الحساب: الرصيد النهائي لصالح الصيدلية، والاسترجاع يُفتح لأدويته.
     await openTab(tester, 'كشف الحساب');
-    expect(find.text('رصيد لصالحك: 150'), findsOneWidget);
-    expect(find.text('استلام'), findsOneWidget);
+    expect(find.text('الرصيد الختامي: لك 150'), findsOneWidget);
+    expect(find.text('استلام أموال'), findsOneWidget);
     await tester.tap(find.byIcon(Icons.expand_more_rounded));
     await tester.pumpAndSettle();
     expect(find.textContaining('Panadol × 3'), findsOneWidget);
+  });
+
+  testWidgets('statement: accounting columns, period filter with opening balance, aging, invoice click', (tester) async {
+    await pumpScreen(tester);
+    await openSupplier(tester, 'مذخر الشفاء');
+    await openTab(tester, 'كشف الحساب');
+    for (final header in ['التاريخ', 'نوع الحركة', 'رقم المستند', 'البيان', 'يزيد الدين (+)', 'ينقص الدين (−)', 'الرصيد']) {
+      expect(find.text(header), findsWidgets, reason: header);
+    }
+    // الكل: بلا رصيد افتتاحي؛ الفاتورة ثم دفعتها "المدفوعة الآن" ثم الاسترجاع.
+    expect(find.text('الرصيد الافتتاحي'), findsNothing);
+    final invoiceRow = find.text('فاتورة شراء رقم F-1 — 1 صنف');
+    final paymentRow = find.text('دفعة على فاتورة رقم F-1');
+    final returnRow = find.text('استرجاع أصناف من فاتورة رقم F-1 (1 صنف)');
+    expect(tester.getTopLeft(invoiceRow).dy, lessThan(tester.getTopLeft(paymentRow).dy));
+    expect(tester.getTopLeft(paymentRow).dy, lessThan(tester.getTopLeft(returnRow).dy));
+    expect(find.text('عليك 1,000'), findsOneWidget);
+    expect(find.text('عليك 100'), findsOneWidget);
+    expect(find.text('لك 200'), findsWidgets);
+    // لا دين على الصيدلية: لا أعمار ديون.
+    expect(find.byKey(const Key('statement-aging')), findsNothing);
+    // لا تمرير أفقي في لوحة التفاصيل.
+    expect(
+      find.ancestor(
+          of: find.byType(Table),
+          matching: find.byWidgetPredicate((w) => w is SingleChildScrollView && w.scrollDirection == Axis.horizontal)),
+      findsNothing,
+    );
+
+    // النقر على سطر الفاتورة يفتح أصنافها.
+    await tester.tap(invoiceRow);
+    await settleIo(tester);
+    expect(find.text('أصناف الفاتورة #F-1 — مذخر الشفاء'), findsOneWidget);
+    await tester.tap(find.byTooltip('إغلاق').last);
+    await tester.pumpAndSettle();
+
+    // مذخر قديم: فاتورة يناير 2026 فقط → "هذا الشهر" يبدأ برصيد افتتاحي بلا حركات.
+    await openSupplier(tester, 'مذخر قديم');
+    await openTab(tester, 'كشف الحساب');
+    expect(find.text('الرصيد الختامي: عليك 500'), findsOneWidget);
+    expect(find.byKey(const Key('statement-aging')), findsOneWidget);
+    expect(find.descendant(of: find.byKey(const Key('statement-aging')), matching: find.text('500 د.ع')), findsOneWidget);
+    await tapVisible(tester, find.byKey(const Key('statement-period-thisMonth')));
+    await tester.pumpAndSettle();
+    expect(find.text('لا توجد حركات في هذه الفترة'), findsOneWidget);
+    expect(find.text('الرصيد في هذه الفترة: عليك 500'), findsOneWidget);
+    await tapVisible(tester, find.byKey(const Key('statement-period-all')));
+    await tester.pumpAndSettle();
+    expect(find.text('فاتورة شراء رقم M-1'), findsOneWidget);
+  });
+
+  testWidgets('statement PDF: Basic sees the upgrade dialog, Gold saves a PDF', (tester) async {
+    final saver = RecordingSaver();
+    await pumpScreen(tester, saver: saver);
+    await openSupplier(tester, 'مذخر قديم');
+    await openTab(tester, 'كشف الحساب');
+    await tapVisible(tester, find.byKey(const Key('statement-pdf')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('upgrade-required-dialog')), findsOneWidget);
+    expect(saver.picked, isEmpty);
+  });
+
+  testWidgets('statement PDF: Gold saves a PDF named after the supplier', (tester) async {
+    final saver = RecordingSaver();
+    await pumpScreen(tester, saver: saver, entitlements: SubscriptionEntitlements.fromLicense({'plan': 'gold'}));
+    await openSupplier(tester, 'مذخر قديم');
+    await openTab(tester, 'كشف الحساب');
+    await tapVisible(tester, find.byKey(const Key('statement-pdf')));
+    for (var i = 0; i < 300 && saver.written.isEmpty; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+      await tester.pump();
+    }
+    expect(find.byKey(const Key('upgrade-required-dialog')), findsNothing);
+    expect(saver.picked.single, startsWith('كشف_حساب_مذخر_قديم_'));
+    expect(String.fromCharCodes(saver.written.values.single.take(4)), '%PDF');
+    await tester.pumpAndSettle();
   });
 
   testWidgets('old manual invoice: "لا توجد أصناف" and payment only', (tester) async {

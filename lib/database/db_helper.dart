@@ -3503,42 +3503,56 @@ Future<List<Map<String, dynamic>>> getPurchaseReturnItems(int purchaseReturnId) 
 /// رصيد المذخر الموحّد دائماً (نفس SupplierViewSet.statement).
 Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId) async {
   final db = await database;
+  // لكل حركة: الفاتورة المرتبطة (purchase_invoice_id، invoice_number،
+  // invoice_created_at) لكشف الحساب المحاسبي (supplier_statement.dart)؛ وللفاتورة
+  // نفسها إجماليها وعدد أصنافها. مجموع debt_added = رصيد المذخر دائماً.
   final rows = await db.rawQuery('''
     SELECT
-      id,
+      pi.id,
       'invoice' AS transaction_type,
-      COALESCE(invoice_number, 'فاتورة بدون رقم') AS reference,
-      total_amount - COALESCE((
+      COALESCE(pi.invoice_number, 'فاتورة بدون رقم') AS reference,
+      pi.total_amount - COALESCE((
         SELECT SUM(pir.amount_returned)
         FROM purchase_invoice_return pir
-        WHERE pir.purchase_invoice_id = purchase_invoice.id
+        WHERE pir.purchase_invoice_id = pi.id
       ), 0.0) AS amount,
-      paid_amount AS cash_paid,
+      pi.paid_amount AS cash_paid,
       -- إجمالي الفاتورة ناقص ما دُفع عند إنشائها بلا سطر دفعة (فواتير يدوية
       -- قديمة). الدفعات والاسترجاعات لها أسطرها المنفصلة أدناه.
-      total_amount - (paid_amount - COALESCE((
+      pi.total_amount - (pi.paid_amount - COALESCE((
         SELECT SUM(sp.amount_paid)
         FROM supplier_payment sp
-        WHERE sp.purchase_invoice_id = purchase_invoice.id
+        WHERE sp.purchase_invoice_id = pi.id
       ), 0.0)) AS debt_added,
-      created_at AS date_time,
-      '' AS notes
-    FROM purchase_invoice
-    WHERE supplier_id = ?
+      pi.created_at AS date_time,
+      '' AS notes,
+      pi.id AS purchase_invoice_id,
+      pi.invoice_number AS invoice_number,
+      pi.created_at AS invoice_created_at,
+      pi.total_amount AS total_amount,
+      pi.item_count AS item_count
+    FROM purchase_invoice pi
+    WHERE pi.supplier_id = ?
 
     UNION ALL
 
     SELECT
-      id,
+      sp.id,
       'payment' AS transaction_type,
       'تسديد دفعة' AS reference,
-      amount_paid AS amount,
-      amount_paid AS cash_paid,
-      -amount_paid AS debt_added,
-      paid_at AS date_time,
-      notes
-    FROM supplier_payment
-    WHERE supplier_id = ?
+      sp.amount_paid AS amount,
+      sp.amount_paid AS cash_paid,
+      -sp.amount_paid AS debt_added,
+      sp.paid_at AS date_time,
+      sp.notes,
+      sp.purchase_invoice_id,
+      pi.invoice_number,
+      pi.created_at AS invoice_created_at,
+      NULL AS total_amount,
+      NULL AS item_count
+    FROM supplier_payment sp
+    LEFT JOIN purchase_invoice pi ON pi.id = sp.purchase_invoice_id
+    WHERE sp.supplier_id = ?
 
     UNION ALL
 
@@ -3550,7 +3564,12 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
       0.0 AS cash_paid,
       -r.amount_returned AS debt_added,
       r.returned_at AS date_time,
-      r.notes
+      r.notes,
+      r.purchase_invoice_id,
+      pi.invoice_number,
+      pi.created_at AS invoice_created_at,
+      NULL AS total_amount,
+      NULL AS item_count
     FROM purchase_invoice_return r
     JOIN purchase_invoice pi ON pi.id = r.purchase_invoice_id
     WHERE r.supplier_id = ?
@@ -3566,7 +3585,12 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
       0.0 AS cash_paid,
       0.0 AS debt_added,
       a.applied_at AS date_time,
-      a.notes
+      a.notes,
+      a.purchase_invoice_id,
+      pi.invoice_number,
+      pi.created_at AS invoice_created_at,
+      NULL AS total_amount,
+      NULL AS item_count
     FROM supplier_credit_application a
     JOIN purchase_invoice pi ON pi.id = a.purchase_invoice_id
     WHERE a.supplier_id = ?
@@ -3574,16 +3598,21 @@ Future<List<Map<String, dynamic>>> getSupplierStatementOfAccount(int supplierId)
     UNION ALL
 
     SELECT
-      id,
+      f.id,
       'refund' AS transaction_type,
       'استلام أموال من المذخر' AS reference,
-      amount AS amount,
+      f.amount AS amount,
       0.0 AS cash_paid,
-      amount AS debt_added,
-      received_at AS date_time,
-      notes
-    FROM supplier_refund
-    WHERE supplier_id = ?
+      f.amount AS debt_added,
+      f.received_at AS date_time,
+      f.notes,
+      NULL AS purchase_invoice_id,
+      NULL AS invoice_number,
+      NULL AS invoice_created_at,
+      NULL AS total_amount,
+      NULL AS item_count
+    FROM supplier_refund f
+    WHERE f.supplier_id = ?
 
     ORDER BY date_time DESC
   ''', [supplierId, supplierId, supplierId, supplierId, supplierId]);

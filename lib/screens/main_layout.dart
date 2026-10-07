@@ -191,6 +191,8 @@ class _MainLayoutState extends State<MainLayout> {
         return MissingSuppliersScreen(
           pharmacyId: widget.pharmacyId,
           isOnlineMode: widget.isOnlineMode,
+          entitlements: widget.entitlements,
+          pharmacyName: _pharmacyName,
         );
       case "الأدوية التالفة":
         return DamagedScreen(
