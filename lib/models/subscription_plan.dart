@@ -17,6 +17,10 @@ enum AppFeature {
   /// [SubscriptionEntitlements.maxWarehouses])، والنقل بينها. البيع يبقى
   /// دائماً من المخزن الرئيسي فقط.
   multiWarehouse,
+
+  /// تصدير شاشة التقارير إلى Excel/PDF. زر "تصدير" يبقى ظاهراً في Basic
+  /// ويعرض نافذة الترقية بدل التصدير.
+  reportExport,
 }
 
 /// الخصائص "المرئية لكن مقفولة" في الباقة الأساسية: تظهر في الواجهة مع
@@ -25,6 +29,7 @@ enum AppFeature {
 /// موجودة في هذه المجموعة تُخفى بالكامل عن Basic كما كان يحدث سابقاً.
 const Set<AppFeature> lockedButVisibleInBasic = <AppFeature>{
   AppFeature.multiWarehouse,
+  AppFeature.reportExport,
 };
 
 enum SubscriptionPlan {
@@ -60,6 +65,7 @@ class SubscriptionEntitlements {
   /// مكان مخصص للخصائص التي ستضاف لاحقاً إلى Gold دون تغيير Basic.
   static const Set<AppFeature> goldAdditionalFeatures = <AppFeature>{
     AppFeature.multiWarehouse,
+    AppFeature.reportExport,
   };
 
   /// مكان مخصص للخصائص الحصرية لـ Diamond التي ستضاف لاحقاً.
@@ -89,6 +95,9 @@ class SubscriptionEntitlements {
   /// يتوافق مع الخادم الحالي الذي يعيد license.type، ومع الخادم بعد إضافة
   /// license.plan أو license.features. القيمة غير المعروفة تبقى Basic حتى لا
   /// يحرم العملاء الحاليون من خصائصهم عند ترقية التطبيق قبل الخادم.
+  ///
+  /// license.features من الخادم (desktop_api.permissions.PLAN_FEATURES) يحوي
+  /// الخصائص الإضافية فوق Basic فقط، لذا تُضاف دائماً إلى [basicFeatures].
   factory SubscriptionEntitlements.fromLicense(Map<String, dynamic> license) {
     final plan = _planFrom(
       (license['plan'] ?? license['type'] ?? '').toString(),
@@ -99,9 +108,12 @@ class SubscriptionEntitlements {
     if (serverFeatures is List) {
       final parsed = serverFeatures
           .map((value) => _featureFrom(value.toString()))
-          .whereType<AppFeature>()
-          .toSet();
-      return SubscriptionEntitlements(plan: plan, features: parsed, maxWarehouses: maxWarehouses);
+          .whereType<AppFeature>();
+      return SubscriptionEntitlements(
+        plan: plan,
+        features: Set<AppFeature>.unmodifiable(<AppFeature>{...basicFeatures, ...parsed}),
+        maxWarehouses: maxWarehouses,
+      );
     }
 
     return SubscriptionEntitlements(
@@ -152,6 +164,7 @@ class SubscriptionEntitlements {
         'expenses' => AppFeature.expenses,
         'reports' => AppFeature.reports,
         'multi_warehouse' => AppFeature.multiWarehouse,
+        'report_export' => AppFeature.reportExport,
         _ => null,
       };
 }

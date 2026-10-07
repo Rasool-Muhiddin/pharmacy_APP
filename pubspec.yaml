@@ -28,6 +28,10 @@ dependencies:
   cryptography: ^2.9.0 
   package_info_plus: ^8.0.0
   fl_chart: ^1.2.0
+  excel: ^4.0.6
+  pdf: ^3.12.0
+  file_selector: ^1.1.0
+  open_filex: ^4.7.0
 
 dev_dependencies:
   flutter_test:
@@ -44,3 +48,6 @@ flutter:
     - assets/image/tera_logo.png
     - assets/image/tera_logo1.png
     - assets/image/tera_login_bg1.png
+    # خط عربي (OFL — assets/fonts/OFL.txt) يُضمَّن في تقارير PDF المصدَّرة.
+    - assets/fonts/Tajawal-Regular.ttf
+    - assets/fonts/Tajawal-Bold.ttf

@@ -204,6 +204,8 @@ class _MainLayoutState extends State<MainLayout> {
           pharmacyId: widget.pharmacyId,
           isOwner: widget.isOwner,
           isOnlineMode: widget.isOnlineMode,
+          entitlements: widget.entitlements,
+          pharmacyName: _pharmacyName,
         );
       default:
         return DashboardScreen(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);

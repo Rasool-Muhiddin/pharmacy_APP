@@ -16,13 +16,15 @@ abstract class ReportsDataSource {
   Future<Map<String, dynamic>> categories(ReportPeriod period);
   Future<Map<String, dynamic>> hours(ReportPeriod period);
   Future<Map<String, dynamic>> items(ReportPeriod period, {String sort = 'qty'});
-  Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1});
+  /// [pageSize] null = الحجم الافتراضي للشاشة؛ التصدير يطلب صفحات أكبر.
+  Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1, int? pageSize});
   Future<Map<String, dynamic>> inventory({int days = 30});
   Future<Map<String, dynamic>> purchases(ReportPeriod period);
   Future<Map<String, dynamic>> losses(ReportPeriod period);
   Future<Map<String, dynamic>> invoices(
     ReportPeriod period, {
     int page = 1,
+    int? pageSize,
     String query = '',
     String seller = '',
     bool refunded = false,
@@ -77,8 +79,13 @@ class ReportsRepository implements ReportsDataSource {
       _section('items', period, () => _local.items(pharmacyId, period, sort: sort), {'sort': sort});
 
   @override
-  Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1}) =>
-      _section('stagnant', period, () => _local.stagnant(pharmacyId, period, page: page), {'page': '$page'});
+  Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1, int? pageSize}) => _section(
+        'stagnant',
+        period,
+        () => _local.stagnant(pharmacyId, period,
+            page: page, pageSize: pageSize ?? ReportsLocalService.defaultPageSize),
+        {'page': '$page', if (pageSize != null) 'page_size': '$pageSize'},
+      );
 
   @override
   Future<Map<String, dynamic>> inventory({int days = 30}) =>
@@ -96,6 +103,7 @@ class ReportsRepository implements ReportsDataSource {
   Future<Map<String, dynamic>> invoices(
     ReportPeriod period, {
     int page = 1,
+    int? pageSize,
     String query = '',
     String seller = '',
     bool refunded = false,
@@ -103,9 +111,15 @@ class ReportsRepository implements ReportsDataSource {
       _section(
         'invoices',
         period,
-        () => _local.invoices(pharmacyId, period, page: page, query: query, seller: seller, refunded: refunded),
+        () => _local.invoices(pharmacyId, period,
+            page: page,
+            pageSize: pageSize ?? ReportsLocalService.defaultPageSize,
+            query: query,
+            seller: seller,
+            refunded: refunded),
         {
           'page': '$page',
+          if (pageSize != null) 'page_size': '$pageSize',
           if (query.trim().isNotEmpty) 'q': query.trim(),
           if (seller.trim().isNotEmpty) 'seller': seller.trim(),
           if (refunded) 'refunded': '1',

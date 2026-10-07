@@ -334,6 +334,28 @@ class WarehouseTests(TestCase):
         self.license.save()
         self.assertEqual(self.login("owner")["license"]["max_warehouses"], 1)
 
+    def test_login_reports_plan_features_including_report_export(self):
+        # report_export (تصدير Excel/PDF) لـ Gold/Diamond فقط؛ التطبيق يحفظ
+        # features مع الترخيص ويفرضها أوفلاين.
+        for plan in ("gold", "diamond"):
+            DesktopLicense.objects.filter(pk=self.license.pk).update(plan=plan)
+            features = self.login("owner")["license"]["features"]
+            self.assertEqual(features, ["multi_warehouse", "report_export"], plan)
+        self.license.refresh_from_db()
+        self.license.plan = "basic"
+        self.license.mode = "offline"
+        self.license.save()
+        self.assertEqual(self.login("owner")["license"]["features"], [])
+
+    def test_license_payload_report_export_only_for_gold_and_diamond(self):
+        from desktop_api.permissions import FEATURE_REPORT_EXPORT, plan_allows
+        from desktop_api.views import license_payload
+
+        for plan, expected in (("basic", False), ("gold", True), ("diamond", True)):
+            self.license.plan = plan
+            self.assertIs(FEATURE_REPORT_EXPORT in license_payload(self.license)["features"], expected, plan)
+            self.assertIs(plan_allows(self.license, FEATURE_REPORT_EXPORT), expected, plan)
+
     def test_list_always_includes_main_warehouse(self):
         Warehouse.objects.all().delete()
         r = self.call("get", "/api/warehouses/", token=self.staff_token)

@@ -11,6 +11,7 @@ import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
 import 'purchase_list_dialog.dart';
 import '../widgets/medicine_dialogs.dart';
+import '../widgets/upgrade_required_dialog.dart';
 
 class InventoryScreen extends StatefulWidget {
   final int pharmacyId;
@@ -166,29 +167,10 @@ class _InventoryScreenState extends State<InventoryScreen> {
   /// تُعرض بدل فتح أي حوار فعلي عندما تكون الصيدلية على الباقة الأساسية —
   /// الميزة تبقى ظاهرة دائماً وفق طلب العمل، لا تُخفى، لكنها مقفولة.
   void _showUpgradeRequiredDialog(String featureLabel) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        title: Row(
-          children: const [
-            Icon(Icons.lock_outline, color: Color(0xFFD97706)),
-            SizedBox(width: 10),
-            Text('ميزة الباقة الذهبية'),
-          ],
-        ),
-        content: Text(
-          'خطتك الحالية لا تسمح بـ "$featureLabel".\n\n'
+    showUpgradeRequiredDialog(
+      context,
+      message: 'خطتك الحالية لا تسمح بـ "$featureLabel".\n\n'
           'قم بالترقية إلى الباقة الذهبية لتفعيل هذه الميزة.',
-        ),
-        actions: [
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFD97706)),
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('حسناً', style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
     );
   }
 

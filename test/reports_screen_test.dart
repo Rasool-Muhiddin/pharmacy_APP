@@ -95,7 +95,7 @@ class FakeReports implements ReportsDataSource {
   }
 
   @override
-  Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1}) async {
+  Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1, int? pageSize}) async {
     calls.add('stagnant:$page');
     return {
       'count': empty ? 0 : 60, 'page': page, 'page_size': 50, 'total_value': 9000,
@@ -175,7 +175,7 @@ class FakeReports implements ReportsDataSource {
 
   @override
   Future<Map<String, dynamic>> invoices(ReportPeriod period,
-      {int page = 1, String query = '', String seller = '', bool refunded = false}) async {
+      {int page = 1, int? pageSize, String query = '', String seller = '', bool refunded = false}) async {
     calls.add('invoices:$page:$query:$seller:$refunded');
     return {
       'count': empty ? 0 : 120, 'page': page, 'page_size': 50, 'total_amount': 4400,

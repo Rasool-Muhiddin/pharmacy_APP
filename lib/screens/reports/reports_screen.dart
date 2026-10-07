@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' hide TextDirection;
 
 import '../../models/report_period.dart';
+import '../../models/subscription_plan.dart';
 import '../../repository/reports_repository.dart';
 import 'report_widgets.dart';
+import 'export/report_export_controller.dart';
 import 'reports_scope.dart';
 import 'tabs/inventory_tab.dart';
 import 'tabs/items_tab.dart';
@@ -25,17 +27,27 @@ class ReportsScreen extends StatefulWidget {
   final bool isOwner;
   final bool isOnlineMode;
 
-  /// للاختبارات: مصدر بيانات بديل وساعة ثابتة.
+  /// باقة الترخيص المحفوظ — تحدد إن كان "تصدير" يصدّر أم يعرض نافذة الترقية.
+  final SubscriptionEntitlements? entitlements;
+
+  /// يظهر في رأس الملفات المصدَّرة واسمها.
+  final String pharmacyName;
+
+  /// للاختبارات: مصدر بيانات بديل وساعة ثابتة وحافظ ملفات بديل.
   final ReportsDataSource? repository;
   final DateTime Function()? clock;
+  final ReportFileSaver? exportSaver;
 
   const ReportsScreen({
     super.key,
     required this.pharmacyId,
     required this.isOnlineMode,
     this.isOwner = true,
+    this.entitlements,
+    this.pharmacyName = '',
     this.repository,
     this.clock,
+    this.exportSaver,
   });
 
   @override
@@ -238,8 +250,23 @@ class _ReportsScreenState extends State<ReportsScreen> with SingleTickerProvider
               const SizedBox(width: 8),
               const Text('التقارير',
                   style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF2C3E50), fontFamily: 'Tajawal')),
-              const Spacer(),
-              Text('آخر تحديث ${DateFormat('HH:mm').format(_updatedAt)}', style: const TextStyle(fontSize: 12, color: RC.muted)),
+              Expanded(
+                child: Text(
+                  'آخر تحديث ${DateFormat('HH:mm').format(_updatedAt)}',
+                  textAlign: TextAlign.end,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12, color: RC.muted),
+                ),
+              ),
+              const SizedBox(width: 8),
+              ReportExportButton(
+                entitlements: widget.entitlements ?? SubscriptionEntitlements.basic(),
+                repo: _repo,
+                period: _period,
+                pharmacyName: widget.pharmacyName,
+                saver: widget.exportSaver ?? const NativeReportFileSaver(),
+              ),
               IconButton(
                 key: const Key('reports-refresh'),
                 tooltip: 'تحديث',

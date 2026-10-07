@@ -21,16 +21,24 @@ from .models import DesktopLicense
 
 # يطابق AppFeature / SubscriptionEntitlements في subscription_plan.dart.
 FEATURE_MULTI_WAREHOUSE = "multi_warehouse"
+# تصدير التقارير Excel/PDF — يُولَّد بالكامل داخل التطبيق من بيانات
+# /api/reports/* الموجودة، فلا واجهة خادم خاصة به؛ يكفي إرساله في الترخيص.
+FEATURE_REPORT_EXPORT = "report_export"
 
 PLAN_FEATURES = {
     DesktopLicense.PLAN_BASIC: frozenset(),
-    DesktopLicense.PLAN_GOLD: frozenset({FEATURE_MULTI_WAREHOUSE}),
-    DesktopLicense.PLAN_DIAMOND: frozenset({FEATURE_MULTI_WAREHOUSE}),
+    DesktopLicense.PLAN_GOLD: frozenset({FEATURE_MULTI_WAREHOUSE, FEATURE_REPORT_EXPORT}),
+    DesktopLicense.PLAN_DIAMOND: frozenset({FEATURE_MULTI_WAREHOUSE, FEATURE_REPORT_EXPORT}),
 }
 
 
 def plan_allows(license, feature):
     return feature in PLAN_FEATURES.get(license.plan, frozenset())
+
+
+def plan_features(license):
+    """خصائص الباقة الإضافية فوق Basic، مرتبة، لـ license_payload."""
+    return sorted(PLAN_FEATURES.get(license.plan, frozenset()))
 
 
 # الوضع الأونلاين (بيانات على الخادم، مزامنة بين الأجهزة، الترحيل أوفلاين→

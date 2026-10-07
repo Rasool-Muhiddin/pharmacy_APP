@@ -15,6 +15,7 @@ from .permissions import (
     login_username_key,
     max_warehouses_for,
     plan_allows_online,
+    plan_features,
 )
 
 
@@ -40,6 +41,9 @@ def license_payload(license):
         # يقرأه subscription_plan.dart (SubscriptionEntitlements.fromLicense)
         # لتفعيل/قفل خصائص الباقة الذهبية (تعدد المخازن).
         "plan": license.plan,
+        # خصائص الباقة فوق Basic (PLAN_FEATURES)؛ يدمجها التطبيق مع خصائص
+        # Basic ويحفظها مع الترخيص فتُفرض أوفلاين أيضاً (مثل report_export).
+        "features": plan_features(license),
         # الحد الفعلي لعدد المخازن؛ يفرضه التطبيق محلياً في الوضع الأوفلاين
         # (SubscriptionEntitlements.maxWarehouses) والخادم في الأونلاين.
         "max_warehouses": max_warehouses_for(license),
