@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart';
@@ -20,9 +22,19 @@ class SalesHistoryScreen extends StatefulWidget {
 }
 
 class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
+  static const int _pageSize = 50;
+
   List<Map<String, dynamic>> _invoices = [];
-  List<Map<String, dynamic>> _filteredInvoices = [];
   bool _isLoading = true;
+  bool _isLoadingMore = false;
+  bool _hasMore = false;
+  bool _fromCache = false;
+  int _page = 1;
+  DateTime? _startDate;
+  DateTime? _endDate;
+  Timer? _searchDebounce;
+  // يتجاهل ردود طلبات أقدم إن تغيّر البحث/الفترة أثناء انتظارها.
+  int _requestSeq = 0;
   final TextEditingController _searchCtrl = TextEditingController();
 
   @override
@@ -33,69 +45,103 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _searchCtrl.dispose();
     super.dispose();
   }
 
-  // جلب الفواتير مع اسم الكاشير مباشرة من قاعدة البيانات بداخل هذه الصفحة
+  /// الصفحة الأولى بالبحث والفترة الحاليين. الترقيم والفلترة على الخادم
+  /// أونلاين (لا يُنزَّل السجل كاملاً)، وعلى الجدول المحلي أوفلاين.
   Future<void> _loadInvoices() async {
+    _searchDebounce?.cancel();
+    final seq = ++_requestSeq;
     setState(() => _isLoading = true);
 
     try {
-      // أونلاين: نُحدّث الكاش المحلي من السيرفر أولاً (قراءة فقط)، ثم
-      // نعرضه بنفس استعلام JOIN المحلي أدناه دون أي تغيير عليه. فواتير
-      // أونلاين مُخزَّنة عبر cashier_id = NULL دائماً (انظر
-      // db_helper._upsertInvoiceRow)، لكن اسم البائع الجاهز القادم من
-      // السيرفر محفوظ في invoice.cashier_name_synced ويُستخدم كبديل هنا.
-      if (widget.isOnlineMode) {
-        await InvoiceRepository.instance.getInvoices(
-          pharmacyId: widget.pharmacyId,
-          isOnlineMode: true,
-        );
-      }
-
-      // الحصول على كائن قاعدة البيانات بدون التعديل على ملف db_helper.dart
-      final db = await DatabaseHelper.instance.database;
-
-      // الاستعلام المباشر لربط الفاتورة بجدول المستخدِمين
-      final data = await db.rawQuery('''
-        SELECT 
-          i.*,
-          COALESCE(u.full_name, u.username, i.cashier_name_synced, 'غير محدد') AS cashier_name
-        FROM invoice i
-        LEFT JOIN user_profile up ON i.cashier_id = up.id
-        LEFT JOIN users u ON up.user_id = u.id
-        WHERE i.pharmacy_id = ? AND ${DatabaseHelper.instance.originFilter('i.')}
-        ORDER BY i.created_at DESC
-      ''', [widget.pharmacyId]);
-
+      final page = await _fetchPage(1);
+      if (!mounted || seq != _requestSeq) return;
       setState(() {
-        _invoices = data;
-        _filteredInvoices = data;
+        _invoices = page.rows;
+        _page = 1;
+        _hasMore = page.hasMore;
+        _fromCache = page.fromCache;
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted || seq != _requestSeq) return;
       setState(() => _isLoading = false);
       _showSnackBar('خطأ أثناء تحميل سجل المبيعات: $e', Colors.red);
     }
   }
 
-  // فلترة الفواتير حسب البحث
-  void _filterInvoices(String query) {
-    if (query.trim().isEmpty) {
-      setState(() => _filteredInvoices = _invoices);
-      return;
+  Future<void> _loadMore() async {
+    if (_isLoadingMore || !_hasMore) return;
+    final seq = _requestSeq;
+    setState(() => _isLoadingMore = true);
+    try {
+      final page = await _fetchPage(_page + 1);
+      if (!mounted || seq != _requestSeq) return;
+      setState(() {
+        final seen = {for (final inv in _invoices) inv['id']};
+        _invoices = [
+          ..._invoices,
+          ...page.rows.where((inv) => !seen.contains(inv['id']))
+        ];
+        _page += 1;
+        _hasMore = page.hasMore;
+      });
+    } catch (e) {
+      _showSnackBar('خطأ أثناء تحميل المزيد: $e', Colors.red);
+    } finally {
+      if (mounted) setState(() => _isLoadingMore = false);
     }
-
-    final lower = query.trim().toLowerCase();
-    setState(() {
-      _filteredInvoices = _invoices.where((inv) {
-        final invNum = (inv['invoice_number'] ?? '').toString().toLowerCase();
-        final cashier = (inv['cashier_name'] ?? '').toString().toLowerCase();
-        return invNum.contains(lower) || cashier.contains(lower);
-      }).toList();
-    });
   }
+
+  Future<InvoicePage> _fetchPage(int page) {
+    return InvoiceRepository.instance.getInvoicesPage(
+      pharmacyId: widget.pharmacyId,
+      isOnlineMode: widget.isOnlineMode,
+      page: page,
+      pageSize: _pageSize,
+      search: _searchCtrl.text,
+      start: _startDate,
+      end: _endDate,
+    );
+  }
+
+  void _onSearchChanged(String _) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 400), _loadInvoices);
+  }
+
+  Future<void> _pickDateRange() async {
+    final now = DateTime.now();
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(now.year, now.month, now.day),
+      initialDateRange: _startDate != null && _endDate != null
+          ? DateTimeRange(start: _startDate!, end: _endDate!)
+          : null,
+    );
+    if (picked == null) return;
+    setState(() {
+      _startDate = picked.start;
+      _endDate = picked.end;
+    });
+    _loadInvoices();
+  }
+
+  void _clearDateRange() {
+    setState(() {
+      _startDate = null;
+      _endDate = null;
+    });
+    _loadInvoices();
+  }
+
+  String _formatDay(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   // تنفيذ عملية الاسترجاع
   Future<void> _handleRefund(int invoiceId, String invoiceNumber) async {
@@ -434,7 +480,8 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                         height: 48,
                         child: TextField(
                           controller: _searchCtrl,
-                          onChanged: _filterInvoices,
+                          onChanged: _onSearchChanged,
+                          onSubmitted: (_) => _loadInvoices(),
                           decoration: InputDecoration(
                             hintText: '🔍 ابحث برقم الفاتورة أو اسم البائع...',
                             hintStyle: TextStyle(color: Colors.grey.shade500, fontSize: 13),
@@ -460,24 +507,54 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         elevation: 0,
                       ),
-                      onPressed: () => _filterInvoices(_searchCtrl.text),
+                      onPressed: _loadInvoices,
                       icon: const Icon(Icons.search, size: 18),
                       label: const Text('ابحث الآن', style: TextStyle(fontWeight: FontWeight.bold)),
                     ),
+                    const SizedBox(width: 10),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: primaryTeal,
+                        side: const BorderSide(color: primaryTeal, width: 1.5),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      onPressed: _pickDateRange,
+                      icon: const Icon(Icons.date_range, size: 18),
+                      label: Text(
+                        _startDate == null ? 'كل الفترات' : '${_formatDay(_startDate!)} ← ${_formatDay(_endDate!)}',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    if (_startDate != null)
+                      IconButton(
+                        tooltip: 'إلغاء فلتر التاريخ',
+                        onPressed: _clearDateRange,
+                        icon: const Icon(Icons.clear, color: Colors.grey),
+                      ),
                   ],
                 ),
+                if (_fromCache)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 10),
+                    child: Text(
+                      'لا يوجد اتصال بالخادم — تُعرض آخر نسخة محفوظة على هذا الجهاز.',
+                      style: TextStyle(color: Colors.orange, fontWeight: FontWeight.w600),
+                    ),
+                  ),
                 const SizedBox(height: 20),
 
                 // 3. جدول البيانات
                 Expanded(
                   child: _isLoading
                       ? const Center(child: CircularProgressIndicator())
-                      : _filteredInvoices.isEmpty
+                      : _invoices.isEmpty
                           ? const Center(child: Text('لا توجد فواتير مطابقة للبحث', style: TextStyle(color: Colors.grey, fontSize: 16)))
                           : ClipRRect(
                               borderRadius: BorderRadius.circular(8),
                               child: SingleChildScrollView(
-                                child: Container(
+                                child: Column(children: [
+                                Container(
                                   width: double.infinity,
                                   decoration: BoxDecoration(
                                     border: Border.all(color: Colors.grey.shade200),
@@ -503,7 +580,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                                       DataColumn(label: Expanded(child: Text('الصافي المدفوع', textAlign: TextAlign.center))),
                                       DataColumn(label: Expanded(child: Text('الإجراءات', textAlign: TextAlign.center))),
                                     ],
-                                    rows: _filteredInvoices.map((inv) {
+                                    rows: _invoices.map((inv) {
                                       final bool isRefunded = inv['is_refunded'] == 1;
                                       final discount = (inv['discount'] as num?)?.toDouble() ?? 0.0;
                                       final finalAmount = (inv['final_amount'] as num?)?.toDouble() ?? 0.0;
@@ -576,6 +653,20 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                                     }).toList(),
                                   ),
                                 ),
+                                if (_hasMore)
+                                  Padding(
+                                    padding: const EdgeInsets.all(12),
+                                    child: _isLoadingMore
+                                        ? const Center(child: CircularProgressIndicator())
+                                        : Center(
+                                            child: OutlinedButton.icon(
+                                              onPressed: _loadMore,
+                                              icon: const Icon(Icons.expand_more),
+                                              label: const Text('تحميل المزيد'),
+                                            ),
+                                          ),
+                                  ),
+                                ]),
                               ),
                             ),
                 ),

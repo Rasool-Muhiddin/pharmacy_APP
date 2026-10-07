@@ -56,6 +56,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "tera_backend.timing.RequestTimingMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -118,6 +119,24 @@ TRUST_CLOUDFLARE_IP = os.getenv("TRUST_CLOUDFLARE_IP", "True").lower() in {"1", 
 CSRF_TRUSTED_ORIGINS = [item.strip() for item in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",") if item.strip()]
 if os.getenv("USE_PROXY_SSL_HEADER", "False").lower() in {"1", "true", "yes"}:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# إصدار واجهة الخادم (يظهر في /api/health/ و/api/desktop/latest-version/).
+# التطبيق يقارنه بـ ApiHttp.expectedServerApiVersion ويحذّر في السجل إن كان
+# الخادم أقدم. ارفعه عند إضافة endpoints يعتمد عليها التطبيق.
+# 2 = أقسام التقارير الجديدة (/api/reports/kpis/ ...) والتصدير.
+# 3 = /api/invoices/ بفلاتر search/start/end وpage_size، و/api/invoices/stats/.
+API_VERSION = 3
+
+# REQUEST_TIMING=True: يسجّل لكل طلب المسار والمدة وعدد استعلامات قاعدة
+# البيانات (logger "tera.timing" → stderr = سجل Gunicorn) ويضيف ترويسة
+# Server-Timing. للقياس المؤقت فقط؛ معطّل افتراضياً.
+REQUEST_TIMING = os.getenv("REQUEST_TIMING", "False").lower() in {"1", "true", "yes"}
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"tera.timing": {"handlers": ["console"], "level": "INFO", "propagate": False}},
+}
 
 # عدد الأيام التي يبقى فيها Token الدخول صالحاً منذ آخر تسجيل دخول ناجح.
 API_TOKEN_TTL_DAYS = int(os.getenv("API_TOKEN_TTL_DAYS", "60"))

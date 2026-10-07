@@ -1,18 +1,11 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class ExpenseApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class ExpenseApiException extends ApiHttpException {
   const ExpenseApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يغلّف جميع طلبات المصروفات (/api/expenses/) على الخادم، بنفس بنية
@@ -26,10 +19,7 @@ class ExpenseApiService {
   /// نفس رابط جذر API العام المستخدم في MedicineApiService/InvoiceApiService
   /// (TERA_API_ROOT_URL)، لأن endpoints بيانات الصيدلية كلها تعيش تحت /api/
   /// مباشرة، لا تحت /api/desktop/.
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -78,65 +68,29 @@ class ExpenseApiService {
   }
 
   Future<void> deleteExpense(int id) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .deleteUrl(Uri.parse('$_baseUrl/expenses/$id/'))
-          .timeout(const Duration(seconds: 25));
-
-      _applyAuthHeader(request);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      await utf8.decoder.bind(response).join();
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ExpenseApiException(
-          'تعذر حذف المصروف.',
-          statusCode: response.statusCode,
-        );
-      }
-    } on TimeoutException {
-      throw const ExpenseApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const ExpenseApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const ExpenseApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
+    final response = await _request('DELETE', '$_baseUrl/expenses/$id/');
+    if (!response.isSuccess) {
+      throw ExpenseApiException(
+        'تعذر حذف المصروف.',
+        statusCode: response.statusCode,
+      );
     }
   }
 
-  void _applyAuthHeader(HttpClientRequest request) {
+  Future<ApiHttpResponse> _request(String method, String url, {Map<String, dynamic>? body}) async {
     final token = _token;
     if (token == null || token.isEmpty) {
       throw const ExpenseApiException('لم يتم تسجيل الدخول بعد.');
     }
-    request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
+    try {
+      return await ApiHttp.request(method, url, token: token, body: body);
+    } on ApiHttpException catch (e) {
+      throw ExpenseApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
+    }
   }
 
   Future<Map<String, dynamic>> _get({required String url}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.getUrl(Uri.parse(url)).timeout(
-            const Duration(seconds: 25),
-          );
-
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      return _parseResponse(response, await utf8.decoder.bind(response).join());
-    } on TimeoutException {
-      throw const ExpenseApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const ExpenseApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const ExpenseApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseResponse(await _request('GET', url));
   }
 
   Future<Map<String, dynamic>> _send({
@@ -144,50 +98,11 @@ class ExpenseApiService {
     required String url,
     required Map<String, dynamic> body,
   }) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .openUrl(method, Uri.parse(url))
-          .timeout(const Duration(seconds: 25));
-
-      _applyAuthHeader(request);
-      request.headers.contentType = ContentType.json;
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final bodyBytes = utf8.encode(jsonEncode(body));
-      request.contentLength = bodyBytes.length;
-      request.add(bodyBytes);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final responseText = await utf8.decoder.bind(response).join();
-      return _parseResponse(response, responseText);
-    } on TimeoutException {
-      throw const ExpenseApiException(
-        'انتهت مهلة الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.',
-      );
-    } on SocketException {
-      throw const ExpenseApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const ExpenseApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseResponse(await _request(method, url, body: body));
   }
 
-  Map<String, dynamic> _parseResponse(
-    HttpClientResponse response,
-    String responseText,
-  ) {
-    dynamic decoded;
-    try {
-      decoded = responseText.isEmpty ? <String, dynamic>{} : jsonDecode(responseText);
-    } catch (_) {
-      throw ExpenseApiException(
-        'استجابة غير صالحة من الخادم.',
-        statusCode: response.statusCode,
-      );
-    }
+  Map<String, dynamic> _parseResponse(ApiHttpResponse response) {
+    final decoded = response.json ?? <String, dynamic>{};
 
     if (response.statusCode == 401) {
       throw const ExpenseApiException(
@@ -196,7 +111,7 @@ class ExpenseApiService {
       );
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+    if (!response.isSuccess) {
       throw ExpenseApiException(
         _extractErrorMessage(decoded),
         statusCode: response.statusCode,

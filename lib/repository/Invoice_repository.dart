@@ -1,8 +1,19 @@
 // ignore_for_file: file_names — اسم الملف قديم ومستورد في عدة شاشات واختبارات.
 import '../database/db_helper.dart';
+import '../services/api_http.dart';
 import '../services/connectivity_service.dart';
 import '../services/invoice_api_service.dart';
 import 'medicine_repository.dart';
+
+class InvoicePage {
+  final List<Map<String, dynamic>> rows;
+  final bool hasMore;
+
+  /// أونلاين بلا اتصال: الصفحة من آخر كاش محلي محفوظ.
+  final bool fromCache;
+
+  const InvoicePage(this.rows, {required this.hasMore, this.fromCache = false});
+}
 
 class InvoiceRepositoryException implements Exception {
   final String message;
@@ -31,28 +42,95 @@ class InvoiceRepository {
   final InvoiceApiService _api = InvoiceApiService.instance;
   final ConnectivityService _connectivity = ConnectivityService.instance;
 
-  Future<List<Map<String, dynamic>>> getInvoices({
+  /// صفحة من سجل المبيعات (الأحدث أولاً) بفلاتر البحث والتاريخ. أونلاين:
+  /// الترقيم والفلترة على الخادم، وصفوف الصفحة تُحفظ في الكاش المحلي (لنافذة
+  /// تفاصيل الفاتورة). بلا اتصال: نفس الصفحة من آخر كاش محفوظ (قراءة فقط —
+  /// البيع والإرجاع يبقيان ممنوعين، انظر checkout/refund).
+  Future<InvoicePage> getInvoicesPage({
+    required int pharmacyId,
+    required bool isOnlineMode,
+    int page = 1,
+    int pageSize = 50,
+    String search = '',
+    DateTime? start,
+    DateTime? end,
+  }) async {
+    final startKey = start == null ? null : _dateKey(start);
+    final endKey = end == null ? null : _dateKey(end);
+    search = search.trim();
+
+    if (isOnlineMode) {
+      try {
+        final body = await _api.fetchInvoicesPage(
+          page: page,
+          pageSize: pageSize,
+          search: search,
+          start: startKey,
+          end: endKey,
+        );
+        final results = (body['results'] as List? ?? const []).whereType<Map<String, dynamic>>().toList();
+        await _db.replaceInvoicesCache(pharmacyId: pharmacyId, serverItems: results);
+        final rows = await _db.queryInvoices(
+          pharmacyId,
+          ids: [for (final r in results) r['id'] as int],
+        );
+        return InvoicePage(rows, hasMore: body['next'] != null);
+      } catch (e) {
+        if (!ApiHttp.isNetworkError(e)) rethrow;
+      }
+    }
+
+    final rows = await _db.queryInvoices(
+      pharmacyId,
+      search: search,
+      start: startKey,
+      end: endKey,
+      limit: pageSize + 1,
+      offset: (page - 1) * pageSize,
+    );
+    return InvoicePage(
+      rows.take(pageSize).toList(),
+      hasMore: rows.length > pageSize,
+      fromCache: isOnlineMode,
+    );
+  }
+
+  /// آخر [limit] فواتير (لوحة "سجل الفواتير الأخيرة" في نقطة البيع): صفحة
+  /// واحدة صغيرة بدل سجل المبيعات كاملاً.
+  Future<List<Map<String, dynamic>>> getRecentInvoices({
+    required int pharmacyId,
+    required bool isOnlineMode,
+    int limit = 20,
+  }) async {
+    final page = await getInvoicesPage(pharmacyId: pharmacyId, isOnlineMode: isOnlineMode, pageSize: limit);
+    return page.rows;
+  }
+
+  /// مبيعات اليوم وعدد فواتيره (الشاشة الرئيسية). أونلاين من الخادم (كل
+  /// أجهزة الصيدلية)؛ أوفلاين أو بلا اتصال من الجدول المحلي.
+  Future<({double sales, int count})> getTodayStats({
     required int pharmacyId,
     required bool isOnlineMode,
   }) async {
-    if (!isOnlineMode) {
-      return _db.getInvoices(pharmacyId);
+    if (isOnlineMode) {
+      try {
+        final stats = await _api.fetchTodayStats();
+        return (
+          sales: (stats['sales_total'] as num? ?? 0).toDouble(),
+          count: (stats['invoices_count'] as num? ?? 0).toInt(),
+        );
+      } catch (e) {
+        if (!ApiHttp.isNetworkError(e)) rethrow;
+      }
     }
-
-    if (!await _connectivity.hasConnection()) {
-      // بلا اتصال فعلي الآن: نعرض آخر نسخة مزامَنة محفوظة في الكاش المحلي
-      // بدل شاشة فارغة، لكن هذا قراءة فقط — البيع والإرجاع يبقيان ممنوعين
-      // (انظر checkout/refund أدناه).
-      return _db.getInvoices(pharmacyId);
-    }
-
-    final serverItems = await _api.fetchInvoices();
-    await _db.replaceInvoicesCache(
-      pharmacyId: pharmacyId,
-      serverItems: serverItems,
+    return (
+      sales: await _db.totalSalesToday(pharmacyId),
+      count: await _db.todayInvoiceCount(pharmacyId),
     );
-    return _db.getInvoices(pharmacyId);
   }
+
+  String _dateKey(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   /// يبيع محتويات السلة الحالية وينشئ فاتورة، محلياً أو عبر السيرفر حسب
   /// isOnlineMode.

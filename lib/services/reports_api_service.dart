@@ -1,18 +1,11 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class ReportsApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class ReportsApiException extends ApiHttpException {
   const ReportsApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يستهلك /api/reports/* (summary/shifts للنسخ الأقدم، وأقسام شاشة التقارير
@@ -26,10 +19,7 @@ class ReportsApiService {
 
   static final ReportsApiService instance = ReportsApiService._();
 
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -69,14 +59,6 @@ class ReportsApiService {
   String _formatDate(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
-  void _applyAuthHeader(HttpClientRequest request) {
-    final token = _token;
-    if (token == null || token.isEmpty) {
-      throw const ReportsApiException('لم يتم تسجيل الدخول بعد.');
-    }
-    request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
-  }
-
   Future<Map<String, dynamic>> _get({
     required String endpoint,
     required DateTime start,
@@ -90,43 +72,23 @@ class ReportsApiService {
     required Map<String, String> query,
   }) async {
     final url = Uri.parse('$_baseUrl/reports/$endpoint/').replace(queryParameters: query.isEmpty ? null : query).toString();
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
+    return _parseResponse(await _request('GET', url));
+  }
 
+  Future<ApiHttpResponse> _request(String method, String url, {Map<String, dynamic>? body}) async {
+    final token = _token;
+    if (token == null || token.isEmpty) {
+      throw const ReportsApiException('لم يتم تسجيل الدخول بعد.');
+    }
     try {
-      final request = await client.getUrl(Uri.parse(url)).timeout(
-            const Duration(seconds: 25),
-          );
-
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final responseText = await utf8.decoder.bind(response).join();
-      return _parseResponse(response, responseText);
-    } on TimeoutException {
-      throw const ReportsApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const ReportsApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const ReportsApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
+      return await ApiHttp.request(method, url, token: token, body: body);
+    } on ApiHttpException catch (e) {
+      throw ReportsApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
     }
   }
 
-  Map<String, dynamic> _parseResponse(
-    HttpClientResponse response,
-    String responseText,
-  ) {
-    dynamic decoded;
-    try {
-      decoded = responseText.isEmpty ? <String, dynamic>{} : jsonDecode(responseText);
-    } catch (_) {
-      throw ReportsApiException(
-        'استجابة غير صالحة من الخادم.',
-        statusCode: response.statusCode,
-      );
-    }
+  Map<String, dynamic> _parseResponse(ApiHttpResponse response) {
+    final decoded = response.json ?? <String, dynamic>{};
 
     if (response.statusCode == 401) {
       throw const ReportsApiException(
@@ -135,10 +97,11 @@ class ReportsApiService {
       );
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      final detail = decoded is Map<String, dynamic> ? decoded['detail'] : null;
+    if (!response.isSuccess) {
       throw ReportsApiException(
-        detail is String && detail.isNotEmpty ? detail : 'تعذر جلب التقرير من الخادم.',
+        decoded is Map<String, dynamic> && decoded['detail'] is String && (decoded['detail'] as String).isNotEmpty
+            ? decoded['detail'] as String
+            : 'تعذر جلب التقرير من الخادم.',
         statusCode: response.statusCode,
       );
     }

@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../database/db_helper.dart';
 import '../repository/medicine_repository.dart';
-import '../services/connectivity_service.dart';
 import '../services/damaged_api_service.dart';
+import '../services/api_http.dart';
 
 class DamagedScreen extends StatefulWidget {
   final int pharmacyId;
@@ -50,12 +50,16 @@ class _DamagedScreenState extends State<DamagedScreen> {
       // أونلاين: نزامن كاش سجلات الإتلاف من السيرفر أولاً (بنفس نمط
       // ExpenseRepository.getExpenses) قبل قراءة الجدول المحلي المُشترَك في
       // JOIN تحتها — بلا اتصال فعلي الآن نعرض آخر كاش محفوظ بدل شاشة فارغة.
-      if (widget.isOnlineMode && await ConnectivityService.instance.hasConnection()) {
-        final serverItems = await DamagedApiService.instance.fetchDamagedMedicines();
-        await DatabaseHelper.instance.replaceDamagedMedicinesCache(
-          pharmacyId: widget.pharmacyId,
-          serverItems: serverItems,
-        );
+      if (widget.isOnlineMode) {
+        try {
+          final serverItems = await DamagedApiService.instance.fetchDamagedMedicines();
+          await DatabaseHelper.instance.replaceDamagedMedicinesCache(
+            pharmacyId: widget.pharmacyId,
+            serverItems: serverItems,
+          );
+        } catch (e) {
+          if (!ApiHttp.isNetworkError(e)) rethrow;
+        }
       }
 
       final db = await DatabaseHelper.instance.database;

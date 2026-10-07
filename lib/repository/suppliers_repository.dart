@@ -3,6 +3,7 @@ import '../models/purchase_list.dart';
 import '../services/connectivity_service.dart';
 import '../services/suppliers_api_service.dart';
 import 'medicine_repository.dart';
+import '../services/api_http.dart';
 
 class SuppliersRepositoryException implements Exception {
   final String message;
@@ -42,8 +43,7 @@ class SuppliersRepository {
       return _db.getSuppliersWithFinancials(pharmacyId);
     }
 
-    await _assertOnlineReadable();
-    final summary = await _api.fetchSuppliersSummary();
+    final summary = await _summary();
     return summary.map(_normalizeSupplierSummaryRow).toList();
   }
 
@@ -55,8 +55,7 @@ class SuppliersRepository {
       return _db.getTotalSuppliersDebt(pharmacyId);
     }
 
-    await _assertOnlineReadable();
-    final summary = await _api.fetchSuppliersSummary();
+    final summary = await _summary();
     return summary.fold<double>(
       0.0,
       (sum, row) => sum + _numOf(row['remaining_debt']),
@@ -71,8 +70,7 @@ class SuppliersRepository {
       return _db.getTopSupplier(pharmacyId);
     }
 
-    await _assertOnlineReadable();
-    final summary = await _api.fetchSuppliersSummary();
+    final summary = await _summary();
     final withPurchases =
         summary.where((row) => (row['invoice_count'] as num? ?? 0) > 0).toList();
     if (withPurchases.isEmpty) return null;
@@ -91,8 +89,7 @@ class SuppliersRepository {
       return _db.getPurchaseInvoicesBySupplier(supplierId);
     }
 
-    await _assertOnlineReadable();
-    final invoices = await _api.fetchPurchaseInvoices(supplierId);
+    final invoices = await _read(() => _api.fetchPurchaseInvoices(supplierId));
     return invoices.map(_normalizePurchaseInvoiceRow).toList();
   }
 
@@ -104,8 +101,7 @@ class SuppliersRepository {
       return _db.getSupplierStatementOfAccount(supplierId);
     }
 
-    await _assertOnlineReadable();
-    final rows = await _api.fetchSupplierStatement(supplierId);
+    final rows = await _read(() => _api.fetchSupplierStatement(supplierId));
     return rows.map(_normalizeStatementRow).toList();
   }
 
@@ -212,8 +208,7 @@ class SuppliersRepository {
     if (!isOnlineMode) {
       return (await _db.getPurchaseInvoiceItems(purchaseInvoiceId)).map(_normalizePurchaseItemRow).toList();
     }
-    await _assertOnlineReadable();
-    final rows = await _api.fetchPurchaseInvoiceItems(purchaseInvoiceId);
+    final rows = await _read(() => _api.fetchPurchaseInvoiceItems(purchaseInvoiceId));
     return rows.map(_normalizePurchaseItemRow).toList();
   }
 
@@ -225,8 +220,7 @@ class SuppliersRepository {
     if (!isOnlineMode) {
       return (await _db.getSupplierPurchasedItems(supplierId)).map(_normalizePurchaseItemRow).toList();
     }
-    await _assertOnlineReadable();
-    final rows = await _api.fetchSupplierPurchasedItems(supplierId);
+    final rows = await _read(() => _api.fetchSupplierPurchasedItems(supplierId));
     return rows.map(_normalizePurchaseItemRow).toList();
   }
 
@@ -346,12 +340,26 @@ class SuppliersRepository {
     }
   }
 
-  Future<void> _assertOnlineReadable() async {
-    if (!await _connectivity.hasConnection()) {
+  /// القراءة تطلب الخادم مباشرة (بلا فحص /health/ مسبق)؛ فشل الشبكة يتحوّل
+  /// لنفس الرسالة الواضحة (لا كاش محلي للمذاخر في وضع الأونلاين).
+  Future<T> _read<T>(Future<T> Function() request) async {
+    try {
+      return await request();
+    } catch (e) {
+      if (!ApiHttp.isNetworkError(e)) rethrow;
       throw const SuppliersRepositoryException(
         'لا يوجد اتصال بالخادم حالياً لعرض بيانات المذاخر في وضع الأونلاين.',
       );
     }
+  }
+
+  Future<List<Map<String, dynamic>>>? _summaryInFlight;
+
+  /// شاشة المذاخر تطلب القائمة والدين الكلي وأعلى مذخر معاً: طلب
+  /// suppliers/summary/ واحد مشترك بينها بدل ثلاثة متطابقة.
+  Future<List<Map<String, dynamic>>> _summary() {
+    return _summaryInFlight ??=
+        _read(_api.fetchSuppliersSummary).whenComplete(() => _summaryInFlight = null);
   }
 
   /// حقول Decimal في Django تصل كنص JSON (مثلاً "1500.00") لا كرقم، بخلاف

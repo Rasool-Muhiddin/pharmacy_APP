@@ -1,5 +1,6 @@
 import json
 
+from django.conf import settings
 from django.contrib.auth import authenticate
 from django.db import transaction
 from django.http import JsonResponse
@@ -55,7 +56,7 @@ def license_payload(license):
 
 @require_GET
 def health(request):
-    return JsonResponse({"ok": True, "service": "tera-desktop-backend"})
+    return JsonResponse({"ok": True, "service": "tera-desktop-backend", "api_version": settings.API_VERSION})
 
 
 @ratelimit(key="ip", rate="20/m", method="POST", block=False)
@@ -151,4 +152,4 @@ def desktop_latest_version(request):
     latest = DesktopAppVersion.objects.first()
     if latest is None:
         return error("لا توجد بيانات إصدار متاحة.", 404)
-    return JsonResponse({"ok": True, "version": latest.version, "download_url": latest.download_url, "release_notes": latest.release_notes, "is_mandatory": latest.is_mandatory})
+    return JsonResponse({"ok": True, "version": latest.version, "download_url": latest.download_url, "release_notes": latest.release_notes, "is_mandatory": latest.is_mandatory, "api_version": settings.API_VERSION})

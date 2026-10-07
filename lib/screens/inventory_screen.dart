@@ -67,7 +67,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
   /// المخازن أولاً (لتحديد المخزن المختار)، ثم أصناف ذلك المخزن.
   Future<void> _refreshAll() async {
     await _loadWarehouses();
-    await _loadMedicines();
+    await _loadMedicines(warehousesFresh: true);
   }
 
   @override
@@ -102,7 +102,8 @@ class _InventoryScreenState extends State<InventoryScreen> {
   String _friendlyWriteErrorMessage(Object error) => friendlyWriteErrorMessage(error);
 
   // --- تحميل أدوية المخزن الحالية من قاعدة البيانات ---
-  Future<void> _loadMedicines() async {
+  /// [warehousesFresh]: _loadWarehouses زامن المخازن للتو، فلا داعي لطلبها مرة ثانية.
+  Future<void> _loadMedicines({bool warehousesFresh = false}) async {
     setState(() => _isLoading = true);
     try {
       final query = _searchController.text.trim();
@@ -112,6 +113,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
         data = await MedicineRepository.instance.getMedicines(
           pharmacyId: widget.pharmacyId,
           isOnlineMode: widget.isOnlineMode,
+          syncWarehouses: !warehousesFresh,
         );
       } else {
         // البحث يبقى محلياً دائماً (على الكاش المتزامن آخر مرة)، بلا فرق
@@ -505,7 +507,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
                           );
                           if (ctx.mounted && Navigator.canPop(ctx)) Navigator.pop(ctx);
                           await _loadWarehouses();
-                          await _loadMedicines();
+                          await _loadMedicines(warehousesFresh: true);
                           if (mounted) {
                             _showSnackBar(
                               'تم نقل $qty من ${selectedMedicine!['trade_name']} إلى ${_warehouseName(destWarehouseId)}',

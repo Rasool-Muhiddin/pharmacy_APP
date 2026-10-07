@@ -1,22 +1,15 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class SuppliersApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class SuppliersApiException extends ApiHttpException {
   /// رقم السطر المرفوض في قائمة المذخر (من 0)، إن أرسله الخادم.
   final int? line;
 
   const SuppliersApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
     this.line,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يغلّف جميع طلبات المذاخر وفواتير الشراء (/api/suppliers/,
@@ -27,10 +20,7 @@ class SuppliersApiService {
 
   static final SuppliersApiService instance = SuppliersApiService._();
 
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -144,81 +134,33 @@ class SuppliersApiService {
 
   // ================== طبقة النقل المشتركة (نفس نمط MedicineApiService) ==================
 
-  void _applyAuthHeader(HttpClientRequest request) {
+  Future<ApiHttpResponse> _request(String method, String url, {Map<String, dynamic>? body}) async {
     final token = _token;
     if (token == null || token.isEmpty) {
       throw const SuppliersApiException('لم يتم تسجيل الدخول بعد.');
     }
-    request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
+    try {
+      return await ApiHttp.request(method, url, token: token, body: body);
+    } on ApiHttpException catch (e) {
+      throw SuppliersApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
+    }
   }
 
   Future<void> _delete({required String url}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.deleteUrl(Uri.parse(url)).timeout(const Duration(seconds: 25));
-      _applyAuthHeader(request);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      await utf8.decoder.bind(response).join();
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw SuppliersApiException('تعذر تنفيذ عملية الحذف.', statusCode: response.statusCode);
-      }
-    } on TimeoutException {
-      throw const SuppliersApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const SuppliersApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const SuppliersApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
+    final response = await _request('DELETE', url);
+    if (!response.isSuccess) {
+      throw SuppliersApiException('تعذر تنفيذ عملية الحذف.', statusCode: response.statusCode);
     }
   }
 
   Future<Map<String, dynamic>> _get({required String url}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 25));
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      return _parseMapResponse(response, await utf8.decoder.bind(response).join());
-    } on TimeoutException {
-      throw const SuppliersApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const SuppliersApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const SuppliersApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseMapResponse(await _request('GET', url));
   }
 
   /// لطلبات ترجع قائمة خامة غير مُرقَّمة (summary، statement) بدل
   /// {"results": [...], "next": ...}.
   Future<List<Map<String, dynamic>>> _getList({required String url}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 25));
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final text = await utf8.decoder.bind(response).join();
-      return _parseListResponse(response, text);
-    } on TimeoutException {
-      throw const SuppliersApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const SuppliersApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const SuppliersApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseListResponse(await _request('GET', url));
   }
 
   Future<Map<String, dynamic>> _send({
@@ -226,46 +168,17 @@ class SuppliersApiService {
     required String url,
     required Map<String, dynamic> body,
   }) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.openUrl(method, Uri.parse(url)).timeout(const Duration(seconds: 25));
-
-      _applyAuthHeader(request);
-      request.headers.contentType = ContentType.json;
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final bodyBytes = utf8.encode(jsonEncode(body));
-      request.contentLength = bodyBytes.length;
-      request.add(bodyBytes);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final responseText = await utf8.decoder.bind(response).join();
-      return _parseMapResponse(response, responseText);
-    } on TimeoutException {
-      throw const SuppliersApiException('انتهت مهلة الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.');
-    } on SocketException {
-      throw const SuppliersApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const SuppliersApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseMapResponse(await _request(method, url, body: body));
   }
 
-  dynamic _decodeOrThrow(HttpClientResponse response, String responseText) {
-    dynamic decoded;
-    try {
-      decoded = responseText.isEmpty ? null : jsonDecode(responseText);
-    } catch (_) {
-      throw SuppliersApiException('استجابة غير صالحة من الخادم.', statusCode: response.statusCode);
-    }
+  dynamic _decodeOrThrow(ApiHttpResponse response) {
+    final decoded = response.json;
 
     if (response.statusCode == 401) {
       throw const SuppliersApiException('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً.', statusCode: 401);
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+    if (!response.isSuccess) {
       throw SuppliersApiException(
         _extractErrorMessage(decoded),
         statusCode: response.statusCode,
@@ -276,16 +189,16 @@ class SuppliersApiService {
     return decoded;
   }
 
-  Map<String, dynamic> _parseMapResponse(HttpClientResponse response, String responseText) {
-    final decoded = _decodeOrThrow(response, responseText) ?? <String, dynamic>{};
+  Map<String, dynamic> _parseMapResponse(ApiHttpResponse response) {
+    final decoded = _decodeOrThrow(response) ?? <String, dynamic>{};
     if (decoded is! Map<String, dynamic>) {
       throw SuppliersApiException('استجابة غير متوقعة من الخادم.', statusCode: response.statusCode);
     }
     return decoded;
   }
 
-  List<Map<String, dynamic>> _parseListResponse(HttpClientResponse response, String responseText) {
-    final decoded = _decodeOrThrow(response, responseText) ?? <dynamic>[];
+  List<Map<String, dynamic>> _parseListResponse(ApiHttpResponse response) {
+    final decoded = _decodeOrThrow(response) ?? <dynamic>[];
     if (decoded is! List) {
       throw SuppliersApiException('استجابة غير متوقعة من الخادم.', statusCode: response.statusCode);
     }

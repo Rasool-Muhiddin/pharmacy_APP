@@ -1,18 +1,11 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class WarehouseApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class WarehouseApiException extends ApiHttpException {
   const WarehouseApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يغلّف طلبات /api/warehouses/ على الخادم (خاصية تعدد المخازن). الخادم يفرض
@@ -24,10 +17,7 @@ class WarehouseApiService {
 
   static final WarehouseApiService instance = WarehouseApiService._();
 
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -98,56 +88,24 @@ class WarehouseApiService {
     required String url,
     Map<String, dynamic>? body,
   }) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .openUrl(method, Uri.parse(url))
-          .timeout(const Duration(seconds: 25));
-
-      final token = _token;
-      if (token == null || token.isEmpty) {
-        throw const WarehouseApiException('لم يتم تسجيل الدخول بعد.');
-      }
-      request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      if (body != null) {
-        request.headers.contentType = ContentType.json;
-        final bodyBytes = utf8.encode(jsonEncode(body));
-        request.contentLength = bodyBytes.length;
-        request.add(bodyBytes);
-      }
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final text = await utf8.decoder.bind(response).join();
-      return _parseResponse(response.statusCode, text);
-    } on TimeoutException {
-      throw const WarehouseApiException('انتهت مهلة الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.');
-    } on SocketException {
-      throw const WarehouseApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const WarehouseApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
+    final token = _token;
+    if (token == null || token.isEmpty) {
+      throw const WarehouseApiException('لم يتم تسجيل الدخول بعد.');
     }
-  }
-
-  dynamic _parseResponse(int statusCode, String text) {
-    dynamic decoded;
+    final ApiHttpResponse response;
     try {
-      decoded = text.isEmpty ? null : jsonDecode(text);
-    } catch (_) {
-      throw WarehouseApiException('استجابة غير صالحة من الخادم.', statusCode: statusCode);
+      response = await ApiHttp.request(method, url, token: token, body: body);
+    } on ApiHttpException catch (e) {
+      throw WarehouseApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
     }
 
-    if (statusCode == 401) {
+    if (response.statusCode == 401) {
       throw const WarehouseApiException('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً.', statusCode: 401);
     }
-    if (statusCode < 200 || statusCode >= 300) {
-      throw WarehouseApiException(_extractErrorMessage(decoded), statusCode: statusCode);
+    if (!response.isSuccess) {
+      throw WarehouseApiException(_extractErrorMessage(response.json), statusCode: response.statusCode);
     }
-    return decoded;
+    return response.json;
   }
 
   /// أخطاء DRF: {"detail": "..."} أو ["..."] (ValidationError عامة) أو

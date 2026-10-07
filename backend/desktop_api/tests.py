@@ -670,3 +670,26 @@ class OnlinePlanTests(TestCase):
         self.assertFalse(Medicine.objects.filter(pharmacy=self.pharmacy).exists())  # معاملة واحدة
         with self.assertRaises(CommandError):
             self.run_command(self.PAYLOAD, pharmacy_id=99999)
+
+
+class ApiVersionAndTimingTests(TestCase):
+    def test_health_reports_api_version(self):
+        from django.conf import settings
+
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["api_version"], settings.API_VERSION)
+        self.assertNotIn("Server-Timing", response)
+
+    def test_reports_endpoint_exists_without_token(self):
+        # خادم قديم يرجع 404 HTML هنا؛ الحالي يرجع رفض مصادقة JSON.
+        response = self.client.get("/api/reports/kpis/")
+        self.assertIn(response.status_code, (401, 403))
+        self.assertIn("detail", response.json())
+
+    @override_settings(REQUEST_TIMING=True)
+    def test_timing_middleware_logs_duration_and_queries(self):
+        with self.assertLogs("tera.timing", level="INFO") as logs:
+            response = self.client.get("/api/health/")
+        self.assertIn("app;dur=", response["Server-Timing"])
+        self.assertRegex(logs.output[0], r"GET /api/health/ 200 [\d.]+ms db=\d+/")

@@ -2,6 +2,7 @@ import '../database/db_helper.dart';
 import '../models/subscription_plan.dart';
 import '../services/connectivity_service.dart';
 import '../services/warehouse_api_service.dart';
+import '../services/api_http.dart';
 
 class WarehouseRepositoryException implements Exception {
   final String message;
@@ -38,8 +39,11 @@ class WarehouseRepository {
       return _db.getWarehouses(pharmacyId);
     }
 
-    if (await _connectivity.hasConnection()) {
+    try {
       await syncFromServer(pharmacyId);
+    } catch (e) {
+      // بلا اتصال: آخر كاش محفوظ (قراءة فقط).
+      if (!ApiHttp.isNetworkError(e)) rethrow;
     }
     return _db.getWarehouses(pharmacyId, syncedOnly: true);
   }
@@ -64,8 +68,12 @@ class WarehouseRepository {
     final cached = await _db.getMainWarehouseId(pharmacyId, syncedOnly: true);
     if (cached != null) return cached;
 
-    await _assertOnline('لا يوجد اتصال بالخادم حالياً لتحميل بيانات المخازن.');
-    await syncFromServer(pharmacyId);
+    try {
+      await syncFromServer(pharmacyId);
+    } catch (e) {
+      if (!ApiHttp.isNetworkError(e)) rethrow;
+      throw const WarehouseRepositoryException('لا يوجد اتصال بالخادم حالياً لتحميل بيانات المخازن.');
+    }
     final synced = await _db.getMainWarehouseId(pharmacyId, syncedOnly: true);
     if (synced == null) {
       throw const WarehouseRepositoryException('تعذر تحديد المخزن الرئيسي من الخادم.');

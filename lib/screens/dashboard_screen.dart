@@ -53,23 +53,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     setState(() => _isLoading = true);
 
     try {
-      // أونلاين: نُحدّث كاش المخزون والفواتير محلياً من السيرفر أولاً (نفس
-      // مسار MedicineRepository/InvoiceRepository المستخدم في شاشتي المخزون
-      // ونقطة البيع)، فتُبنى كل الأرقام والتنبيهات أدناه على بيانات كل
-      // أجهزة الصيدلية مجتمعة بدل كاش هذا الجهاز وحده. لا يوجد endpoint
-      // تجميع مخصص للداشبورد (خلافاً لـ/api/reports/) لأن كل مؤشراته
-      // مشتقة مباشرة من نفس جدولي medicine/invoice المتوفرين محلياً أصلاً
-      // بعد المزامنة، فلا داعي لتكرار نفس الاستعلامات على السيرفر أيضاً.
-      //
-      // فشل المزامنة (لا اتصال، إلخ) لا يمنع عرض الداشبورد بآخر كاش محلي
-      // متوفر — نفس نمط باقي الشاشات في وضع الأونلاين.
-      if (widget.isOnlineMode) {
+      // أونلاين: كاش المخزون يُحدَّث من السيرفر (التنبيهات تُبنى عليه)،
+      // ومبيعات اليوم تأتي مجمّعة من /api/invoices/stats/ (كل أجهزة
+      // الصيدلية) بدل تنزيل سجل الفواتير كاملاً — الطلبان بالتوازي.
+      // فشل مزامنة المخزون لا يمنع العرض بآخر كاش محلي متوفر.
+      Future<void> syncMedicines() async {
+        if (!widget.isOnlineMode) return;
         try {
           await MedicineRepository.instance.getMedicines(
-            pharmacyId: widget.pharmacyId,
-            isOnlineMode: true,
-          );
-          await InvoiceRepository.instance.getInvoices(
             pharmacyId: widget.pharmacyId,
             isOnlineMode: true,
           );
@@ -78,12 +69,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
       }
 
+      final medicinesSync = syncMedicines();
+      final todayStats = InvoiceRepository.instance.getTodayStats(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+      await medicinesSync;
+      final today = await todayStats;
+
       final db = DatabaseHelper.instance;
 
       // 1. جلب البيانات الإحصائية
       final medicinesCount = await db.medicineCountByPharmacy(widget.pharmacyId);
-      final salesToday = await db.totalSalesToday(widget.pharmacyId);
-      final invoicesToday = await db.todayInvoiceCount(widget.pharmacyId);
+      final salesToday = today.sales;
+      final invoicesToday = today.count;
 
       // 2. جلب قوائم التنبيهات
       // 🆕 90 يوماً: فترة عملية تعطي الصيدلي وقتاً كافياً للتصرف

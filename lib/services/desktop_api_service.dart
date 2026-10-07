@@ -1,18 +1,11 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class DesktopApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class DesktopApiException extends ApiHttpException {
   const DesktopApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
   });
-
-  @override
-  String toString() => message;
 }
 
 class DesktopApiService {
@@ -28,10 +21,7 @@ class DesktopApiService {
   /// متغيراً مختلف الاسم (TERA_API_BASE_URL) لم يكن يُمرَّر عند البناء أبداً،
   /// فكان التفعيل/الدخول يستخدمان صمتاً نفس الرابط الافتراضي المحلي إن لم
   /// يُعرَّف أي من المتغيرين، ما قد يسبب سلوكاً غير متسق بين الشاشات.
-  static const String _apiRootUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _apiRootUrl = ApiHttp.rootUrl;
 
   static const String _baseUrl = '$_apiRootUrl/desktop';
 
@@ -71,134 +61,46 @@ class DesktopApiService {
 
   Future<Map<String, dynamic>> _get({
     required String endpoint,
-  }) async {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .getUrl(Uri.parse('$_baseUrl/$endpoint'))
-          .timeout(const Duration(seconds: 25));
-
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(
-            const Duration(seconds: 30),
-          );
-
-      final responseText = await utf8.decoder.bind(response).join();
-
-      Map<String, dynamic> data;
-
-      try {
-        final decoded = jsonDecode(responseText);
-
-        if (decoded is! Map<String, dynamic>) {
-          throw const FormatException();
-        }
-
-        data = decoded;
-      } catch (_) {
-        throw DesktopApiException(
-          'استجابة غير صالحة من الخادم.',
-          statusCode: response.statusCode,
-        );
-      }
-
-      if (response.statusCode < 200 ||
-          response.statusCode >= 300 ||
-          data['ok'] != true) {
-        throw DesktopApiException(
-          (data['message'] as String?) ?? 'تعذر جلب البيانات.',
-          statusCode: response.statusCode,
-        );
-      }
-
-      return data;
-    } on TimeoutException {
-      throw const DesktopApiException(
-        'انتهت مهلة الاتصال بالخادم.',
-      );
-    } on SocketException {
-      throw const DesktopApiException(
-        'تعذر الاتصال بالإنترنت أو بالخادم.',
-      );
-    } on HandshakeException {
-      throw const DesktopApiException(
-        'تعذر إنشاء اتصال آمن بالخادم.',
-      );
-    } finally {
-      client.close(force: true);
-    }
+  }) {
+    return _request('GET', endpoint, fallbackMessage: 'تعذر جلب البيانات.');
   }
 
   Future<Map<String, dynamic>> _post({
     required String endpoint,
     required Map<String, dynamic> body,
+  }) {
+    return _request('POST', endpoint, body: body, fallbackMessage: 'تعذر إتمام العملية.');
+  }
+
+  /// ردود desktop_api بصيغة {"ok": bool, "message": "..."} (وليس DRF).
+  Future<Map<String, dynamic>> _request(
+    String method,
+    String endpoint, {
+    Map<String, dynamic>? body,
+    required String fallbackMessage,
   }) async {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 20);
-
+    final ApiHttpResponse response;
     try {
-      final request = await client
-          .postUrl(Uri.parse('$_baseUrl/$endpoint'))
-          .timeout(const Duration(seconds: 25));
-
-      request.headers.contentType = ContentType.json;
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-      // يقرأ خادم Django المحلي Content-Length ولا يدعم طلبات chunked في
-      // خادم التطوير. كما أن الإرسال بالبايتات واضح وآمن لخوادم الإنتاج.
-      final bodyBytes = utf8.encode(jsonEncode(body));
-      request.contentLength = bodyBytes.length;
-      request.add(bodyBytes);
-
-      final response = await request.close().timeout(
-            const Duration(seconds: 30),
-          );
-
-      final responseText = await utf8.decoder.bind(response).join();
-
-      Map<String, dynamic> data;
-
-      try {
-        final decoded = jsonDecode(responseText);
-
-        if (decoded is! Map<String, dynamic>) {
-          throw const FormatException();
-        }
-
-        data = decoded;
-      } catch (_) {
-        throw DesktopApiException(
-          'استجابة غير صالحة من الخادم. تأكد من اتصال الإنترنت وحاول لاحقاً.',
-          statusCode: response.statusCode,
-        );
-      }
-
-      if (response.statusCode < 200 ||
-          response.statusCode >= 300 ||
-          data['ok'] != true) {
-        throw DesktopApiException(
-          (data['message'] as String?) ?? 'تعذر إتمام العملية.',
-          statusCode: response.statusCode,
-        );
-      }
-
-      return data;
-    } on TimeoutException {
-      throw const DesktopApiException(
-        'انتهت مهلة الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.',
-      );
-    } on SocketException {
-      throw const DesktopApiException(
-        'تعذر الاتصال بالإنترنت أو بالخادم.',
-      );
-    } on HandshakeException {
-      throw const DesktopApiException(
-        'تعذر إنشاء اتصال آمن بالخادم.',
-      );
-    } finally {
-      client.close(force: true);
+      response = await ApiHttp.request(method, '$_baseUrl/$endpoint', body: body);
+    } on ApiHttpException catch (e) {
+      throw DesktopApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
     }
+
+    final data = response.json;
+    if (data is! Map<String, dynamic>) {
+      throw DesktopApiException(
+        'استجابة غير صالحة من الخادم.',
+        statusCode: response.statusCode,
+      );
+    }
+
+    if (!response.isSuccess || data['ok'] != true) {
+      throw DesktopApiException(
+        (data['message'] as String?) ?? fallbackMessage,
+        statusCode: response.statusCode,
+      );
+    }
+
+    return data;
   }
 }

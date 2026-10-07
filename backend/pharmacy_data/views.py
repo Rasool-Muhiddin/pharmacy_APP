@@ -10,6 +10,7 @@ from django.utils import timezone
 from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.renderers import BaseRenderer
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 
@@ -375,6 +376,14 @@ def _next_invoice_number(pharmacy):
     return f"INV-{candidate:06d}"
 
 
+class InvoicePagination(PageNumberPagination):
+    """100 افتراضياً (كالسابق)؛ سجل المبيعات ونقطة البيع يطلبان صفحات أصغر."""
+
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
 class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
     """
     قراءة فقط لسجل المبيعات وتفاصيله (list/retrieve). لا يوجد create/update/
@@ -388,15 +397,73 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
     # الوضع الأوفلاين وشاشتي نقطة البيع وسجل المبيعات.
     permission_classes = [IsActiveOnlineMember]
 
+    pagination_class = InvoicePagination
+
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)
         if membership is None:
             return Invoice.objects.none()
-        return (
+        # select_related("cashier"): cashier_display_name كان يطلب المستخدم
+        # باستعلام لكل فاتورة (N+1 = 100 استعلام لكل صفحة).
+        qs = (
             Invoice.objects.filter(pharmacy=membership.pharmacy)
+            .select_related("cashier")
             .prefetch_related("items")
-            .order_by("-created_at")
+            .order_by("-created_at", "-id")
         )
+        if self.action == "list":
+            qs = self._filter_list(qs)
+        return qs
+
+    def _filter_list(self, qs):
+        """
+        فلاتر سجل المبيعات على الخادم: ?search= (رقم الفاتورة أو اسم البائع)
+        و?start=/&end= (YYYY-MM-DD، أيام محلية شاملة). الترقيم ?page=&page_size=.
+        """
+        params = self.request.query_params
+        search = params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(invoice_number__icontains=search)
+                | Q(cashier_name__icontains=search)
+                | Q(cashier__username__icontains=search)
+                | Q(cashier__first_name__icontains=search)
+                | Q(cashier__last_name__icontains=search)
+            )
+        try:
+            start = date.fromisoformat(params["start"]) if params.get("start") else None
+            end = date.fromisoformat(params["end"]) if params.get("end") else None
+        except ValueError:
+            raise ValidationError("صيغة التاريخ غير صحيحة، استخدم YYYY-MM-DD.")
+        if start:
+            qs = qs.filter(created_at__gte=reports.day_bounds(start, start)[0])
+        if end:
+            qs = qs.filter(created_at__lt=reports.day_bounds(end, end)[1])
+        return qs
+
+    @action(detail=False, methods=["get"])
+    def stats(self, request):
+        """
+        GET /api/invoices/stats/?start=&end= (الافتراضي: اليوم) — مبيعات الفترة
+        (صافي غير المسترجعة) وعدد فواتيرها، لبطاقات الشاشة الرئيسية. متاح
+        للموظف أيضاً (أقسام /api/reports/ للمالك فقط).
+        """
+        membership = self._membership()
+        today = reports.today()
+        try:
+            start = date.fromisoformat(request.query_params.get("start") or today.isoformat())
+            end = date.fromisoformat(request.query_params.get("end") or today.isoformat())
+        except ValueError:
+            raise ValidationError("صيغة التاريخ غير صحيحة، استخدم YYYY-MM-DD.")
+        figures = reports.period_invoices(membership.pharmacy, start, end).aggregate(
+            sales_total=Sum("final_amount"), invoices_count=Count("id")
+        )
+        return Response({
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "sales_total": reports.money(figures["sales_total"]),
+            "invoices_count": figures["invoices_count"],
+        })
 
     def _membership(self):
         membership = getattr(self.request.user, "pharmacymembership", None)

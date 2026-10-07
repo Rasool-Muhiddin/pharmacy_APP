@@ -4,6 +4,7 @@ import '../services/connectivity_service.dart';
 import '../services/damaged_api_service.dart';
 import '../services/medicine_api_service.dart';
 import 'warehouse_repository.dart';
+import '../services/api_http.dart';
 
 class MedicineRepositoryException implements Exception {
   final String message;
@@ -32,28 +33,32 @@ class MedicineRepository {
   final DamagedApiService _damagedApi = DamagedApiService.instance;
   final ConnectivityService _connectivity = ConnectivityService.instance;
 
+  /// [syncWarehouses] = false عندما زامن المستدعي المخازن للتو (شاشة المخزون).
   Future<List<Map<String, dynamic>>> getMedicines({
     required int pharmacyId,
     required bool isOnlineMode,
+    bool syncWarehouses = true,
   }) async {
     if (!isOnlineMode) {
       return _db.getMedicines(pharmacyId);
     }
 
-    if (!await _connectivity.hasConnection()) {
-      // بلا اتصال فعلي الآن: نعرض آخر نسخة مزامَنة محفوظة في الكاش المحلي
-      // بدل شاشة فارغة، لكن هذا القراءة فقط — الكتابة تبقى ممنوعة (انظر
-      // addMedicine/updateMedicine/deleteMedicine أدناه).
-      return _db.getMedicines(pharmacyId);
+    try {
+      // المخازن أولاً: كل صف دواء يشير لمخزنه بقيد FOREIGN KEY.
+      if (syncWarehouses) {
+        await WarehouseRepository.instance.syncFromServer(pharmacyId);
+      }
+      final serverItems = await _api.fetchMedicines();
+      await _db.replaceMedicinesCache(
+        pharmacyId: pharmacyId,
+        serverItems: serverItems,
+      );
+    } catch (e) {
+      // بلا اتصال فعلي الآن (لا فحص /health/ مسبق للقراءة): نعرض آخر نسخة
+      // مزامَنة محفوظة في الكاش المحلي بدل شاشة فارغة، لكن هذا القراءة فقط —
+      // الكتابة تبقى ممنوعة (انظر addMedicine/updateMedicine/deleteMedicine).
+      if (!ApiHttp.isNetworkError(e)) rethrow;
     }
-
-    // المخازن أولاً: كل صف دواء يشير لمخزنه بقيد FOREIGN KEY.
-    await WarehouseRepository.instance.syncFromServer(pharmacyId);
-    final serverItems = await _api.fetchMedicines();
-    await _db.replaceMedicinesCache(
-      pharmacyId: pharmacyId,
-      serverItems: serverItems,
-    );
     return _db.getMedicines(pharmacyId);
   }
 

@@ -2,17 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-class MigrationApiException implements Exception {
-  final String message;
-  final int? statusCode;
+import 'api_http.dart';
 
+class MigrationApiException extends ApiHttpException {
   const MigrationApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يستهلك /api/migration/status/ و/api/migration/upload_offline_data/.
@@ -26,10 +23,7 @@ class MigrationApiService {
 
   static final MigrationApiService instance = MigrationApiService._();
 
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -48,25 +42,28 @@ class MigrationApiService {
   }
 
   Future<Map<String, dynamic>> checkStatus() async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-    try {
-      final request = await client
-          .getUrl(Uri.parse('$_baseUrl/migration/status/'))
-          .timeout(const Duration(seconds: 25));
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final text = await utf8.decoder.bind(response).join();
-      return _parseSimpleJsonResponse(response, text);
-    } on TimeoutException {
-      throw const MigrationApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const MigrationApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const MigrationApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
+    final token = _token;
+    if (token == null || token.isEmpty) {
+      throw const MigrationApiException('لم يتم تسجيل الدخول بعد.');
     }
+    final ApiHttpResponse response;
+    try {
+      response = await ApiHttp.request('GET', '$_baseUrl/migration/status/', token: token);
+    } on ApiHttpException catch (e) {
+      throw MigrationApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
+    }
+
+    if (response.statusCode == 401) {
+      throw const MigrationApiException('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً.', statusCode: 401);
+    }
+    if (!response.isSuccess) {
+      throw MigrationApiException(_extractPreStreamError(response.json), statusCode: response.statusCode);
+    }
+    final decoded = response.json ?? <String, dynamic>{};
+    if (decoded is! Map<String, dynamic>) {
+      throw MigrationApiException('استجابة غير متوقعة من الخادم.', statusCode: response.statusCode);
+    }
+    return decoded;
   }
 
   /// يرفع كل الحمولة ويستهلك الاستجابة المتدفقة سطراً بسطر، مستدعياً
@@ -105,7 +102,14 @@ class MigrationApiService {
 
       if (response.statusCode != 200) {
         final text = await utf8.decoder.bind(response).join();
-        throw MigrationApiException(_extractPreStreamError(text), statusCode: response.statusCode);
+        final url = '$_baseUrl/migration/upload_offline_data/';
+        final String message;
+        try {
+          message = _extractPreStreamError(ApiHttp.decodeJson(response.statusCode, text, url));
+        } on ApiHttpException catch (e) {
+          throw MigrationApiException(e.message, statusCode: response.statusCode);
+        }
+        throw MigrationApiException(message, statusCode: response.statusCode);
       }
 
       Map<String, dynamic>? summary;
@@ -179,33 +183,7 @@ class MigrationApiService {
     request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
   }
 
-  Map<String, dynamic> _parseSimpleJsonResponse(HttpClientResponse response, String text) {
-    dynamic decoded;
-    try {
-      decoded = text.isEmpty ? <String, dynamic>{} : jsonDecode(text);
-    } catch (_) {
-      throw MigrationApiException('استجابة غير صالحة من الخادم.', statusCode: response.statusCode);
-    }
-
-    if (response.statusCode == 401) {
-      throw const MigrationApiException('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً.', statusCode: 401);
-    }
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw MigrationApiException(_extractPreStreamError(text), statusCode: response.statusCode);
-    }
-    if (decoded is! Map<String, dynamic>) {
-      throw MigrationApiException('استجابة غير متوقعة من الخادم.', statusCode: response.statusCode);
-    }
-    return decoded;
-  }
-
-  String _extractPreStreamError(String text) {
-    dynamic decoded;
-    try {
-      decoded = text.isEmpty ? null : jsonDecode(text);
-    } catch (_) {
-      return 'تعذر إتمام عملية الرفع.';
-    }
+  String _extractPreStreamError(dynamic decoded) {
     if (decoded is List && decoded.isNotEmpty) {
       return decoded.first.toString();
     }

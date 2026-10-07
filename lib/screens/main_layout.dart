@@ -18,6 +18,7 @@ import '../screens/reports_screen.dart';
 import '../screens/missing_suppliers.dart';
 import '../screens/expenses_screen.dart';
 import '../screens/offline_migration_screen.dart';
+import '../services/connectivity_service.dart';
 import '../services/migration_api_service.dart';
 import '../models/subscription_plan.dart';
 import '../widgets/unsaved_changes_guard.dart';
@@ -95,6 +96,10 @@ class _MainLayoutState extends State<MainLayout> {
     DatabaseHelper.instance.setSessionMode(isOnline: widget.isOnlineMode);
     _loadPharmacyData(); // 👈 جلب بيانات الصيدلية عند فتح الشاشة
     _maybeSuggestOfflineMigration();
+    // فحص /health/ واحد عند الدخول: يحذّر في السجل إن كان الخادم أقدم من
+    // التطبيق (api_version)، ويملأ كاش الاتصال لأول عملية كتابة. القراءة لا
+    // تنتظره ولا تستدعيه.
+    if (widget.isOnlineMode) ConnectivityService.instance.hasConnection();
   }
 
   /// نقطة 5: يُسأل المالك مرة كل دخول أونلاين (طالما لم يرفع بعد) عن رفع

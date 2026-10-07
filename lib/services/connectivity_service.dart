@@ -1,6 +1,6 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'package:flutter/foundation.dart';
+
+import 'api_http.dart';
 
 /// يتحقق من إمكانية الوصول الفعلي للخادم (وليس فقط وجود شبكة محلية)،
 /// عبر استدعاء خفيف لـ /api/health/. هذا مهم لأن جهازاً قد يكون
@@ -25,38 +25,65 @@ class ConnectivityService {
   /// فعلاً تحت /api/desktop/. لذلك رابط الفحص هنا يُبنى من _apiRootUrl
   /// مباشرة بلا إضافة '/desktop' — إضافتها سابقاً كانت تنتج رابطاً غير
   /// موجود (404) فتفشل hasConnection() دائماً حتى مع خادم يعمل بشكل صحيح.
-  static const String _apiRootUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _apiRootUrl = ApiHttp.rootUrl;
 
+  /// نتيجة الفحص تُحفظ 30 ثانية (الناجحة) أو 5 ثوانٍ (الفاشلة) كي لا يسبق
+  /// /health/ كل طلب. أي رد من الخادم يجدّدها ([markReachable])، وأي فشل
+  /// شبكة يلغيها فوراً ([invalidate]) — كلاهما من ApiHttp تلقائياً.
+  static const Duration onlineTtl = Duration(seconds: 30);
+  static const Duration offlineTtl = Duration(seconds: 5);
+
+  bool? _lastResult;
+  DateTime? _checkedAt;
+  Future<bool>? _inFlight;
+
+  /// للكتابة فقط (منع التعديل بلا خادم). القراءة تطلب البيانات مباشرة
+  /// وترجع للكاش المحلي عند فشل الشبكة.
   Future<bool> hasConnection({
     Duration timeout = const Duration(seconds: 5),
-  }) async {
-    final client = HttpClient()..connectionTimeout = timeout;
+  }) {
+    final last = _lastResult;
+    final checkedAt = _checkedAt;
+    if (last != null && checkedAt != null &&
+        DateTime.now().difference(checkedAt) < (last ? onlineTtl : offlineTtl)) {
+      return Future.value(last);
+    }
+    // فحوص متزامنة (عدة شاشات/أقسام) تتشارك طلباً واحداً.
+    return _inFlight ??= _probe(timeout).whenComplete(() => _inFlight = null);
+  }
 
+  void markReachable() => _remember(true);
+
+  /// للاختبارات: هل توجد نتيجة فحص محفوظة الآن.
+  @visibleForTesting
+  bool get hasCachedResult => _checkedAt != null;
+
+  void invalidate() {
+    _lastResult = null;
+    _checkedAt = null;
+  }
+
+  void _remember(bool result) {
+    _lastResult = result;
+    _checkedAt = DateTime.now();
+  }
+
+  Future<bool> _probe(Duration timeout) async {
     try {
-      final request = await client
-          .getUrl(Uri.parse('$_apiRootUrl/health/'))
-          .timeout(timeout);
-
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(timeout);
-      final responseText = await utf8.decoder.bind(response).join();
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
+      final response = await ApiHttp.request('GET', '$_apiRootUrl/health/', timeout: timeout);
+      final decoded = response.json;
+      if (!response.isSuccess || decoded is! Map<String, dynamic> || decoded['ok'] != true) {
+        _remember(false);
         return false;
       }
-
-      final decoded = jsonDecode(responseText);
-      return decoded is Map<String, dynamic> && decoded['ok'] == true;
+      ApiHttp.checkServerApiVersion(decoded);
+      _remember(true);
+      return true;
     } catch (_) {
-      // أي فشل (SocketException، TimeoutException، خطأ TLS، رد غير متوقع...)
-      // يعني ببساطة أن الخادم غير متاح الآن؛ لا داعي لتمييز نوع الفشل هنا.
+      // أي فشل (شبكة، مهلة، TLS، رد غير متوقع...) يعني ببساطة أن الخادم غير
+      // متاح الآن؛ لا داعي لتمييز نوع الفشل هنا.
+      _remember(false);
       return false;
-    } finally {
-      client.close(force: true);
     }
   }
 }

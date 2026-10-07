@@ -1,22 +1,15 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class MedicineApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class MedicineApiException extends ApiHttpException {
   /// رقم السطر المرفوض في قائمة الرصيد الافتتاحي (من 0)، إن أرسله الخادم.
   final int? line;
 
   const MedicineApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
     this.line,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يغلّف جميع طلبات جدول المخزون (/api/medicines/) على الخادم.
@@ -32,10 +25,7 @@ class MedicineApiService {
   /// الفواتير...) تعيش تحت /api/ مباشرة، لا تحت /api/desktop/.
   /// مثال بناء نسخة الإنتاج:
   /// --dart-define=TERA_API_ROOT_URL=https://pharmacy-api.tera-software1.com/api
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -88,65 +78,29 @@ class MedicineApiService {
   }
 
   Future<void> deleteMedicine(int id) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .deleteUrl(Uri.parse('$_baseUrl/medicines/$id/'))
-          .timeout(const Duration(seconds: 25));
-
-      _applyAuthHeader(request);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      await utf8.decoder.bind(response).join();
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw MedicineApiException(
-          'تعذر حذف الدواء.',
-          statusCode: response.statusCode,
-        );
-      }
-    } on TimeoutException {
-      throw const MedicineApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const MedicineApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const MedicineApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
+    final response = await _request('DELETE', '$_baseUrl/medicines/$id/');
+    if (!response.isSuccess) {
+      throw MedicineApiException(
+        'تعذر حذف الدواء.',
+        statusCode: response.statusCode,
+      );
     }
   }
 
-  void _applyAuthHeader(HttpClientRequest request) {
+  Future<ApiHttpResponse> _request(String method, String url, {Map<String, dynamic>? body}) async {
     final token = _token;
     if (token == null || token.isEmpty) {
       throw const MedicineApiException('لم يتم تسجيل الدخول بعد.');
     }
-    request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
+    try {
+      return await ApiHttp.request(method, url, token: token, body: body);
+    } on ApiHttpException catch (e) {
+      throw MedicineApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
+    }
   }
 
   Future<Map<String, dynamic>> _get({required String url}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.getUrl(Uri.parse(url)).timeout(
-            const Duration(seconds: 25),
-          );
-
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      return _parseResponse(response, await utf8.decoder.bind(response).join());
-    } on TimeoutException {
-      throw const MedicineApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const MedicineApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const MedicineApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseResponse(await _request('GET', url));
   }
 
   Future<Map<String, dynamic>> _send({
@@ -154,50 +108,11 @@ class MedicineApiService {
     required String url,
     required Map<String, dynamic> body,
   }) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .openUrl(method, Uri.parse(url))
-          .timeout(const Duration(seconds: 25));
-
-      _applyAuthHeader(request);
-      request.headers.contentType = ContentType.json;
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final bodyBytes = utf8.encode(jsonEncode(body));
-      request.contentLength = bodyBytes.length;
-      request.add(bodyBytes);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final responseText = await utf8.decoder.bind(response).join();
-      return _parseResponse(response, responseText);
-    } on TimeoutException {
-      throw const MedicineApiException(
-        'انتهت مهلة الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.',
-      );
-    } on SocketException {
-      throw const MedicineApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const MedicineApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseResponse(await _request(method, url, body: body));
   }
 
-  Map<String, dynamic> _parseResponse(
-    HttpClientResponse response,
-    String responseText,
-  ) {
-    dynamic decoded;
-    try {
-      decoded = responseText.isEmpty ? <String, dynamic>{} : jsonDecode(responseText);
-    } catch (_) {
-      throw MedicineApiException(
-        'استجابة غير صالحة من الخادم.',
-        statusCode: response.statusCode,
-      );
-    }
+  Map<String, dynamic> _parseResponse(ApiHttpResponse response) {
+    final decoded = response.json ?? <String, dynamic>{};
 
     if (response.statusCode == 401) {
       throw const MedicineApiException(
@@ -206,7 +121,7 @@ class MedicineApiService {
       );
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+    if (!response.isSuccess) {
       throw MedicineApiException(
         _extractErrorMessage(decoded),
         statusCode: response.statusCode,

@@ -92,6 +92,17 @@ class _PosScreenState extends State<PosScreen> {
     if (!mounted) return;
     setState(() => _isLoading = true);
 
+    // لوحة "سجل الفواتير الأخيرة" تحتاج صفحة واحدة صغيرة فقط (لا السجل
+    // كاملاً)؛ تُطلب بالتوازي مع مزامنة المخزون. الخطأ يُحفظ ويُرمى بعد
+    // انتظارها كي لا يبقى Future فاشل بلا معالجة.
+    Object? recentError;
+    final recentFuture = InvoiceRepository.instance
+        .getRecentInvoices(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode)
+        .catchError((Object e) {
+      recentError = e;
+      return <Map<String, dynamic>>[];
+    });
+
     try {
       // أونلاين: نحدّث كاش المخازن والمخزون من الخادم أولاً (إن توفر اتصال)
       // كي تعكس الشاشة الكميات الحالية من كل الأجهزة؛ الفشل لا يمنع البيع
@@ -114,10 +125,8 @@ class _PosScreenState extends State<PosScreen> {
         widget.pharmacyId,
         warehouseId: _mainWarehouseId,
       );
-      final invoices = await InvoiceRepository.instance.getInvoices(
-        pharmacyId: widget.pharmacyId,
-        isOnlineMode: widget.isOnlineMode,
-      );
+      final invoices = await recentFuture;
+      if (recentError != null) throw recentError!;
       if (!mounted) return;
       setState(() {
         // فلترة الأدوية: غير تالفة + لها كمية في دفعات غير منتهية الصلاحية

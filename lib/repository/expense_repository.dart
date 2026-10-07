@@ -1,6 +1,7 @@
 import '../database/db_helper.dart';
 import '../services/connectivity_service.dart';
 import '../services/expense_api_service.dart';
+import '../services/api_http.dart';
 
 class ExpenseRepositoryException implements Exception {
   final String message;
@@ -40,12 +41,16 @@ class ExpenseRepository {
     String? endDate,
     String? expenseType,
   }) async {
-    if (isOnlineMode && await _connectivity.hasConnection()) {
-      final serverItems = await _api.fetchExpenses();
-      await _db.replaceExpensesCache(
-        pharmacyId: pharmacyId,
-        serverItems: serverItems,
-      );
+    if (isOnlineMode) {
+      try {
+        final serverItems = await _api.fetchExpenses();
+        await _db.replaceExpensesCache(
+          pharmacyId: pharmacyId,
+          serverItems: serverItems,
+        );
+      } catch (e) {
+        if (!ApiHttp.isNetworkError(e)) rethrow;
+      }
     }
     // أوفلاين، أو أونلاين بلا اتصال فعلي الآن: نعرض آخر نسخة محفوظة محلياً
     // (قراءة فقط) بدل شاشة فارغة — الكتابة تبقى ممنوعة (انظر addExpense/

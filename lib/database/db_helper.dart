@@ -2141,6 +2141,53 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   // Invoice CRUD
   //====================================================
 
+  /// فواتير مع اسم البائع (محلي، أو cashier_name_synced لفواتير الخادم)،
+  /// الأحدث أولاً. [ids] = صفوف صفحة جاءت من الخادم للتو؛ وإلا فلاتر وترقيم
+  /// محليان. [start]/[end] = YYYY-MM-DD شاملة بتاريخ الفاتورة المحلي (أول 10
+  /// أحرف من created_at، لا DATE() التي تحوّل الإزاحة الزمنية إلى UTC).
+  Future<List<Map<String, dynamic>>> queryInvoices(
+    int pharmacyId, {
+    List<int>? ids,
+    String search = '',
+    String? start,
+    String? end,
+    int? limit,
+    int offset = 0,
+  }) async {
+    final db = await database;
+    final clauses = <String>['i.pharmacy_id = ?', originFilter('i.')];
+    final args = <Object?>[pharmacyId];
+    if (ids != null) {
+      if (ids.isEmpty) return [];
+      clauses.add('i.id IN (${List.filled(ids.length, '?').join(',')})');
+      args.addAll(ids);
+    }
+    if (search.isNotEmpty) {
+      clauses.add("(i.invoice_number LIKE ? OR COALESCE(u.full_name, u.username, i.cashier_name_synced, '') LIKE ?)");
+      args.addAll(['%$search%', '%$search%']);
+    }
+    if (start != null) {
+      clauses.add('substr(i.created_at, 1, 10) >= ?');
+      args.add(start);
+    }
+    if (end != null) {
+      clauses.add('substr(i.created_at, 1, 10) <= ?');
+      args.add(end);
+    }
+    final page = limit != null ? 'LIMIT $limit OFFSET $offset' : '';
+    return db.rawQuery('''
+      SELECT
+        i.*,
+        COALESCE(u.full_name, u.username, i.cashier_name_synced, 'غير محدد') AS cashier_name
+      FROM invoice i
+      LEFT JOIN user_profile up ON i.cashier_id = up.id
+      LEFT JOIN users u ON up.user_id = u.id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY i.created_at DESC, i.id DESC
+      $page
+    ''', args);
+  }
+
   // جلب جميع فواتير الصيدلية
   Future<List<Map<String, dynamic>>> getInvoices(int pharmacyId) async {
     final db = await database;

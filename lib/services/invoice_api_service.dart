@@ -1,18 +1,11 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'api_http.dart';
 
-class InvoiceApiException implements Exception {
-  final String message;
-  final int? statusCode;
-
+class InvoiceApiException extends ApiHttpException {
   const InvoiceApiException(
-    this.message, {
-    this.statusCode,
+    super.message, {
+    super.statusCode,
+    super.isNetworkError,
   });
-
-  @override
-  String toString() => message;
 }
 
 /// يغلّف جميع طلبات الفواتير (/api/invoices/) على الخادم. لا تُنشأ الفواتير
@@ -29,10 +22,7 @@ class InvoiceApiService {
   /// نفس رابط جذر API العام المستخدم في MedicineApiService
   /// (TERA_API_ROOT_URL)، لأن endpoints بيانات الصيدلية كلها (المخزون،
   /// الفواتير...) تعيش تحت /api/ مباشرة.
-  static const String _baseUrl = String.fromEnvironment(
-    'TERA_API_ROOT_URL',
-    defaultValue: 'http://127.0.0.1:8000/api',
-  );
+  static const String _baseUrl = ApiHttp.rootUrl;
 
   String? _token;
 
@@ -40,28 +30,29 @@ class InvoiceApiService {
     _token = token;
   }
 
-  Future<List<Map<String, dynamic>>> fetchInvoices() async {
-    final results = <Map<String, dynamic>>[];
-    String? nextUrl = '$_baseUrl/invoices/';
-
-    // /api/invoices/ مُرقَّم بالصفحات مثل /api/medicines/ تماماً، فنتابع
-    // "next" حتى تُستنفد كل الصفحات لضمان جلب كامل سجل المبيعات دفعة واحدة.
-    while (nextUrl != null) {
-      final page = await _get(url: nextUrl);
-      final pageResults = page['results'];
-
-      if (pageResults is List) {
-        results.addAll(pageResults.whereType<Map<String, dynamic>>());
-      } else {
-        // رد غير مرقّم (احتياط لو عُطّل pagination مستقبلاً على الخادم).
-        break;
-      }
-
-      nextUrl = page['next'] as String?;
-    }
-
-    return results;
+  /// صفحة واحدة من سجل المبيعات (الأحدث أولاً) مع فلاتر الخادم:
+  /// {"count", "next", "previous", "results": [...]}. لا يُجلب السجل كاملاً
+  /// أبداً — قد يكون آلاف الفواتير.
+  Future<Map<String, dynamic>> fetchInvoicesPage({
+    int page = 1,
+    int pageSize = 50,
+    String search = '',
+    String? start,
+    String? end,
+  }) {
+    final uri = Uri.parse('$_baseUrl/invoices/').replace(queryParameters: {
+      'page': '$page',
+      'page_size': '$pageSize',
+      if (search.isNotEmpty) 'search': search,
+      if (start != null) 'start': start,
+      if (end != null) 'end': end,
+    });
+    return _get(url: uri.toString());
   }
+
+  /// GET /api/invoices/stats/ — مبيعات اليوم (صافي غير المسترجعة) وعدد
+  /// فواتيره: {"sales_total", "invoices_count"}. متاح للموظف أيضاً.
+  Future<Map<String, dynamic>> fetchTodayStats() => _get(url: '$_baseUrl/invoices/stats/');
 
   /// GET /api/invoices/{id}/ — فاتورة واحدة بأصنافها (نافذة تفاصيل الفاتورة في
   /// التقارير أونلاين، بدل مزامنة كل سجل المبيعات محلياً).
@@ -94,36 +85,20 @@ class InvoiceApiService {
     );
   }
 
-  void _applyAuthHeader(HttpClientRequest request) {
+  Future<ApiHttpResponse> _request(String method, String url, {Map<String, dynamic>? body}) async {
     final token = _token;
     if (token == null || token.isEmpty) {
       throw const InvoiceApiException('لم يتم تسجيل الدخول بعد.');
     }
-    request.headers.set(HttpHeaders.authorizationHeader, 'Token $token');
+    try {
+      return await ApiHttp.request(method, url, token: token, body: body);
+    } on ApiHttpException catch (e) {
+      throw InvoiceApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
+    }
   }
 
   Future<Map<String, dynamic>> _get({required String url}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client.getUrl(Uri.parse(url)).timeout(
-            const Duration(seconds: 25),
-          );
-
-      _applyAuthHeader(request);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      return _parseResponse(response, await utf8.decoder.bind(response).join());
-    } on TimeoutException {
-      throw const InvoiceApiException('انتهت مهلة الاتصال بالخادم.');
-    } on SocketException {
-      throw const InvoiceApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const InvoiceApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseResponse(await _request('GET', url));
   }
 
   Future<Map<String, dynamic>> _send({
@@ -131,50 +106,11 @@ class InvoiceApiService {
     required String url,
     required Map<String, dynamic> body,
   }) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-
-    try {
-      final request = await client
-          .openUrl(method, Uri.parse(url))
-          .timeout(const Duration(seconds: 25));
-
-      _applyAuthHeader(request);
-      request.headers.contentType = ContentType.json;
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final bodyBytes = utf8.encode(jsonEncode(body));
-      request.contentLength = bodyBytes.length;
-      request.add(bodyBytes);
-
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final responseText = await utf8.decoder.bind(response).join();
-      return _parseResponse(response, responseText);
-    } on TimeoutException {
-      throw const InvoiceApiException(
-        'انتهت مهلة الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.',
-      );
-    } on SocketException {
-      throw const InvoiceApiException('تعذر الاتصال بالإنترنت أو بالخادم.');
-    } on HandshakeException {
-      throw const InvoiceApiException('تعذر إنشاء اتصال آمن بالخادم.');
-    } finally {
-      client.close(force: true);
-    }
+    return _parseResponse(await _request(method, url, body: body));
   }
 
-  Map<String, dynamic> _parseResponse(
-    HttpClientResponse response,
-    String responseText,
-  ) {
-    dynamic decoded;
-    try {
-      decoded = responseText.isEmpty ? <String, dynamic>{} : jsonDecode(responseText);
-    } catch (_) {
-      throw InvoiceApiException(
-        'استجابة غير صالحة من الخادم.',
-        statusCode: response.statusCode,
-      );
-    }
+  Map<String, dynamic> _parseResponse(ApiHttpResponse response) {
+    final decoded = response.json ?? <String, dynamic>{};
 
     if (response.statusCode == 401) {
       throw const InvoiceApiException(
@@ -183,7 +119,7 @@ class InvoiceApiService {
       );
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
+    if (!response.isSuccess) {
       throw InvoiceApiException(
         _extractErrorMessage(decoded),
         statusCode: response.statusCode,
