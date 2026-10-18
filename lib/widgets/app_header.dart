@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../help/screen_help_content.dart';
+import 'screen_help_dialog.dart';
+
 class AppHeader extends StatelessWidget {
   final String pharmacyName; // 👈 اسم الصيدلية المفتوحة
   final String? pageTitle;    // اسم الصفحة الحالية (اخيتياري)
   final IconData? icon;
   final Widget? trailing;
+
+  /// شرح الشاشة الحالية (lib/help/screen_help_content.dart)؛ null = بلا زر معلومات.
+  final ScreenHelp? help;
 
   const AppHeader({
     super.key,
@@ -13,6 +19,7 @@ class AppHeader extends StatelessWidget {
     this.pageTitle,
     this.icon,
     this.trailing,
+    this.help,
   });
 
   @override
@@ -88,6 +95,16 @@ class AppHeader extends StatelessWidget {
 
           const Spacer(),
           if (trailing != null) trailing!,
+          // زر معلومات الشاشة: آخر عنصر في الصف = أقصى اليسار في RTL.
+          if (help != null) ...[
+            const SizedBox(width: 8),
+            IconButton(
+              key: const Key('screen-help-button'),
+              tooltip: 'معلومات الشاشة',
+              onPressed: () => showScreenHelpDialog(context, help!),
+              icon: const Icon(Icons.info_outline, color: Color(0xff1abc9c), size: 26),
+            ),
+          ],
         ],
       ),
     );

@@ -42,7 +42,9 @@ class InvoiceRepository {
   final InvoiceApiService _api = InvoiceApiService.instance;
   final ConnectivityService _connectivity = ConnectivityService.instance;
 
-  /// صفحة من سجل المبيعات (الأحدث أولاً) بفلاتر البحث والتاريخ. أونلاين:
+  /// صفحة من سجل المبيعات (الأحدث أولاً) بفلاتر البحث (رقم الفاتورة أو اسم
+  /// دواء فيها) والتاريخ والبائع ([seller] = اسم من getSellers) والحالة
+  /// ([refunded]) والخصم ([hasDiscount])؛ null = بلا فلتر. أونلاين:
   /// الترقيم والفلترة على الخادم، وصفوف الصفحة تُحفظ في الكاش المحلي (لنافذة
   /// تفاصيل الفاتورة). بلا اتصال: نفس الصفحة من آخر كاش محفوظ (قراءة فقط —
   /// البيع والإرجاع يبقيان ممنوعين، انظر checkout/refund).
@@ -54,6 +56,9 @@ class InvoiceRepository {
     String search = '',
     DateTime? start,
     DateTime? end,
+    String? seller,
+    bool? refunded,
+    bool? hasDiscount,
   }) async {
     final startKey = start == null ? null : _dateKey(start);
     final endKey = end == null ? null : _dateKey(end);
@@ -67,6 +72,9 @@ class InvoiceRepository {
           search: search,
           start: startKey,
           end: endKey,
+          seller: seller,
+          refunded: refunded,
+          hasDiscount: hasDiscount,
         );
         final results = (body['results'] as List? ?? const []).whereType<Map<String, dynamic>>().toList();
         await _db.replaceInvoicesCache(pharmacyId: pharmacyId, serverItems: results);
@@ -85,6 +93,9 @@ class InvoiceRepository {
       search: search,
       start: startKey,
       end: endKey,
+      seller: seller,
+      refunded: refunded,
+      hasDiscount: hasDiscount,
       limit: pageSize + 1,
       offset: (page - 1) * pageSize,
     );
@@ -93,6 +104,23 @@ class InvoiceRepository {
       hasMore: rows.length > pageSize,
       fromCache: isOnlineMode,
     );
+  }
+
+  /// أسماء البائعين لفلتر سجل المبيعات (بما فيها DatabaseHelper.unknownSeller
+  /// إن وُجدت فواتير بلا بائع). أونلاين من الخادم (كل فواتير الصيدلية، لا
+  /// الصفحات المحمّلة فقط)؛ أوفلاين أو بلا اتصال من الجدول المحلي.
+  Future<List<String>> getSellers({
+    required int pharmacyId,
+    required bool isOnlineMode,
+  }) async {
+    if (isOnlineMode) {
+      try {
+        return await _api.fetchSellers();
+      } catch (e) {
+        if (!ApiHttp.isNetworkError(e)) rethrow;
+      }
+    }
+    return _db.getInvoiceSellers(pharmacyId);
   }
 
   /// آخر [limit] فواتير (لوحة "سجل الفواتير الأخيرة" في نقطة البيع): صفحة
@@ -188,14 +216,17 @@ class InvoiceRepository {
     return created;
   }
 
-  /// يعكس checkout بالضبط، محلياً أو عبر السيرفر حسب isOnlineMode.
+  /// يعكس checkout بالضبط، محلياً أو عبر السيرفر حسب isOnlineMode، ويسجّل من
+  /// أرجع الفاتورة ومتى. [userId]: المستخدم الحالي (user_profile.id أوفلاين)؛
+  /// أونلاين يحدده الخادم من صاحب التوكن فلا يُرسل.
   Future<void> refund({
     required int pharmacyId,
     required bool isOnlineMode,
     required int invoiceId,
+    int? userId,
   }) async {
     if (!isOnlineMode) {
-      await _db.refundInvoice(invoiceId);
+      await _db.refundInvoice(invoiceId, refundedBy: userId);
       return;
     }
 

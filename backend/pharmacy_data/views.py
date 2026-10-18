@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, F, OuterRef, Q, Subquery, Sum, Value
+from django.db.models import Count, DecimalField, Exists, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, Length
 from django.http import StreamingHttpResponse
 from django.utils import timezone
@@ -66,6 +66,14 @@ from .serializers import (
 )
 
 
+class MedicinePagination(PageNumberPagination):
+    """100 افتراضياً (المزامنة الكاملة كالسابق)؛ البحث السريع يطلب ?page_size= أصغر."""
+
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
 class MedicineViewSet(viewsets.ModelViewSet):
     """
     CRUD كامل لجدول المخزون، مقيَّد دائماً بصيدلية المستخدم المسجّل دخوله فقط
@@ -73,6 +81,7 @@ class MedicineViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = MedicineSerializer
+    pagination_class = MedicinePagination
     # القراءة لكل أعضاء الصيدلية (الموظف يحتاجها للبيع)، والكتابة للمالك فقط
     # — مطابق لما تعرضه شاشة المخزون في Flutter (أزرار الإضافة/التعديل/الحذف للمالك).
     def get_permissions(self):
@@ -92,7 +101,26 @@ class MedicineViewSet(viewsets.ModelViewSet):
             if not str(warehouse_id).isdigit():
                 raise ValidationError("معرّف المخزن غير صحيح.")
             qs = qs.filter(warehouse_id=warehouse_id)
+        if self.action == "list":
+            # بحث نافذة الإتلاف (Flutter: MedicineRepository.searchMedicinesForPicker):
+            # ?search= على الاسم التجاري/العلمي/الباركود، ?in_stock=1 = بكمية فقط.
+            params = self.request.query_params
+            search = params.get("search", "").strip()
+            if search:
+                qs = qs.filter(
+                    Q(trade_name__icontains=search)
+                    | Q(scientific_name__icontains=search)
+                    | Q(barcode__icontains=search)
+                )
+            if params.get("in_stock") == "1":
+                qs = qs.filter(quantity__gt=0)
         return qs.order_by("trade_name")
+
+    def perform_destroy(self, instance):
+        # بدونها يصل PROTECT كخطأ خادم 500 بلا رسالة مفهومة.
+        if _is_referenced(instance):
+            raise ValidationError(MEDICINE_IN_USE_MESSAGE)
+        instance.delete()
 
     def perform_create(self, serializer):
         membership = self.request.user.pharmacymembership
@@ -150,8 +178,16 @@ class MedicineViewSet(viewsets.ModelViewSet):
 
 
 def _is_referenced(medicine):
-    """صف دواء له سجل مبيعات أو إتلاف (PROTECT) لا يُحذف — يُصفَّر بدلاً من ذلك."""
+    """صف دواء له سجل مبيعات أو إتلاف (PROTECT) لا يُحذف."""
     return medicine.invoice_items.exists() or medicine.damaged_records.exists()
+
+
+# نفس نص Flutter (medicine_dialogs.medicineInUseMessage): الحذف لأصناف أُدخلت
+# بالخطأ فقط؛ الكمية الخاطئة تُنقل إلى التالف.
+MEDICINE_IN_USE_MESSAGE = (
+    'لا يمكن حذف هذا الدواء لأن له سجل مبيعات أو إتلاف سابق. لتصحيح كمية خاطئة استخدم زر '
+    '"إتلاف" وانقل الكمية إلى التالف (سبب "تصحيح إدخال" لا يُحتسب خسارة).'
+)
 
 
 class WarehouseViewSet(viewsets.ModelViewSet):
@@ -407,7 +443,7 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
         # باستعلام لكل فاتورة (N+1 = 100 استعلام لكل صفحة).
         qs = (
             Invoice.objects.filter(pharmacy=membership.pharmacy)
-            .select_related("cashier")
+            .select_related("cashier", "refunded_by")
             .prefetch_related("items")
             .order_by("-created_at", "-id")
         )
@@ -417,19 +453,30 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
 
     def _filter_list(self, qs):
         """
-        فلاتر سجل المبيعات على الخادم: ?search= (رقم الفاتورة أو اسم البائع)
-        و?start=/&end= (YYYY-MM-DD، أيام محلية شاملة). الترقيم ?page=&page_size=.
+        فلاتر سجل المبيعات على الخادم: ?search= (رقم الفاتورة أو اسم دواء مباع
+        فيها)، ?start=/&end= (YYYY-MM-DD، أيام محلية شاملة)، ?seller= (اسم
+        البائع كما في /sellers/ وcashier_display_name)، ?status=completed|refunded،
+        ?discount=with|without. الترقيم ?page=&page_size=.
         """
         params = self.request.query_params
         search = params.get("search", "").strip()
         if search:
-            qs = qs.filter(
-                Q(invoice_number__icontains=search)
-                | Q(cashier_name__icontains=search)
-                | Q(cashier__username__icontains=search)
-                | Q(cashier__first_name__icontains=search)
-                | Q(cashier__last_name__icontains=search)
-            )
+            # Exists بدل join على items: لا صفوف مكررة تُفسد الترقيم.
+            sold = InvoiceItem.objects.filter(invoice=OuterRef("pk"), trade_name__icontains=search)
+            qs = qs.filter(Q(invoice_number__icontains=search) | Q(Exists(sold)))
+        seller = params.get("seller", "").strip()
+        if seller:
+            qs = qs.annotate(seller_name=reports.SELLER_NAME).filter(seller_name=seller)
+        status_param = params.get("status", "").strip()
+        if status_param:
+            if status_param not in ("completed", "refunded"):
+                raise ValidationError("حالة الفاتورة غير صحيحة.")
+            qs = qs.filter(is_refunded=status_param == "refunded")
+        discount = params.get("discount", "").strip()
+        if discount:
+            if discount not in ("with", "without"):
+                raise ValidationError("قيمة فلتر الخصم غير صحيحة.")
+            qs = qs.filter(discount__gt=0) if discount == "with" else qs.filter(discount__lte=0)
         try:
             start = date.fromisoformat(params["start"]) if params.get("start") else None
             end = date.fromisoformat(params["end"]) if params.get("end") else None
@@ -440,6 +487,22 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
         if end:
             qs = qs.filter(created_at__lt=reports.day_bounds(end, end)[1])
         return qs
+
+    @action(detail=False, methods=["get"])
+    def sellers(self, request):
+        """
+        GET /api/invoices/sellers/ — {"sellers": [...]} أسماء البائعين الذين لهم
+        فواتير في الصيدلية (فلتر سجل المبيعات)، بنفس الاسم الذي يقبله ?seller=.
+        """
+        membership = self._membership()
+        names = (
+            Invoice.objects.filter(pharmacy=membership.pharmacy)
+            .annotate(seller_name=reports.SELLER_NAME)
+            .values_list("seller_name", flat=True)
+            .distinct()
+            .order_by("seller_name")
+        )
+        return Response({"sellers": list(names)})
 
     @action(detail=False, methods=["get"])
     def stats(self, request):
@@ -622,17 +685,24 @@ class InvoiceViewSet(viewsets.ReadOnlyModelViewSet):
                 stock.restore_to_latest(locked[item.medicine_id], item.quantity)
 
             invoice.is_refunded = True
-            invoice.save(update_fields=["is_refunded", "updated_at"])
+            invoice.refunded_by = request.user
+            invoice.refunded_at = timezone.now()
+            invoice.save(update_fields=["is_refunded", "refunded_by", "refunded_at", "updated_at"])
 
         invoice.refresh_from_db()
         return Response(InvoiceSerializer(invoice, context=self.get_serializer_context()).data)
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
-    """CRUD كامل للمذاخر، مقيَّد بصيدلية المستخدم فقط — نفس نمط MedicineViewSet."""
+    """
+    المذاخر، مقيَّدة بصيدلية المستخدم فقط — نفس نمط MedicineViewSet. بلا حذف
+    (DELETE = 405): حذف مذخر كان يحذف فواتيره ودفعاته ومرتجعاته (CASCADE)
+    بينما يبقى مخزونه، فتختفي المشتريات والديون من التقارير وكشوف الحساب.
+    """
 
     serializer_class = SupplierSerializer
     permission_classes = [IsActiveOnlineOwner]
+    http_method_names = ["get", "post", "put", "patch", "head", "options"]
 
     def get_queryset(self):
         membership = getattr(self.request.user, "pharmacymembership", None)

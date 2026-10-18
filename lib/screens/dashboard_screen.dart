@@ -5,6 +5,7 @@ import '../database/db_helper.dart'; // مسار الداتابيس
 import '../models/medicine_model.dart';
 import '../repository/medicine_repository.dart';
 import '../repository/Invoice_repository.dart';
+import '../repository/warehouse_repository.dart';
 import '../widgets/alert_box.dart';   // استيراد الـ AlertBox الخاص بك
 import '../widgets/custom_table.dart'; // استيراد الـ CustomTable الخاص بك
 
@@ -88,7 +89,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // 🆕 90 يوماً: فترة عملية تعطي الصيدلي وقتاً كافياً للتصرف
       // (إرجاع للمذخر، تخفيض سعر، أو سحب من الرف) قبل انتهاء الصلاحية فعلياً
       final expiredData = await db.getExpiredMedicines(widget.pharmacyId, daysAhead: 90);
-      final lowStockData = await db.getLowStockMedicines(widget.pharmacyId);
+      // النواقص من المخزن الرئيسي فقط: البيع يتم منه وحده، فنقص مخزن إضافي لا
+      // يمنع البيع. أونلاين بلا اتصال ولا كاش مخازن: كل المخازن (الكاش فارغ أصلاً).
+      int? mainWarehouseId;
+      try {
+        mainWarehouseId = await WarehouseRepository.instance.getMainWarehouseId(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: widget.isOnlineMode,
+        );
+      } on WarehouseRepositoryException {
+        mainWarehouseId = null;
+      }
+      final lowStockData = await db.getLowStockMedicines(widget.pharmacyId, warehouseId: mainWarehouseId);
 
       setState(() {
         _totalMedicines = medicinesCount;
@@ -464,7 +476,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   // قسم الأدوية التي أوشكت على النفاذ
   Widget _buildLowStockAlertSection() {
     return AlertBox(
-      title: "تحذيرات الكمية",
+      title: "تحذيرات الكمية (المخزن الرئيسي)",
       icon: Icons.inventory_2_rounded,
       color: const Color(0xFFE67E22),
       child: _lowStockMedicines.isEmpty

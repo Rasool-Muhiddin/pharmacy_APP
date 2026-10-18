@@ -21,6 +21,13 @@ class DatabaseHelper {
   static Database? _database;
   static const String _dbName = "pharmacy.db";
 
+  /// اسم البائع في الفواتير (يتطلب i = invoice، u = users عبر user_profile):
+  /// الحساب المحلي، وإلا الاسم القادم من الخادم (cashier_name_synced)، وإلا
+  /// [unknownSeller] — نفس الاسم الذي يُرجعه الخادم لفاتورة بلا بائع.
+  static const String unknownSeller = 'بائع غير محدد';
+  static const String sellerNameSql =
+      "COALESCE(NULLIF(TRIM(u.full_name), ''), NULLIF(TRIM(u.username), ''), NULLIF(TRIM(i.cashier_name_synced), ''), '$unknownSeller')";
+
   //====================================================
   // استراتيجية المعرّفات (منع تصادم بيانات الأوفلاين مع كاش الخادم)
   //
@@ -136,6 +143,7 @@ Future<Database> _initDatabase() async {
       await db.execute('PRAGMA foreign_keys = ON');
       // احتياط: يضمن أن أي صف محلي جديد يُعطى معرّفاً في النطاق المحلي.
       await _ensureLocalIdSequences(db);
+      await _ensureAddedColumns(db);
     },
   );
 }
@@ -383,10 +391,39 @@ Future<void> _createInvoiceTable(DatabaseExecutor db, String name) async {
       created_at TEXT NOT NULL,
       is_refunded INTEGER NOT NULL DEFAULT 0,
       last_synced_at TEXT,
+      refunded_by INTEGER REFERENCES user_profile(id),
+      refunded_by_name TEXT,
+      refunded_at TEXT,
       FOREIGN KEY(pharmacy_id) REFERENCES pharmacy_branch(id),
       FOREIGN KEY(cashier_id) REFERENCES user_profile(id)
     )
   ''');
+}
+
+/// أعمدة أُضيفت بعد v13 بلا رفع رقم نسخة القاعدة: موجودة في CREATE TABLE
+/// للتثبيت الجديد، وتُضاف هنا عند الفتح لأي قاعدة قائمة ينقصها العمود.
+/// {الجدول: {العمود: التعريف}} — تعريف ALTER TABLE ADD COLUMN (NULL افتراضياً).
+static const Map<String, Map<String, String>> _addedColumns = {
+  'invoice': {
+    // من أرجع الفاتورة (مستخدم محلي أوفلاين، أو اسم الخادم أونلاين) ومتى.
+    'refunded_by': 'INTEGER REFERENCES user_profile(id)',
+    'refunded_by_name': 'TEXT',
+    'refunded_at': 'TEXT',
+  },
+};
+
+Future<void> _ensureAddedColumns(DatabaseExecutor db) async {
+  for (final table in _addedColumns.entries) {
+    final existing = {
+      for (final row in await db.rawQuery('PRAGMA table_info(${table.key})')) row['name'] as String,
+    };
+    if (existing.isEmpty) continue; // الجدول غير موجود (لا يحدث بعد onCreate).
+    for (final column in table.value.entries) {
+      if (!existing.contains(column.key)) {
+        await db.execute('ALTER TABLE ${table.key} ADD COLUMN ${column.key} ${column.value}');
+      }
+    }
+  }
 }
 
 Future<void> _createInvoiceIndexes(DatabaseExecutor db) async {
@@ -1097,14 +1134,72 @@ Future<int> insertMedicine(Map<String, dynamic> medicine) async {
 //
 // كل صف يحمل sellable_quantity: الكمية في الدفعات غير المنتهية (ما يمكن
 // بيعه فعلاً؛ البيع يخصم منها بترتيب FEFO).
-Future<List<Map<String, dynamic>>> getMedicines(int pharmacyId, {int? warehouseId}) async {
+//
+// [search]: الاسم التجاري أو العلمي أو الباركود (جزء من النص). [category]:
+// null = كل الفئات، '' = الأصناف بلا فئة، وإلا مفتاح الفئة كما هو.
+Future<List<Map<String, dynamic>>> getMedicines(
+  int pharmacyId, {
+  int? warehouseId,
+  String search = '',
+  String? category,
+}) async {
   final db = await database;
+  final clauses = <String>['pharmacy_id = ?', originFilter()];
+  final args = <Object?>[pharmacyId];
+  if (warehouseId != null) {
+    clauses.add('warehouse_id = ?');
+    args.add(warehouseId);
+  }
+  search = search.trim();
+  if (search.isNotEmpty) {
+    clauses.add("(trade_name LIKE ? OR COALESCE(scientific_name, '') LIKE ? OR COALESCE(barcode, '') LIKE ?)");
+    args.addAll(['%$search%', '%$search%', '%$search%']);
+  }
+  if (category != null) {
+    clauses.add("COALESCE(TRIM(category), '') = ?");
+    args.add(category.trim());
+  }
   return db.rawQuery('''
     SELECT medicine.*, $sellableQuantitySql
     FROM medicine
-    WHERE pharmacy_id = ? ${warehouseId != null ? 'AND warehouse_id = ?' : ''} AND ${originFilter()}
+    WHERE ${clauses.join(' AND ')}
     ORDER BY trade_name COLLATE NOCASE ASC
+  ''', args);
+}
+
+/// بحث نافذة الإتلاف: أصناف بكمية (> 0) يطابق اسمها التجاري/العلمي أو
+/// باركودها [query]، حتى [limit] نتيجة — ما يبدأ بالنص أولاً — مع اسم المخزن.
+Future<List<Map<String, dynamic>>> searchMedicinesForPicker(int pharmacyId, String query, {int limit = 20}) async {
+  final db = await database;
+  final text = query.trim();
+  if (text.isEmpty) return [];
+  final like = '%$text%';
+  return db.rawQuery('''
+    SELECT m.id, m.trade_name, m.scientific_name, m.barcode, m.quantity, m.warehouse_id, w.name AS warehouse_name
+    FROM medicine m LEFT JOIN warehouses w ON w.id = m.warehouse_id
+    WHERE m.pharmacy_id = ? AND ${originFilter('m.')} AND m.quantity > 0
+      AND (m.trade_name LIKE ? OR COALESCE(m.scientific_name, '') LIKE ? OR COALESCE(m.barcode, '') LIKE ?)
+    ORDER BY (m.trade_name LIKE ?) DESC, m.trade_name COLLATE NOCASE ASC, m.id ASC
+    LIMIT ?
+  ''', [pharmacyId, like, like, like, '$text%', limit]);
+}
+
+/// أسماء مخازن الصيدلية {المعرّف: الاسم} (لنتائج بحث قادمة من الخادم).
+Future<Map<int, String>> getWarehouseNames(int pharmacyId) async {
+  final db = await database;
+  final rows = await db.query('warehouses', columns: ['id', 'name'], where: 'pharmacy_id = ?', whereArgs: [pharmacyId]);
+  return {for (final r in rows) r['id'] as int: r['name'] as String};
+}
+
+/// الفئات الموجودة فعلاً في أصناف الصيدلية (أو مخزن واحد)، '' = بلا فئة.
+Future<List<String>> getMedicineCategories(int pharmacyId, {int? warehouseId}) async {
+  final db = await database;
+  final rows = await db.rawQuery('''
+    SELECT DISTINCT COALESCE(TRIM(category), '') AS category
+    FROM medicine
+    WHERE pharmacy_id = ? ${warehouseId != null ? 'AND warehouse_id = ?' : ''} AND ${originFilter()}
   ''', [pharmacyId, if (warehouseId != null) warehouseId]);
+  return [for (final r in rows) r['category'] as String];
 }
 
 // تعديل دواء
@@ -2017,6 +2112,10 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       'final_amount': _parseServerDecimal(serverData['final_amount']),
       'created_at': serverData['created_at'] as String,
       'is_refunded': serverData['is_refunded'] == true ? 1 : 0,
+      // من أرجعها: اسم جاهز من الخادم (معرّف مستخدم الخادم ليس user_profile محلياً).
+      'refunded_by': null,
+      'refunded_by_name': serverData['refunded_by_display'] as String?,
+      'refunded_at': serverData['refunded_at'] as String?,
       'last_synced_at': syncedAt,
     };
 
@@ -2046,21 +2145,8 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   }
 
   // البحث بالاسم التجاري أو العلمي أو الباركود
-  Future<List<Map<String, dynamic>>> searchMedicines(int pharmacyId, String keyword) async {
-    final db = await database;
-    return await db.rawQuery('''
-      SELECT * 
-      FROM medicine 
-      WHERE pharmacy_id = ? 
-        AND ${originFilter()}
-        AND (
-          trade_name LIKE ? 
-          OR scientific_name LIKE ? 
-          OR barcode LIKE ?
-        ) 
-      ORDER BY trade_name
-    ''', [pharmacyId, '%$keyword%', '%$keyword%', '%$keyword%']);
-  }
+  Future<List<Map<String, dynamic>>> searchMedicines(int pharmacyId, String keyword) =>
+      getMedicines(pharmacyId, search: keyword);
 
   //====================================================
   // البحث بالباركود
@@ -2101,12 +2187,14 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   // الأدوية منخفضة المخزون
   //====================================================
 
-  Future<List<Map<String, dynamic>>> getLowStockMedicines(int pharmacyId, {int limit = kLowStockThreshold}) async {
+  /// [warehouseId]: مخزن واحد (الشاشة الرئيسية تمرر الرئيسي — البيع منه فقط).
+  Future<List<Map<String, dynamic>>> getLowStockMedicines(int pharmacyId,
+      {int limit = kLowStockThreshold, int? warehouseId}) async {
     final db = await database;
     return await db.query(
       'medicine',
-      where: 'pharmacy_id = ? AND quantity <= ? AND ${originFilter()}',
-      whereArgs: [pharmacyId, limit],
+      where: 'pharmacy_id = ? AND quantity <= ? AND ${originFilter()}${warehouseId != null ? ' AND warehouse_id = ?' : ''}',
+      whereArgs: [pharmacyId, limit, if (warehouseId != null) warehouseId],
       orderBy: 'quantity ASC',
     );
   }
@@ -2165,12 +2253,19 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   /// الأحدث أولاً. [ids] = صفوف صفحة جاءت من الخادم للتو؛ وإلا فلاتر وترقيم
   /// محليان. [start]/[end] = YYYY-MM-DD شاملة بتاريخ الفاتورة المحلي (أول 10
   /// أحرف من created_at، لا DATE() التي تحوّل الإزاحة الزمنية إلى UTC).
+  ///
+  /// [search]: رقم الفاتورة أو اسم دواء مباع فيها (لقطة trade_name في
+  /// invoice_item). [seller]: اسم البائع كما يُعرض ([sellerNameSql]، ومنه
+  /// [unknownSeller]). [refunded]: null = كل الحالات. [hasDiscount]: null = الكل.
   Future<List<Map<String, dynamic>>> queryInvoices(
     int pharmacyId, {
     List<int>? ids,
     String search = '',
     String? start,
     String? end,
+    String? seller,
+    bool? refunded,
+    bool? hasDiscount,
     int? limit,
     int offset = 0,
   }) async {
@@ -2183,8 +2278,20 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
       args.addAll(ids);
     }
     if (search.isNotEmpty) {
-      clauses.add("(i.invoice_number LIKE ? OR COALESCE(u.full_name, u.username, i.cashier_name_synced, '') LIKE ?)");
+      clauses.add('(i.invoice_number LIKE ? OR EXISTS ('
+          'SELECT 1 FROM invoice_item ii WHERE ii.invoice_id = i.id AND ii.trade_name LIKE ?))');
       args.addAll(['%$search%', '%$search%']);
+    }
+    if (seller != null) {
+      clauses.add('$sellerNameSql = ?');
+      args.add(seller);
+    }
+    if (refunded != null) {
+      clauses.add('i.is_refunded = ?');
+      args.add(refunded ? 1 : 0);
+    }
+    if (hasDiscount != null) {
+      clauses.add(hasDiscount ? 'i.discount > 0' : 'i.discount <= 0');
     }
     if (start != null) {
       clauses.add('substr(i.created_at, 1, 10) >= ?');
@@ -2198,14 +2305,33 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     return db.rawQuery('''
       SELECT
         i.*,
-        COALESCE(u.full_name, u.username, i.cashier_name_synced, 'غير محدد') AS cashier_name
+        $sellerNameSql AS cashier_name,
+        COALESCE(NULLIF(TRIM(ru.full_name), ''), NULLIF(TRIM(ru.username), ''), NULLIF(TRIM(i.refunded_by_name), ''))
+          AS refunded_by_display
       FROM invoice i
       LEFT JOIN user_profile up ON i.cashier_id = up.id
       LEFT JOIN users u ON up.user_id = u.id
+      LEFT JOIN user_profile rup ON i.refunded_by = rup.id
+      LEFT JOIN users ru ON rup.user_id = ru.id
       WHERE ${clauses.join(' AND ')}
       ORDER BY i.created_at DESC, i.id DESC
       $page
     ''', args);
+  }
+
+  /// أسماء البائعين الذين لهم فواتير في الصيدلية (فلتر سجل المبيعات)، بنفس
+  /// [sellerNameSql] الذي تُصفّى به queryInvoices.
+  Future<List<String>> getInvoiceSellers(int pharmacyId) async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT DISTINCT $sellerNameSql AS seller
+      FROM invoice i
+      LEFT JOIN user_profile up ON i.cashier_id = up.id
+      LEFT JOIN users u ON up.user_id = u.id
+      WHERE i.pharmacy_id = ? AND ${originFilter('i.')}
+      ORDER BY seller
+    ''', [pharmacyId]);
+    return [for (final r in rows) r['seller'] as String];
   }
 
   // جلب جميع فواتير الصيدلية
@@ -2336,6 +2462,36 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
     await db.update('damaged_medicine', row, where: 'id = ?', whereArgs: [row['id']]);
   }
 
+  /// سجلات الإتلاف (الأحدث أولاً) مع اسم الدواء و`loss` = كلفة العملية بنفس
+  /// [damageCostSql] الذي تجمعه التقارير (الكلفة المسجّلة وقت الإتلاف، وإلا
+  /// الكمية × avg_cost/buy_price) — فتتطابق الشاشة والتقارير دائماً. [search]: الاسم
+  /// التجاري/العلمي أو الملاحظات أو نص السبب المخزَّن؛ [reasonKeys]: أسباب
+  /// يطابق نصها العربي البحث (damageReasonKeysMatching) فتُضاف للمطابقة.
+  Future<List<Map<String, dynamic>>> getDamagedMedicines(
+    int pharmacyId, {
+    String search = '',
+    List<String> reasonKeys = const [],
+  }) async {
+    final db = await database;
+    final clauses = <String>['dm.pharmacy_id = ?', originFilter('dm.')];
+    final args = <Object?>[pharmacyId];
+    search = search.trim();
+    if (search.isNotEmpty) {
+      final like = '%$search%';
+      final byReason = reasonKeys.isEmpty ? '' : ' OR dm.reason IN (${List.filled(reasonKeys.length, '?').join(',')})';
+      clauses.add("(COALESCE(m.trade_name, '') LIKE ? OR COALESCE(m.scientific_name, '') LIKE ?"
+          " OR COALESCE(dm.notes, '') LIKE ? OR COALESCE(dm.reason, '') LIKE ?$byReason)");
+      args.addAll([like, like, like, like, ...reasonKeys]);
+    }
+    return db.rawQuery('''
+      SELECT dm.*, m.trade_name, m.scientific_name, $damageCostSql AS loss
+      FROM damaged_medicine dm
+      LEFT JOIN medicine m ON dm.medicine_id = m.id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY dm.id DESC
+    ''', args);
+  }
+
   /// يستبدل كامل كاش سجلات الإتلاف المحلي بقائمة كاملة قادمة من السيرفر
   /// (بعد جلب damaged_api_service.fetchDamagedMedicines() لكل الصفحات).
   Future<void> replaceDamagedMedicinesCache({
@@ -2386,7 +2542,9 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
   // استرجاع فاتورة (Refund) - النسخة المتطورة والآمنة
   //====================================================
 
-  Future<void> refundInvoice(int invoiceId) async {
+  /// [refundedBy]: user_profile.id للمستخدم الحالي (من نفّذ الإرجاع)؛ معرّف غير
+  /// موجود محلياً يُسجَّل null (يبقى وقت الإرجاع) بدل رفض الإرجاع.
+  Future<void> refundInvoice(int invoiceId, {int? refundedBy}) async {
     final db = await database;
 
     await db.transaction((txn) async {
@@ -2419,10 +2577,18 @@ Future<int> updateMedicine(int id, Map<String, dynamic> medicine) async {
         await _restoreToLatestBatch(txn, item['medicine_id'] as int, item['quantity'] as int);
       }
 
-      // تحديث حالة الفاتورة
+      final profile = refundedBy == null
+          ? const <Map<String, Object?>>[]
+          : await txn.query('user_profile', columns: ['id'], where: 'id = ?', whereArgs: [refundedBy], limit: 1);
+
+      // تحديث حالة الفاتورة + من أرجعها ومتى
       await txn.update(
         'invoice',
-        {'is_refunded': 1},
+        {
+          'is_refunded': 1,
+          'refunded_by': profile.isEmpty ? null : refundedBy,
+          'refunded_at': DateTime.now().toIso8601String(),
+        },
         where: 'id = ?',
         whereArgs: [invoiceId],
       );
@@ -2568,15 +2734,6 @@ Future<double> totalSalesToday(int pharmacyId) async {
   }
 
   // حذف مورد
-  Future<int> deleteSupplier(int id) async {
-    final db = await database;
-    return await db.delete(
-      "pharmacy_supplier",
-      where: "id = ?",
-      whereArgs: [id],
-    );
-  }
-
   //====================================================
   // Damaged Medicine CRUD (الأدوية التالفة)
   //====================================================
@@ -3841,10 +3998,13 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
   // المحلي) لأنه لا حساب Django حقيقي وراء هذه الفواتير التاريخية —
   // ستُحفَظ في Invoice.cashier_name على السيرفر بدل Invoice.cashier.
   final invoices = await db.rawQuery('''
-    SELECT i.*, COALESCE(u.full_name, u.username, '') AS cashier_name
+    SELECT i.*, COALESCE(u.full_name, u.username, '') AS cashier_name,
+           COALESCE(NULLIF(TRIM(ru.full_name), ''), NULLIF(TRIM(ru.username), ''), '') AS refunded_by_display
     FROM invoice i
     LEFT JOIN user_profile up ON i.cashier_id = up.id
     LEFT JOIN users u ON up.user_id = u.id
+    LEFT JOIN user_profile rup ON i.refunded_by = rup.id
+    LEFT JOIN users ru ON rup.user_id = ru.id
     WHERE i.pharmacy_id = ? AND ${localOnly('i.')}
   ''', [pharmacyId]);
   final invoicesPayload = <Map<String, dynamic>>[];
@@ -3859,6 +4019,8 @@ Future<Map<String, dynamic>> getOfflineMigrationPayload(int pharmacyId) async {
       'final_amount': inv['final_amount'],
       'created_at': inv['created_at'],
       'is_refunded': (inv['is_refunded'] as int?) == 1,
+      'refunded_by_name': inv['refunded_by_display'],
+      'refunded_at': inv['refunded_at'],
       'items': items
           .map((it) => {
                 'local_medicine_id': it['medicine_id'],

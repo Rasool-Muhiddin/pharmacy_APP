@@ -143,18 +143,8 @@ class SuppliersRepository {
     }
   }
 
-  Future<void> deleteSupplier({
-    required bool isOnlineMode,
-    required int id,
-  }) async {
-    if (!isOnlineMode) {
-      await _db.deleteSupplier(id);
-      return;
-    }
-
-    await _assertOnlineWritable();
-    await _api.deleteSupplier(id);
-  }
+  // لا حذف للمذاخر (قرار عمل): حذف مذخر كان يحذف فواتيره ودفعاته ومرتجعاته
+  // بينما يبقى مخزونه، فتختفي المشتريات والديون من التقارير وكشوف الحساب.
 
   /// قائمة مذخر كاملة من شاشة المخزون (الطريق الوحيد لإنشاء فاتورة شراء):
   /// المذخر (موجود [supplierId] أو جديد [supplierName]) ← الفاتورة ← توريد كل

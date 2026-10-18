@@ -83,7 +83,7 @@ void _summary(_SheetWriter w, ReportExportData d) {
   w.section('التنبيهات الحالية');
   w.table(['التنبيه', 'العدد', 'القيمة'], [
     [_T('أصناف تُباع بأقل من كلفتها'), _Int(a['below_cost_count']), _T('-')],
-    [_T('تنتهي صلاحيتها خلال ${xi(a['expiring_days'] ?? 30)} يوماً'), _Int(a['expiring_count']), _Money(a['expiring_value'])],
+    [_T('تنتهي صلاحيتها خلال ${xi(a['expiring_days'] ?? 90)} يوماً'), _Int(a['expiring_count']), _Money(a['expiring_value'])],
     [_T('منتهية الصلاحية غير مُسجَّلة كتالف'), _Int(a['expired_count']), _Money(a['expired_value'])],
     [_T('نفدت أو أوشكت على النفاد'), _Int(a['low_stock_count']), _T('-')],
     [_T('منها نفدت بالكامل'), _Int(a['out_of_stock_count']), _T('-')],

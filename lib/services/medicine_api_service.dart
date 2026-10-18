@@ -33,6 +33,22 @@ class MedicineApiService {
     _token = token;
   }
 
+  /// GET /api/medicines/?search=&in_stock=1&page_size= — صفحة واحدة صغيرة
+  /// (بحث نافذة الإتلاف) بدل تنزيل المخزون كاملاً.
+  Future<List<Map<String, dynamic>>> searchMedicines({
+    required String query,
+    int limit = 20,
+    bool inStockOnly = true,
+  }) async {
+    final uri = Uri.parse('$_baseUrl/medicines/').replace(queryParameters: {
+      'search': query,
+      'page_size': '$limit',
+      if (inStockOnly) 'in_stock': '1',
+    });
+    final page = await _get(url: uri.toString());
+    return (page['results'] as List? ?? const []).whereType<Map<String, dynamic>>().toList();
+  }
+
   Future<List<Map<String, dynamic>>> fetchMedicines() async {
     final results = <Map<String, dynamic>>[];
     String? nextUrl = '$_baseUrl/medicines/';

@@ -7,6 +7,7 @@ import '../models/pharmacy_branch_model.dart'; // 👈 تأكد من صحة ال
 // استيراد المكونات المخصصة
 import '../widgets/app_sidebar.dart';
 import '../widgets/app_header.dart';
+import '../help/screen_help_content.dart';
 
 // استيراد الشاشات
 import '../screens/dashboard_screen.dart';
@@ -186,6 +187,7 @@ class _MainLayoutState extends State<MainLayout> {
           pharmacyId: widget.pharmacyId,
           isOwner: widget.isOwner,
           isOnlineMode: widget.isOnlineMode,
+          userId: widget.userId,
         );
       case "المذاخر والمشتريات":
         return MissingSuppliersScreen(
@@ -245,6 +247,7 @@ class _MainLayoutState extends State<MainLayout> {
                     pharmacyName: _pharmacyName,
                     pageTitle: _currentPage,
                     icon: _pageIcons[_currentPage] ?? Icons.circle,
+                    help: screenHelpFor(_currentPage),
                   ),
 
                   LicenseExpiryBanner(expiry: widget.licenseExpiry),

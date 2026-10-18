@@ -20,15 +20,18 @@ class InvoiceListTests(ReportsTestBase):
             User.objects.create_user(f"seller{i}", password=PASSWORD, first_name=name)
             for i, name in enumerate(["Ali", "Sara", "Omar"])
         ]
-        # 60 فاتورة على 6 أيام، 3 بائعين مختلفين، كل خامسة مسترجعة.
+        # 60 فاتورة على 6 أيام، 3 بائعين مختلفين، كل خامسة مسترجعة، الزوجية
+        # بخصم. الفاتورة 7 فيها صنف ثانٍ "Panadol" (للبحث باسم الدواء).
         for i in range(60):
+            discount = Decimal("1") if i % 2 == 0 else Decimal("0")
             invoice = Invoice.objects.create(
                 pharmacy=self.pharmacy, invoice_number=f"INV-{i:06d}", cashier=self.sellers[i % 3],
-                total_amount=Decimal("10"), discount=Decimal("1"), final_amount=Decimal("9"),
+                total_amount=Decimal("10"), discount=discount, final_amount=Decimal("10") - discount,
                 is_refunded=i % 5 == 0, created_at=self.at(-(i % 6), 10),
             )
-            InvoiceItem.objects.create(invoice=invoice, medicine=medicine, trade_name="Med", quantity=1,
-                                       unit_price=Decimal("10"), total_price=Decimal("10"))
+            for name in ["Med", "Panadol"] if i == 7 else ["Med"]:
+                InvoiceItem.objects.create(invoice=invoice, medicine=medicine, trade_name=name, quantity=1,
+                                           unit_price=Decimal("10"), total_price=Decimal("10"))
 
     def list(self, token=None, **params):
         query = "&".join(f"{k}={v}" for k, v in params.items())
@@ -63,11 +66,36 @@ class InvoiceListTests(ReportsTestBase):
         dates = [r["created_at"] for r in first["results"]]
         self.assertEqual(dates, sorted(dates, reverse=True))
 
-    def test_search_by_invoice_number_and_seller(self):
+    def test_search_by_invoice_number_and_medicine_name(self):
         self.assertEqual(self.list(search="INV-000007").json()["count"], 1)
-        # البائع Sara = كل فاتورة i % 3 == 1.
-        self.assertEqual(self.list(search="sara").json()["count"], 20)
+        # اسم دواء: بلا تكرار للفاتورة 7 رغم أن فيها صنفين يطابقان "Med"/"Panadol".
+        self.assertEqual(self.list(search="panadol").json()["count"], 1)
+        self.assertEqual(self.list(search="med").json()["count"], 60)
         self.assertEqual(self.list(search="nobody").json()["count"], 0)
+
+    def test_seller_status_and_discount_filters_combine(self):
+        # Sara = i % 3 == 1 → 20 فاتورة.
+        self.assertEqual(self.list(seller="Sara").json()["count"], 20)
+        self.assertEqual(self.list(status="refunded").json()["count"], 12)
+        self.assertEqual(self.list(status="completed").json()["count"], 48)
+        self.assertEqual(self.list(discount="with").json()["count"], 30)
+        self.assertEqual(self.list(discount="without").json()["count"], 30)
+        # Sara + بخصم + مكتملة: i % 3 == 1، زوجي، i % 5 != 0 → i ≡ 4 (mod 6) بلا مضاعفات 5.
+        expected = len([i for i in range(60) if i % 3 == 1 and i % 2 == 0 and i % 5 != 0])
+        body = self.list(seller="Sara", discount="with", status="completed").json()
+        self.assertEqual(body["count"], expected)
+        self.assertEqual(self.list(status="paid").status_code, 400)
+        self.assertEqual(self.list(discount="maybe").status_code, 400)
+
+    def test_sellers_list_and_unknown_seller_filter(self):
+        Invoice.objects.create(pharmacy=self.pharmacy, invoice_number="INV-MIG-1", cashier=None,
+                               created_at=self.at(0, 9))
+        response = self.client.get("/api/invoices/sellers/", HTTP_AUTHORIZATION="Token " + self.staff_token)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["sellers"], sorted(["Ali", "Omar", "Sara", "بائع غير محدد"]))
+        body = self.list(seller="بائع غير محدد").json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["cashier_display_name"], "بائع غير محدد")
 
     def test_date_filter_is_inclusive_local_days(self):
         today = self.day(0).isoformat()

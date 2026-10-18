@@ -422,6 +422,7 @@ class _PosScreenState extends State<PosScreen> {
           pharmacyId: widget.pharmacyId,
           isOnlineMode: widget.isOnlineMode,
           invoiceId: invoice['id'],
+          userId: widget.userId,
         );
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(

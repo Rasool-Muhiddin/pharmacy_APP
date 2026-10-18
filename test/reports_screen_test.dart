@@ -298,7 +298,7 @@ void main() {
     expect(find.text('3 أصناف نفدت أو أوشكت على النفاد'), findsOneWidget);
     await tester.tap(find.byKey(const Key('alert-expiry')));
     await tester.pumpAndSettle();
-    expect(fake.calls, contains('inventory:30'));
+    expect(fake.calls, contains('inventory:90')); // الافتراضي 90 يوماً
     expect(find.text('منتهية الصلاحية ولم تُسجَّل كتالف'), findsOneWidget);
     expect(find.byKey(const Key('record-expired-8')), findsOneWidget);
   });

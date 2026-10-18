@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../repository/expense_repository.dart';
+import '../widgets/stat_card.dart';
 
 class ExpensesScreen extends StatefulWidget {
   final int pharmacyId;
@@ -297,15 +298,11 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
                     const Row(children: [Icon(Icons.account_balance_wallet_outlined, color: Color(0xFFE53E3E), size: 29), SizedBox(width: 9), Text('المصروفات', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF2C3E50)))]),
                     ElevatedButton.icon(onPressed: () => _showExpenseDialog(), icon: const Icon(Icons.add_circle_outline, size: 18), label: const Text('إضافة مصروف'), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1ABC9C), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
                   ]),
-                  const Padding(padding: EdgeInsets.symmetric(vertical: 20), child: Divider(color: Color(0xFFEDF2F7))),
-                  const SizedBox(height: 22),
-                  LayoutBuilder(builder: (context, constraints) {
-                    final width = constraints.maxWidth > 700 ? (constraints.maxWidth - 16) / 2 : constraints.maxWidth;
-                    return Wrap(spacing: 16, runSpacing: 16, children: [
-                      _summaryCard('إجمالي مصروفات الفترة', '${_moneyFormat.format(_total)} د.ع', Icons.payments_outlined, const Color(0xFFE53E3E), width),
-                      _summaryCard('عدد المصروفات', '${_expenses.length} عملية', Icons.receipt_long_outlined, const Color(0xFF1ABC9C), width),
-                    ]);
-                  }),
+                  const Padding(padding: EdgeInsets.symmetric(vertical: 16), child: Divider(color: Color(0xFFEDF2F7))),
+                  StatCardRow(cards: [
+                    StatCard(title: 'إجمالي مصروفات الفترة', value: '${_moneyFormat.format(_total)} د.ع', icon: Icons.payments_outlined, accentColor: const Color(0xFFE53E3E)),
+                    StatCard(title: 'عدد المصروفات', value: '${_expenses.length} عملية', icon: Icons.receipt_long_outlined, accentColor: const Color(0xFF1ABC9C), valueColor: const Color(0xFF2D3748)),
+                  ]),
                   const SizedBox(height: 22),
                   _filters(),
                   const SizedBox(height: 22),
@@ -319,17 +316,11 @@ class _ExpensesScreenState extends State<ExpensesScreen> {
     );
   }
 
-  Widget _summaryCard(String title, String value, IconData icon, Color color, double width) => Container(
-    width: width, height: 150, padding: const EdgeInsets.all(25),
-    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10), border: Border(right: BorderSide(color: color, width: 6)), boxShadow: const [BoxShadow(color: Color(0x0A000000), blurRadius: 12)]),
-    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [Icon(icon, color: const Color(0xFF718096), size: 18), const SizedBox(width: 6), Text(title, style: const TextStyle(color: Color(0xFF718096), fontWeight: FontWeight.w600, fontSize: 15))]), const Spacer(), Text(value, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 25, color: color))]),
-  );
-
   Widget _filters() => Container(
     padding: const EdgeInsets.all(22),
     decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(10), border: Border.all(color: const Color(0xFFEDF2F7))),
     child: LayoutBuilder(builder: (context, constraints) {
-      final typeSelector = DropdownButtonFormField<String?>(initialValue: _selectedType, decoration: const InputDecoration(labelText: 'نوع المصروف', filled: true, fillColor: Colors.white, border: OutlineInputBorder()), items: [const DropdownMenuItem<String?>(value: null, child: Text('كل الأنواع')), ..._types.map((type) => DropdownMenuItem<String?>(value: type, child: Text(type)))], onChanged: (value) => setState(() => _selectedType = value));
+      final typeSelector = DropdownButtonFormField<String?>(initialValue: _selectedType, isExpanded: true, decoration: const InputDecoration(labelText: 'نوع المصروف', filled: true, fillColor: Colors.white, border: OutlineInputBorder()), items: [const DropdownMenuItem<String?>(value: null, child: Text('كل الأنواع')), ..._types.map((type) => DropdownMenuItem<String?>(value: type, child: Text(type)))], onChanged: (value) => setState(() => _selectedType = value));
       final searchButton = ElevatedButton.icon(onPressed: _loadExpenses, icon: const Icon(Icons.filter_alt_outlined, size: 18), label: const Text('بحث وتصفية'), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF3182CE), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 17), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(7))));
 
       if (constraints.maxWidth >= 850) {

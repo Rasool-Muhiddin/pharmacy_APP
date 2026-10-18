@@ -19,12 +19,12 @@ class ReportsLocalService {
   final DatabaseHelper _helper;
   final DateTime Function() _clock;
 
-  static const int expiryAlertDays = 30;
+  static const int expiryAlertDays = 90;
   static const int topItemsLimit = 20;
   static const int topDebtorsLimit = 10;
   static const int defaultPageSize = 50;
   static const int maxPageSize = 200;
-  static const String unknownSeller = 'بائع غير محدد';
+  static const String unknownSeller = DatabaseHelper.unknownSeller;
 
   static const String _lineDiscount =
       '(CASE WHEN i.total_amount > 0 THEN i.discount * ii.total_price * 1.0 / i.total_amount ELSE 0 END)';
@@ -32,8 +32,7 @@ class ReportsLocalService {
   static const String _lineCost = '(ii.unit_cost * ii.quantity)';
   static const String _batchValue = '(b.quantity * COALESCE(b.purchase_price, m.avg_cost, m.buy_price, 0))';
   static const String _medicineCost = 'COALESCE(m.avg_cost, m.buy_price, 0)';
-  static const String _sellerName =
-      "COALESCE(NULLIF(TRIM(u.full_name), ''), NULLIF(TRIM(u.username), ''), NULLIF(TRIM(i.cashier_name_synced), ''), '$unknownSeller')";
+  static const String _sellerName = DatabaseHelper.sellerNameSql;
 
   double _r(Object? v) => DatabaseHelper.roundMoney((v as num?) ?? 0);
   int _i(Object? v) => (v as num?)?.toInt() ?? 0;

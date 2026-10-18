@@ -366,6 +366,22 @@ void main() {
     expect(find.text('المتبقي: 300 د.ع'), findsOneWidget); // النافذة تتحدث بعد الدفع
   });
 
+  testWidgets('suppliers cannot be deleted: no delete option for any supplier', (tester) async {
+    await pumpScreen(tester);
+    for (final name in ['مذخر الشفاء', 'مذخر مسدد']) {
+      await openSupplier(tester, name);
+      expect(find.byTooltip('المزيد'), findsNothing);
+      expect(find.text('حذف المذخر'), findsNothing);
+      expect(find.textContaining('حذف'), findsNothing);
+      await tester.tap(find.byKey(const Key('supplier-details-close')));
+      await tester.pumpAndSettle();
+    }
+    // ولا يوجد مسار حذف في طبقة البيانات أصلاً.
+    for (final path in ['lib/repository/suppliers_repository.dart', 'lib/services/suppliers_api_service.dart', 'lib/database/db_helper.dart']) {
+      expect(File(path).readAsStringSync().contains('deleteSupplier'), isFalse, reason: path);
+    }
+  });
+
   testWidgets('edit dialog has only the name field and keeps names unique', (tester) async {
     await pumpScreen(tester);
     await openSupplier(tester, 'مذخر مسدد');

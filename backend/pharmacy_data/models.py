@@ -224,6 +224,18 @@ class Invoice(models.Model):
     # الحقيقي القادم من الجهاز المحلي بدل تاريخ يوم الترحيل.
     created_at = models.DateTimeField(default=timezone.now)
     is_refunded = models.BooleanField(default=False)
+    # من أرجع الفاتورة ومتى (InvoiceViewSet.refund يملؤهما من صاحب الطلب).
+    # refunded_by_name لإرجاعات مرحَّلة من أوفلاين بلا حساب Django وراءها
+    # (نفس فكرة cashier_name). فواتير أُرجعت قبل هذه الحقول تبقى فارغة.
+    refunded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoices_refunded",
+    )
+    refunded_by_name = models.CharField(max_length=150, blank=True, default="")
+    refunded_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

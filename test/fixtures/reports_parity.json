@@ -67,7 +67,7 @@
         "expenses": 200, "damage_cost": 0, "net_profit": 1000
       },
       "alerts": {
-        "below_cost_count": 1, "expiring_days": 30, "expiring_count": 1, "expiring_value": 1200,
+        "below_cost_count": 1, "expiring_days": 90, "expiring_count": 1, "expiring_value": 1200,
         "expired_count": 1, "expired_value": 300, "low_stock_count": 4, "out_of_stock_count": 1
       }
     },
@@ -97,7 +97,7 @@
       "results": [{"medicine": "D", "quantity": 10, "stock_value": 9000, "category": "injection", "last_sale_offset": -8}]
     },
     "inventory": {
-      "days": 30,
+      "days": 90,
       "stock_cost_value": 18500, "stock_sell_value": 37500, "expected_profit": 19000,
       "expiring": [{"medicine": "B", "quantity": 4, "value": 1200, "supplier_name": "S2", "expiry_offset": 20}],
       "expiring_value": 1200,

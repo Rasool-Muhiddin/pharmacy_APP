@@ -18,7 +18,7 @@ class InventoryTab extends StatefulWidget {
 class _InventoryTabState extends State<InventoryTab> {
   ReportsScope get s => widget.scope;
 
-  int _days = 30;
+  int _days = 90; // نفس ReportsLocalService.expiryAlertDays (90 افتراضياً)
 
   void _retry() => setState(() {});
 

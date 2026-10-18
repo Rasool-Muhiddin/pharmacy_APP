@@ -221,6 +221,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
     # المُرحَّلة من أوفلاين: cashier=None وcashier_name نص محفوظ من الجهاز
     # المحلي وقت الترحيل. هذا الحقل يوحّد الاثنين لعرض واحد في الواجهة.
     cashier_display_name = serializers.SerializerMethodField()
+    # من أرجع الفاتورة: حساب المستخدم، وإلا الاسم المرحَّل من أوفلاين؛ null = غير مسجَّل.
+    refunded_by_display = serializers.SerializerMethodField()
 
     class Meta:
         model = Invoice
@@ -235,6 +237,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "final_amount",
             "created_at",
             "is_refunded",
+            "refunded_at",
+            "refunded_by_display",
             "updated_at",
             "items",
         ]
@@ -244,6 +248,11 @@ class InvoiceSerializer(serializers.ModelSerializer):
         if obj.cashier is not None:
             return obj.cashier.get_full_name() or obj.cashier.username
         return obj.cashier_name or "بائع غير محدد"
+
+    def get_refunded_by_display(self, obj):
+        if obj.refunded_by is not None:
+            return obj.refunded_by.get_full_name() or obj.refunded_by.username
+        return obj.refunded_by_name or None
 
 
 class SupplyInputSerializer(serializers.Serializer):

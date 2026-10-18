@@ -28,16 +28,31 @@ void main() {
     await db.insert('pharmacy_branch', {'id': pharmacyId, 'name': 'P', 'created_at': '2026-10-01T00:00:00'});
     await db.insert('users', {'id': 5, 'username': 'sara', 'password': '', 'full_name': 'Sara'});
     await db.insert('user_profile', {'id': 5, 'user_id': 5, 'pharmacy_id': pharmacyId, 'is_owner': 0});
-    // 25 فاتورة على 5 أيام (1–5 أكتوبر)، البائعة Sara لكل ثالثة.
+    await db.insert('warehouses', {'id': base, 'pharmacy_id': pharmacyId, 'name': 'Main', 'is_main': 1, 'created_at': '2026-10-01T00:00:00'});
+    await db.insert('medicine', {'id': base, 'pharmacy_id': pharmacyId, 'warehouse_id': base, 'trade_name': 'Med'});
+    // 25 فاتورة على 5 أيام (1–5 أكتوبر)، البائعة Sara لكل ثالثة (الباقي بلا
+    // بائع)، الزوجية بخصم، كل خامسة مسترجعة، والفاتورة 7 فيها "Panadol" أيضاً.
     for (var i = 0; i < 25; i++) {
       await db.insert('invoice', {
         'id': base + i,
         'pharmacy_id': pharmacyId,
         'invoice_number': 'INV-${i.toString().padLeft(6, '0')}',
         'cashier_id': i % 3 == 0 ? 5 : null,
+        'discount': i.isEven ? 1 : 0,
         'final_amount': 10,
+        'is_refunded': i % 5 == 0 ? 1 : 0,
         'created_at': '2026-10-0${i % 5 + 1}T1${i % 10}:00:00',
       });
+      for (final name in i == 7 ? ['Med', 'Panadol'] : ['Med']) {
+        await db.insert('invoice_item', {
+          'invoice_id': base + i,
+          'medicine_id': base,
+          'trade_name': name,
+          'quantity': 1,
+          'unit_price': 10,
+          'total_price': 10,
+        });
+      }
     }
   });
 
@@ -46,14 +61,27 @@ void main() {
     await tempDir.delete(recursive: true);
   });
 
-  Future<InvoicePage> page(int n, {String search = '', DateTime? start, DateTime? end}) => repo.getInvoicesPage(
+  Future<InvoicePage> page(
+    int n, {
+    String search = '',
+    DateTime? start,
+    DateTime? end,
+    String? seller,
+    bool? refunded,
+    bool? hasDiscount,
+    int pageSize = 10,
+  }) =>
+      repo.getInvoicesPage(
         pharmacyId: pharmacyId,
         isOnlineMode: false,
         page: n,
-        pageSize: 10,
+        pageSize: pageSize,
         search: search,
         start: start,
         end: end,
+        seller: seller,
+        refunded: refunded,
+        hasDiscount: hasDiscount,
       );
 
   test('pages walk all invoices newest first without overlap', () async {
@@ -66,11 +94,34 @@ void main() {
     expect(dates, [...dates]..sort((a, b) => b.compareTo(a)));
   });
 
-  test('search matches invoice number or seller name', () async {
+  test('search matches invoice number or a sold medicine name', () async {
     expect((await page(1, search: 'INV-000007')).rows.single['invoice_number'], 'INV-000007');
-    final sara = await page(1, search: 'sara');
+    expect((await page(1, search: 'panadol')).rows.single['invoice_number'], 'INV-000007');
+    // صنفان مطابقان في الفاتورة 7 لا يكرّرانها.
+    expect((await page(1, search: 'med', pageSize: 50)).rows, hasLength(25));
+    expect((await page(1, search: 'sara')).rows, isEmpty);
+  });
+
+  test('seller list and filter include unspecified seller', () async {
+    final sellers = await repo.getSellers(pharmacyId: pharmacyId, isOnlineMode: false);
+    expect(sellers, unorderedEquals(['Sara', DatabaseHelper.unknownSeller]));
+    final sara = await page(1, seller: 'Sara', pageSize: 50);
     expect(sara.rows, hasLength(9));
     expect(sara.rows.every((r) => r['cashier_name'] == 'Sara'), isTrue);
+    expect((await page(1, seller: DatabaseHelper.unknownSeller, pageSize: 50)).rows, hasLength(16));
+  });
+
+  test('status, discount, seller and search filters combine', () async {
+    expect((await page(1, refunded: true, pageSize: 50)).rows, hasLength(5));
+    expect((await page(1, refunded: false, pageSize: 50)).rows, hasLength(20));
+    expect((await page(1, hasDiscount: true, pageSize: 50)).rows, hasLength(13));
+    expect((await page(1, hasDiscount: false, pageSize: 50)).rows, hasLength(12));
+    // Sara (i % 3 == 0) + بخصم (زوجي) + مكتملة (i % 5 != 0) → 6، 12، 18، 24.
+    final combined = await page(1, seller: 'Sara', hasDiscount: true, refunded: false, pageSize: 50);
+    expect(combined.rows.map((r) => r['invoice_number']),
+        unorderedEquals(['INV-000006', 'INV-000012', 'INV-000018', 'INV-000024']));
+    final withSearch = await page(1, seller: 'Sara', hasDiscount: true, refunded: false, search: '0001');
+    expect(withSearch.rows.map((r) => r['invoice_number']), unorderedEquals(['INV-000012', 'INV-000018']));
   });
 
   test('date range is inclusive by local invoice date', () async {

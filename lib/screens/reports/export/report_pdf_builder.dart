@@ -185,7 +185,7 @@ pw.Widget _alerts(ReportExportData d) {
     ['التنبيه', 'العدد', 'القيمة'],
     [
       ['أصناف تُباع بأقل من كلفتها', _int(a['below_cost_count']), '-'],
-      ['تنتهي صلاحيتها خلال ${xi(a['expiring_days'] ?? 30)} يوماً', _int(a['expiring_count']), _money(a['expiring_value'])],
+      ['تنتهي صلاحيتها خلال ${xi(a['expiring_days'] ?? 90)} يوماً', _int(a['expiring_count']), _money(a['expiring_value'])],
       ['منتهية غير مُسجَّلة كتالف', _int(a['expired_count']), _money(a['expired_value'])],
       ['نفدت أو أوشكت على النفاد', _int(a['low_stock_count']), '-'],
       ['منها نفدت بالكامل', _int(a['out_of_stock_count']), '-'],

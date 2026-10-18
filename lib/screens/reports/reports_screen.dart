@@ -153,7 +153,7 @@ class _ReportsScreenState extends State<ReportsScreen> with SingleTickerProvider
           body: Center(
             child: Text(
               "عذراً، هذه الصفحة مخصصة للإدارة فقط.",
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFFC53030), fontFamily: 'Tajawal'),
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFFC53030)),
             ),
           ),
         ),
@@ -188,7 +188,7 @@ class _ReportsScreenState extends State<ReportsScreen> with SingleTickerProvider
                         labelColor: RC.tealDark,
                         unselectedLabelColor: RC.muted,
                         indicatorColor: RC.tealDark,
-                        labelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, fontFamily: 'Tajawal'),
+                        labelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                         tabs: [
                           for (var i = 0; i < ReportTab.labels.length; i++)
                             Tab(height: 46, icon: null, child: Row(mainAxisSize: MainAxisSize.min, children: [
@@ -249,7 +249,7 @@ class _ReportsScreenState extends State<ReportsScreen> with SingleTickerProvider
               const Icon(Icons.insert_chart_rounded, color: RC.teal, size: 26),
               const SizedBox(width: 8),
               const Text('التقارير',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF2C3E50), fontFamily: 'Tajawal')),
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF2C3E50))),
               Expanded(
                 child: Text(
                   'آخر تحديث ${DateFormat('HH:mm').format(_updatedAt)}',
@@ -547,7 +547,7 @@ class _AlertsStrip extends StatelessWidget {
               key: const Key('alert-expiry'),
               text: [
                 if (expiring > 0)
-                  '$expiring صنفاً تنتهي صلاحيتها خلال ${a['expiring_days'] ?? 30} يوماً بقيمة ${iqd(a['expiring_value'])}',
+                  '$expiring صنفاً تنتهي صلاحيتها خلال ${a['expiring_days'] ?? 90} يوماً بقيمة ${iqd(a['expiring_value'])}',
                 if (expired > 0) '$expired منتهية غير مُسجَّلة كتالف بقيمة ${iqd(a['expired_value'])}',
               ].join('  •  '),
               icon: Icons.event_busy_outlined,

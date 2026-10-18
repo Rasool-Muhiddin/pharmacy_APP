@@ -464,6 +464,8 @@ def iter_offline_import(pharmacy, payload):
                 final_amount=Decimal(str(item.get("final_amount") or 0)),
                 created_at=_parse_datetime(item.get("created_at")) or timezone.now(),
                 is_refunded=bool(item.get("is_refunded") or False),
+                refunded_by_name=(item.get("refunded_by_name") or "")[:150],
+                refunded_at=_parse_datetime(item.get("refunded_at")),
             )
             for it in item.get("items") or []:
                 local_medicine_id = it.get("local_medicine_id")

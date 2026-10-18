@@ -1,4 +1,5 @@
 import '../database/db_helper.dart';
+import '../models/damage_reasons.dart';
 import '../models/purchase_list.dart';
 import '../services/connectivity_service.dart';
 import '../services/damaged_api_service.dart';
@@ -34,13 +35,30 @@ class MedicineRepository {
   final ConnectivityService _connectivity = ConnectivityService.instance;
 
   /// [syncWarehouses] = false عندما زامن المستدعي المخازن للتو (شاشة المخزون).
+  ///
+  /// [warehouseId]/[search]/[category]: فلاتر العرض (انظر
+  /// DatabaseHelper.getMedicines). تُطبَّق دائماً على الجدول المحلي — أونلاين
+  /// هو نسخة كاملة من مخزون الخادم بعد المزامنة، فلا حاجة لفلترة على الخادم.
+  /// [syncFromServer] = false: فلترة على آخر مزامنة بلا طلب شبكة (البحث
+  /// الحي أثناء الكتابة، بدل تنزيل المخزون كاملاً مع كل حرف).
   Future<List<Map<String, dynamic>>> getMedicines({
     required int pharmacyId,
     required bool isOnlineMode,
     bool syncWarehouses = true,
+    bool syncFromServer = true,
+    int? warehouseId,
+    String search = '',
+    String? category,
   }) async {
-    if (!isOnlineMode) {
-      return _db.getMedicines(pharmacyId);
+    Future<List<Map<String, dynamic>>> local() => _db.getMedicines(
+          pharmacyId,
+          warehouseId: warehouseId,
+          search: search,
+          category: category,
+        );
+
+    if (!isOnlineMode || !syncFromServer) {
+      return local();
     }
 
     try {
@@ -59,8 +77,12 @@ class MedicineRepository {
       // الكتابة تبقى ممنوعة (انظر addMedicine/updateMedicine/deleteMedicine).
       if (!ApiHttp.isNetworkError(e)) rethrow;
     }
-    return _db.getMedicines(pharmacyId);
+    return local();
   }
+
+  /// الفئات الموجودة فعلاً في الأصناف (آخر مزامنة أونلاين)، '' = بلا فئة.
+  Future<List<String>> getCategories({required int pharmacyId, int? warehouseId}) =>
+      _db.getMedicineCategories(pharmacyId, warehouseId: warehouseId);
 
   Future<Map<String, dynamic>> addMedicine({
     required int pharmacyId,
@@ -145,6 +167,69 @@ class MedicineRepository {
     for (final item in serverItems.whereType<Map<String, dynamic>>()) {
       await _db.upsertMedicineFromServer(pharmacyId: pharmacyId, serverData: item);
     }
+  }
+
+  /// أقصى عدد نتائج لبحث نافذة الإتلاف (لا تُعرض كل الأصناف دفعة واحدة).
+  static const int pickerLimit = 20;
+
+  /// بحث نافذة الإتلاف: أصناف بكمية يطابق اسمها التجاري/العلمي أو باركودها
+  /// [query]، حتى [limit]. أونلاين: صفحة صغيرة من الخادم (كميات حالية من كل
+  /// الأجهزة)؛ بلا اتصال أو أوفلاين: الجدول المحلي. كل صف: id, trade_name,
+  /// scientific_name, barcode, quantity, warehouse_id, warehouse_name.
+  Future<List<Map<String, dynamic>>> searchMedicinesForPicker({
+    required int pharmacyId,
+    required bool isOnlineMode,
+    required String query,
+    int limit = pickerLimit,
+  }) async {
+    final text = query.trim();
+    if (text.isEmpty) return [];
+    if (isOnlineMode) {
+      try {
+        final rows = await _api.searchMedicines(query: text, limit: limit);
+        final names = await _db.getWarehouseNames(pharmacyId);
+        return [
+          for (final r in rows.take(limit))
+            {
+              'id': r['id'],
+              'trade_name': r['trade_name'],
+              'scientific_name': r['scientific_name'],
+              'barcode': r['barcode'],
+              'quantity': r['quantity'],
+              'warehouse_id': r['warehouse'],
+              'warehouse_name': names[r['warehouse']],
+            },
+        ];
+      } catch (e) {
+        if (!ApiHttp.isNetworkError(e)) rethrow;
+      }
+    }
+    return _db.searchMedicinesForPicker(pharmacyId, text, limit: limit);
+  }
+
+  /// سجل الإتلاف (شاشة التوالف). أونلاين مع [syncFromServer]: يُزامَن كاش
+  /// السجلات من الخادم أولاً (بلا اتصال: آخر كاش محفوظ). [search] يُطبَّق
+  /// دائماً على الجدول المحلي — البحث الحي يمرّر syncFromServer = false كي لا
+  /// يُنزَّل السجل كاملاً مع كل حرف.
+  Future<List<Map<String, dynamic>>> getDamagedMedicines({
+    required int pharmacyId,
+    required bool isOnlineMode,
+    bool syncFromServer = true,
+    String search = '',
+  }) async {
+    if (isOnlineMode && syncFromServer) {
+      try {
+        final serverItems = await _damagedApi.fetchDamagedMedicines();
+        await _db.replaceDamagedMedicinesCache(pharmacyId: pharmacyId, serverItems: serverItems);
+      } catch (e) {
+        if (!ApiHttp.isNetworkError(e)) rethrow;
+      }
+    }
+    return _db.getDamagedMedicines(
+      pharmacyId,
+      search: search,
+      reasonKeys: damageReasonKeysMatching(search),
+    );
   }
 
   /// إتلاف جزء من كمية دواء (خصم من المخزن + تسجيل السبب).

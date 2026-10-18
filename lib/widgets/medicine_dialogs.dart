@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 
+import '../models/damage_reasons.dart';
 import '../models/medicine_categories.dart';
+
+export '../models/damage_reasons.dart' show damageReasons;
 import '../repository/medicine_repository.dart';
 import '../repository/warehouse_repository.dart';
 import '../services/medicine_api_service.dart';
@@ -9,16 +12,12 @@ import '../services/warehouse_api_service.dart';
 /// نافذتا تعديل بيانات الدواء والإتلاف الجزئي — مشتركتان بين شاشة المخزون
 /// وشاشة التقارير (تعديل سعر صنف يُباع بأقل من كلفته، تسجيل منتهي كتالف).
 
-/// أسباب الإتلاف. 'correction' لتصحيح خطأ إدخال كمية — لا يُحتسب خسارة.
-/// 'expired' لتسجيل دفعة منتهية الصلاحية كتالف (من تقرير المخزون).
-const Map<String, String> damageReasons = {
-  'broken': 'كسر وضرر',
-  'spoiled': 'سوء خزن',
-  'withdrawn': 'سحب وزاري',
-  'expired': 'انتهاء الصلاحية',
-  'correction': 'تصحيح إدخال (خطأ كمية)',
-  'other': 'أسباب أخرى',
-};
+
+/// حذف صنف له مبيعات أو إتلاف مرفوض (الحذف لأصناف أُدخلت بالخطأ فقط). نفس نص
+/// الخادم (views.MEDICINE_IN_USE_MESSAGE).
+const String medicineInUseMessage =
+    'لا يمكن حذف هذا الدواء لأن له سجل مبيعات أو إتلاف سابق. لتصحيح كمية خاطئة استخدم زر '
+    '"إتلاف" وانقل الكمية إلى التالف (سبب "تصحيح إدخال" لا يُحتسب خسارة).';
 
 // تحويل رسائل خطأ قاعدة البيانات الخام (طويلة وتقنية) إلى سبب مباشر
 // ومفهوم للصيدلي، بدل عرض نص الاستثناء الكامل بالـ SnackBar

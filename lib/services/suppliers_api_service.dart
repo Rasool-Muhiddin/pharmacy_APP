@@ -73,8 +73,6 @@ class SuppliersApiService {
     return _send(method: 'PATCH', url: '$_baseUrl/suppliers/$id/', body: {'name': name});
   }
 
-  Future<void> deleteSupplier(int id) => _delete(url: '$_baseUrl/suppliers/$id/');
-
   // ================== فواتير الشراء (Purchase Invoices) ==================
 
   Future<List<Map<String, dynamic>>> fetchPurchaseInvoices(int supplierId) async {
@@ -148,13 +146,6 @@ class SuppliersApiService {
       return await ApiHttp.request(method, url, token: token, body: body);
     } on ApiHttpException catch (e) {
       throw SuppliersApiException(e.message, statusCode: e.statusCode, isNetworkError: e.isNetworkError);
-    }
-  }
-
-  Future<void> _delete({required String url}) async {
-    final response = await _request('DELETE', url);
-    if (!response.isSuccess) {
-      throw SuppliersApiException('تعذر تنفيذ عملية الحذف.', statusCode: response.statusCode);
     }
   }
 

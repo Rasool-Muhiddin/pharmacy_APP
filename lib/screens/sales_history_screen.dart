@@ -4,18 +4,39 @@ import 'package:flutter/material.dart';
 import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart';
 import '../repository/invoice_repository.dart';
+import '../widgets/filter_dropdown.dart';
 
 class SalesHistoryScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOwner;
   final bool isOnlineMode; // من license.mode القادم من التفعيل/تسجيل الدخول
 
+  /// المستخدم الحالي (user_profile.id أوفلاين) — يُسجَّل كمنفّذ الإرجاع.
+  final int? userId;
+
   const SalesHistoryScreen({
     super.key,
     required this.pharmacyId,
     this.isOwner = true,
     this.isOnlineMode = false, // قيمة افتراضية آمنة (أوفلاين)
+    this.userId,
   });
+
+  /// من أرجع الفاتورة ومتى. فواتير أُرجعت قبل تسجيل ذلك لا تحمل الاسم ولا الوقت.
+  static String refundInfoText(Map<String, dynamic> invoice) {
+    final by = (invoice['refunded_by_display'] ?? '').toString().trim();
+    final rawAt = (invoice['refunded_at'] ?? '').toString().trim();
+    final at = DateTime.tryParse(rawAt)?.toLocal();
+    final when = at == null
+        ? ''
+        : '${at.year}-${at.month.toString().padLeft(2, '0')}-${at.day.toString().padLeft(2, '0')} '
+            '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}';
+    if (by.isEmpty && when.isEmpty) return 'تم الإرجاع (قبل تسجيل المنفّذ)';
+    return [
+      'تم الإرجاع بواسطة: ${by.isEmpty ? 'غير معروف' : by}',
+      if (when.isNotEmpty) 'بتاريخ: $when',
+    ].join('  •  ');
+  }
 
   @override
   State<SalesHistoryScreen> createState() => _SalesHistoryScreenState();
@@ -33,14 +54,35 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
   DateTime? _startDate;
   DateTime? _endDate;
   Timer? _searchDebounce;
-  // يتجاهل ردود طلبات أقدم إن تغيّر البحث/الفترة أثناء انتظارها.
+  // يتجاهل ردود طلبات أقدم إن تغيّر البحث/الفلاتر أثناء انتظارها.
   int _requestSeq = 0;
   final TextEditingController _searchCtrl = TextEditingController();
+
+  // الفلاتر (null = الكل). البائع = اسمه كما يُعرض (DatabaseHelper.sellerNameSql
+  // محلياً، cashier_display_name على الخادم). الحالة: الفواتير إما مكتملة أو
+  // مسترجعة بالكامل (is_refunded) — لا حالات أخرى في النظام.
+  String? _seller;
+  bool? _refunded;
+  bool? _hasDiscount;
+  List<String> _sellers = [];
 
   @override
   void initState() {
     super.initState();
     _loadInvoices();
+    _loadSellers();
+  }
+
+  Future<void> _loadSellers() async {
+    try {
+      final sellers = await InvoiceRepository.instance.getSellers(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+      );
+      if (mounted) setState(() => _sellers = sellers);
+    } catch (_) {
+      // فلتر البائع اختياري: بلا قائمة يبقى "كل البائعين" فقط.
+    }
   }
 
   @override
@@ -106,13 +148,39 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
       search: _searchCtrl.text,
       start: _startDate,
       end: _endDate,
+      seller: _seller,
+      refunded: _refunded,
+      hasDiscount: _hasDiscount,
     );
   }
 
+  /// بحث حي: يُعاد التحميل بعد توقف الكتابة 300ms، لا مع كل حرف.
   void _onSearchChanged(String _) {
+    setState(() {}); // زر مسح الفلاتر يظهر/يختفي مع النص.
     _searchDebounce?.cancel();
-    _searchDebounce = Timer(const Duration(milliseconds: 400), _loadInvoices);
+    _searchDebounce = Timer(const Duration(milliseconds: 300), _loadInvoices);
   }
+
+  bool get _hasActiveFilters =>
+      _searchCtrl.text.trim().isNotEmpty ||
+      _startDate != null ||
+      _seller != null ||
+      _refunded != null ||
+      _hasDiscount != null;
+
+  void _clearFilters() {
+    _searchCtrl.clear();
+    setState(() {
+      _startDate = null;
+      _endDate = null;
+      _seller = null;
+      _refunded = null;
+      _hasDiscount = null;
+    });
+    _loadInvoices();
+  }
+
+  static String _sellerLabel(String name) => name == DatabaseHelper.unknownSeller ? 'غير محدد' : name;
 
   Future<void> _pickDateRange() async {
     final now = DateTime.now();
@@ -128,14 +196,6 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     setState(() {
       _startDate = picked.start;
       _endDate = picked.end;
-    });
-    _loadInvoices();
-  }
-
-  void _clearDateRange() {
-    setState(() {
-      _startDate = null;
-      _endDate = null;
     });
     _loadInvoices();
   }
@@ -174,6 +234,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
         pharmacyId: widget.pharmacyId,
         isOnlineMode: widget.isOnlineMode,
         invoiceId: invoiceId,
+        userId: widget.userId,
       );
       _showSnackBar('تم استرجاع الفاتورة بنجاح وإعادة الكميات للمخزن', Colors.green);
       _loadInvoices();
@@ -216,22 +277,26 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Row(
-                          children: [
-                            const Icon(Icons.receipt_long, color: Color(0xFF1ABC9C), size: 22),
-                            const SizedBox(width: 8),
-                            Text(
-                              "تفاصيل الفاتورة: ${(invoice['invoice_number'] ?? '').toString()}",
-                              style: const TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                                color: Color(0xFF2C3E50),
-                                fontFamily: 'Tajawal',
+                        Expanded(
+                          child: Row(
+                            children: [
+                              const Icon(Icons.receipt_long, color: Color(0xFF1ABC9C), size: 22),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  "تفاصيل الفاتورة: ${(invoice['invoice_number'] ?? '').toString()}",
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF2C3E50),
+                                  ),
+                                ),
                               ),
-                            ),
-                            const SizedBox(width: 10),
-                            _buildStatusChip(isRefunded),
-                          ],
+                              const SizedBox(width: 10),
+                              _buildStatusChip(isRefunded),
+                            ],
+                          ),
                         ),
                         IconButton(
                           icon: const Icon(Icons.close, color: Color(0xFFA0AEC0)),
@@ -243,6 +308,10 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
 
                     // معلومات ترويسة الفاتورة
                     _buildInvoiceHeaderInfo(invoice),
+                    if (isRefunded) ...[
+                      const SizedBox(height: 8),
+                      _buildRefundInfo(invoice),
+                    ],
                     const SizedBox(height: 12),
 
                     // جدول أصناف الفاتورة
@@ -472,68 +541,8 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                 ),
                 const SizedBox(height: 20),
 
-                // 2. شريط البحث بدون زر شفتات اليوم
-                Row(
-                  children: [
-                    Expanded(
-                      child: SizedBox(
-                        height: 48,
-                        child: TextField(
-                          controller: _searchCtrl,
-                          onChanged: _onSearchChanged,
-                          onSubmitted: (_) => _loadInvoices(),
-                          decoration: InputDecoration(
-                            hintText: '🔍 ابحث برقم الفاتورة أو اسم البائع...',
-                            hintStyle: TextStyle(color: Colors.grey.shade500, fontSize: 13),
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                            enabledBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                              borderSide: const BorderSide(color: primaryTeal, width: 1.5),
-                            ),
-                            focusedBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                              borderSide: const BorderSide(color: primaryTeal, width: 2),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: primaryTeal,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        elevation: 0,
-                      ),
-                      onPressed: _loadInvoices,
-                      icon: const Icon(Icons.search, size: 18),
-                      label: const Text('ابحث الآن', style: TextStyle(fontWeight: FontWeight.bold)),
-                    ),
-                    const SizedBox(width: 10),
-                    OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: primaryTeal,
-                        side: const BorderSide(color: primaryTeal, width: 1.5),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
-                      onPressed: _pickDateRange,
-                      icon: const Icon(Icons.date_range, size: 18),
-                      label: Text(
-                        _startDate == null ? 'كل الفترات' : '${_formatDay(_startDate!)} ← ${_formatDay(_endDate!)}',
-                        style: const TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                    if (_startDate != null)
-                      IconButton(
-                        tooltip: 'إلغاء فلتر التاريخ',
-                        onPressed: _clearDateRange,
-                        icon: const Icon(Icons.clear, color: Colors.grey),
-                      ),
-                  ],
-                ),
+                // 2. شريط البحث والفلاتر (صف واحد؛ صفّان على الشاشات الضيقة)
+                _buildFilterBar(primaryTeal),
                 if (_fromCache)
                   const Padding(
                     padding: EdgeInsets.only(top: 10),
@@ -549,7 +558,12 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                   child: _isLoading
                       ? const Center(child: CircularProgressIndicator())
                       : _invoices.isEmpty
-                          ? const Center(child: Text('لا توجد فواتير مطابقة للبحث', style: TextStyle(color: Colors.grey, fontSize: 16)))
+                          ? Center(
+                              child: Text(
+                                _hasActiveFilters ? 'لا توجد فواتير مطابقة للبحث والفلاتر' : 'لا توجد فواتير بعد',
+                                style: const TextStyle(color: Colors.grey, fontSize: 16),
+                              ),
+                            )
                           : ClipRRect(
                               borderRadius: BorderRadius.circular(8),
                               child: SingleChildScrollView(
@@ -586,7 +600,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                                       final finalAmount = (inv['final_amount'] as num?)?.toDouble() ?? 0.0;
                                       final totalAmount = (inv['total_amount'] as num?)?.toDouble() ?? (finalAmount + discount);
                                       final dtParts = _parseDateTime(inv['created_at']);
-                                      final cashierName = inv['cashier_name'] ?? 'غير محدد';
+                                      final cashierName = _sellerLabel((inv['cashier_name'] ?? DatabaseHelper.unknownSeller) as String);
 
                                       return DataRow(
                                         cells: [
@@ -678,6 +692,112 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     );
   }
 
+  Widget _buildFilterBar(Color primaryTeal) {
+    final search = SizedBox(
+      height: 48,
+      child: TextField(
+        controller: _searchCtrl,
+        onChanged: _onSearchChanged,
+        onSubmitted: (_) => _loadInvoices(),
+        decoration: InputDecoration(
+          hintText: '🔍 ابحث برقم الفاتورة أو اسم الدواء...',
+          hintStyle: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: primaryTeal, width: 1.5),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: primaryTeal, width: 2),
+          ),
+        ),
+      ),
+    );
+
+    final seller = _seller;
+    final filters = <Widget>[
+      FilterDropdown<String>(
+        value: seller,
+        allLabel: 'كل البائعين',
+        icon: Icons.person_outline,
+        width: 165,
+        options: {
+          for (final name in _sellers) name: _sellerLabel(name),
+          if (seller != null && !_sellers.contains(seller)) seller: _sellerLabel(seller),
+        },
+        onChanged: (value) {
+          setState(() => _seller = value);
+          _loadInvoices();
+        },
+      ),
+      const SizedBox(width: 8),
+      FilterDropdown<bool>(
+        value: _refunded,
+        allLabel: 'كل الحالات',
+        icon: Icons.fact_check_outlined,
+        width: 135,
+        options: const {false: 'مكتملة', true: 'مسترجعة'},
+        onChanged: (value) {
+          setState(() => _refunded = value);
+          _loadInvoices();
+        },
+      ),
+      const SizedBox(width: 8),
+      FilterDropdown<bool>(
+        value: _hasDiscount,
+        allLabel: 'الخصم: الكل',
+        icon: Icons.percent,
+        width: 135,
+        options: const {true: 'بخصم', false: 'بدون خصم'},
+        onChanged: (value) {
+          setState(() => _hasDiscount = value);
+          _loadInvoices();
+        },
+      ),
+      const SizedBox(width: 8),
+      SizedBox(
+        height: 48,
+        child: OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(
+            foregroundColor: primaryTeal,
+            backgroundColor: _startDate != null ? primaryTeal.withValues(alpha: 0.06) : null,
+            side: BorderSide(color: primaryTeal, width: 1.5),
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+          onPressed: _pickDateRange,
+          icon: const Icon(Icons.date_range, size: 18),
+          label: Text(
+            _startDate == null ? 'كل الفترات' : '${_formatDay(_startDate!)} ← ${_formatDay(_endDate!)}',
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+        ),
+      ),
+      if (_hasActiveFilters) ...[
+        const SizedBox(width: 4),
+        ClearFiltersButton(onPressed: _clearFilters),
+      ],
+    ];
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // الفلاتر حتى ~850px (مع فترة ومسح)؛ البحث يحتاج ~250px بجانبها، وإلا ينزل فوقها.
+        if (constraints.maxWidth >= 1100) {
+          return Row(children: [Expanded(child: search), const SizedBox(width: 10), ...filters]);
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            search,
+            const SizedBox(height: 10),
+            SingleChildScrollView(scrollDirection: Axis.horizontal, child: Row(children: filters)),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildStatusChip(bool isRefunded) {
     if (isRefunded) {
       return Container(
@@ -714,6 +834,30 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     );
   }
 
+  Widget _buildRefundInfo(Map<String, dynamic> invoice) {
+    return Container(
+      key: const Key('invoice-refund-info'),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFEF2F2),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFFECACA)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.undo, size: 18, color: Color(0xFFB91C1C)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              SalesHistoryScreen.refundInfoText(invoice),
+              style: const TextStyle(color: Color(0xFFB91C1C), fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildInvoiceHeaderInfo(Map<String, dynamic> invoice) {
     return Container(
       padding: const EdgeInsets.all(12),
@@ -734,8 +878,12 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('الخصم المطبق: ${AppFormatter.iqdWithCurrency(invoice['discount'] ?? 0)}'),
-              Text('المبلغ النهائي: ${AppFormatter.iqdWithCurrency(invoice['final_amount'])}', style: const TextStyle(fontWeight: FontWeight.bold)),
+              Flexible(child: Text('الخصم المطبق: ${AppFormatter.iqdWithCurrency(invoice['discount'] ?? 0)}')),
+              const SizedBox(width: 12),
+              Flexible(
+                child: Text('المبلغ النهائي: ${AppFormatter.iqdWithCurrency(invoice['final_amount'])}',
+                    textAlign: TextAlign.end, style: const TextStyle(fontWeight: FontWeight.bold)),
+              ),
             ],
           ),
         ],

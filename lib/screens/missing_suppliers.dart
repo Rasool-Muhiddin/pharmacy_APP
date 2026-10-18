@@ -622,16 +622,6 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
                   ],
                 ),
               ),
-              PopupMenuButton<String>(
-                tooltip: 'المزيد',
-                icon: const Icon(Icons.more_vert_rounded, color: textSecondary),
-                onSelected: (value) {
-                  if (value == 'delete') _confirmDeleteSupplier(supplierId, supplierName);
-                },
-                itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'delete', child: Text('حذف المذخر', style: TextStyle(color: danger))),
-                ],
-              ),
               if (!fullPage)
                 IconButton(
                   key: const Key('supplier-details-close'),
@@ -1842,53 +1832,6 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
     );
   }
 
-  // ==========================================
-  // 🗑️ تأكيد حذف المذخر
-  // ==========================================
-  void _confirmDeleteSupplier(int id, String name) {
-    showDialog(
-      context: context,
-      builder: (ctx) => Directionality(
-        textDirection: TextDirection.rtl,
-        child: AlertDialog(
-          shape: _dialogShape,
-          backgroundColor: cardBg,
-          title: _dialogTitle(Icons.delete_outline_rounded, 'تأكيد الحذف', color: danger, background: RC.redBg),
-          content: Text(
-            'هل أنت متأكد من حذف المذخر "$name"؟ سيتم حذف جميع الفواتير والسجلات المرتبطة به.',
-            style: const TextStyle(color: textSecondary),
-          ),
-          actions: [
-            _cancelButton(ctx),
-            ElevatedButton(
-              style: _primaryButton(danger),
-              onPressed: () async {
-                try {
-                  await _repository.deleteSupplier(isOnlineMode: widget.isOnlineMode, id: id);
-                  if (ctx.mounted) Navigator.pop(ctx);
-                  if (_selectedId == id) _selectedId = null;
-                  _refreshData();
-
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('تم حذف المذخر "$name" بنجاح.'), backgroundColor: warning),
-                    );
-                  }
-                } catch (e) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('خطأ أثناء الحذف: $e'), backgroundColor: danger),
-                    );
-                  }
-                }
-              },
-              child: const Text('حذف'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 /// بطاقة رقم في ملخص المذاخر (نفس شكل KpiCard في التقارير).

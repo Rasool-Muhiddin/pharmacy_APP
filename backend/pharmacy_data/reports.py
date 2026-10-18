@@ -55,7 +55,7 @@ from .models import (
 
 # نفس kLowStockThreshold في Flutter (db_helper.dart).
 LOW_STOCK_THRESHOLD = 10
-EXPIRY_ALERT_DAYS = 30
+EXPIRY_ALERT_DAYS = 90
 TOP_ITEMS_LIMIT = 20
 TOP_DEBTORS_LIMIT = 10
 DEFAULT_PAGE_SIZE = 50

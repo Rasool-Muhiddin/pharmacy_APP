@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,6 +11,7 @@ import '../models/purchase_list.dart';
 import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
 import 'purchase_list_dialog.dart';
+import '../widgets/filter_dropdown.dart';
 import '../widgets/medicine_dialogs.dart';
 import '../widgets/upgrade_required_dialog.dart';
 
@@ -36,6 +38,14 @@ class InventoryScreen extends StatefulWidget {
 
 class _InventoryScreenState extends State<InventoryScreen> {
   final TextEditingController _searchController = TextEditingController();
+  Timer? _searchDebounce;
+  // يتجاهل نتائج تحميل أقدم إن تغيّر البحث/الفلتر أثناء انتظارها.
+  int _loadSeq = 0;
+
+  /// فلتر الفئة: null = كل الفئات، '' = بلا فئة. [_categoryOptions] = الفئات
+  /// الموجودة فعلاً في أصناف المخزن المختار.
+  String? _selectedCategory;
+  List<String> _categoryOptions = [];
   List<Map<String, dynamic>> _medicines = [];
   List<Map<String, dynamic>> _masterMedicines = []; // القاموس المحمل من iraqi_drugs.json
   bool _isLoading = false;
@@ -72,6 +82,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -102,30 +113,30 @@ class _InventoryScreenState extends State<InventoryScreen> {
   String _friendlyWriteErrorMessage(Object error) => friendlyWriteErrorMessage(error);
 
   // --- تحميل أدوية المخزن الحالية من قاعدة البيانات ---
+  /// أصناف المخزن المختار بالبحث وفلتر الفئة الحاليين.
   /// [warehousesFresh]: _loadWarehouses زامن المخازن للتو، فلا داعي لطلبها مرة ثانية.
-  Future<void> _loadMedicines({bool warehousesFresh = false}) async {
-    setState(() => _isLoading = true);
+  /// [sync] = false: فلترة على آخر مزامنة بلا طلب شبكة (البحث الحي وتغيير
+  /// الفلاتر)؛ true بعد فتح الشاشة وأي تعديل على المخزون.
+  Future<void> _loadMedicines({bool warehousesFresh = false, bool sync = true}) async {
+    _searchDebounce?.cancel();
+    final seq = ++_loadSeq;
+    if (sync) setState(() => _isLoading = true);
     try {
-      final query = _searchController.text.trim();
-      List<Map<String, dynamic>> data;
-
-      if (query.isEmpty) {
-        data = await MedicineRepository.instance.getMedicines(
-          pharmacyId: widget.pharmacyId,
-          isOnlineMode: widget.isOnlineMode,
-          syncWarehouses: !warehousesFresh,
-        );
-      } else {
-        // البحث يبقى محلياً دائماً (على الكاش المتزامن آخر مرة)، بلا فرق
-        // بين الوضعين — أونلاين أو أوفلاين.
-        data = await DatabaseHelper.instance.searchMedicines(widget.pharmacyId, query);
-      }
-
-      // تقييد العرض بالمخزن المختار حالياً (الرئيسي افتراضياً). أونلاين هذا
-      // يُخفي أيضاً أي صفوف أوفلاين قديمة لم تُرفع بعد (مخزنها ليس من الخادم).
-      if (_selectedWarehouseId != null) {
-        data = data.where((m) => m['warehouse_id'] == _selectedWarehouseId).toList();
-      }
+      final data = await MedicineRepository.instance.getMedicines(
+        pharmacyId: widget.pharmacyId,
+        isOnlineMode: widget.isOnlineMode,
+        syncWarehouses: !warehousesFresh,
+        syncFromServer: sync,
+        // تقييد العرض بالمخزن المختار حالياً (الرئيسي افتراضياً). أونلاين هذا
+        // يُخفي أيضاً أي صفوف أوفلاين قديمة لم تُرفع بعد (مخزنها ليس من الخادم).
+        warehouseId: _selectedWarehouseId,
+        search: _searchController.text,
+        category: _selectedCategory,
+      );
+      final categories = await MedicineRepository.instance.getCategories(
+        pharmacyId: widget.pharmacyId,
+        warehouseId: _selectedWarehouseId,
+      );
 
       // تحديث عدد الأصناف/الكميات على شرائح المخازن من الكاش المحلي (بلا
       // طلب شبكة إضافي) بعد أي إضافة/توريد/إتلاف/حذف.
@@ -135,15 +146,37 @@ class _InventoryScreenState extends State<InventoryScreen> {
       );
 
       if (!mounted) return;
+      if (seq != _loadSeq) {
+        // مزامنة انتهت بعد بحث أحدث: النتيجة الأحدث قرأت الكاش قبل تحديثه.
+        if (sync) unawaited(_loadMedicines(sync: false));
+        return;
+      }
       setState(() {
         _medicines = data;
+        _categoryOptions = categories
+          ..sort((a, b) => medicineCategoryLabel(a).compareTo(medicineCategoryLabel(b)));
         if (warehouses.isNotEmpty) _warehouses = warehouses;
       });
     } catch (e) {
-      if (mounted) _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
+      if (mounted && seq == _loadSeq) _showSnackBar(_friendlyWriteErrorMessage(e), Colors.red);
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted && seq == _loadSeq) setState(() => _isLoading = false);
     }
+  }
+
+  /// بحث حي: يُعاد التحميل بعد توقف الكتابة 300ms، لا مع كل حرف.
+  void _onSearchChanged(String _) {
+    setState(() {}); // زر مسح الفلاتر يظهر/يختفي مع النص.
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () => _loadMedicines(sync: false));
+  }
+
+  bool get _hasActiveFilters => _searchController.text.trim().isNotEmpty || _selectedCategory != null;
+
+  void _clearFilters() {
+    _searchController.clear();
+    setState(() => _selectedCategory = null);
+    _loadMedicines(sync: false);
   }
 
   // --- خاصية الباقة الذهبية: تعدد المخازن ---
@@ -345,7 +378,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
                         selected: _selectedWarehouseId == w['id'],
                         onSelected: (_) {
                           setState(() => _selectedWarehouseId = w['id'] as int);
-                          _loadMedicines();
+                          _loadMedicines(sync: false);
                         },
                       ),
                     ),
@@ -527,6 +560,27 @@ class _InventoryScreenState extends State<InventoryScreen> {
       ),
     );
   }
+  /// فلتر الفئة بجانب البحث: "كل الفئات" + الفئات الموجودة فعلاً فقط.
+  Widget _buildCategoryFilter() {
+    final selected = _selectedCategory;
+    return FilterDropdown<String>(
+      value: selected,
+      allLabel: 'كل الفئات',
+      icon: Icons.category_outlined,
+      width: 220,
+      height: 50,
+      options: {
+        for (final c in _categoryOptions) c: medicineCategoryLabel(c),
+        // فئة مختارة لم تعد في المخزن الحالي (تبديل مخزن) تبقى ظاهرة لإلغائها.
+        if (selected != null && !_categoryOptions.contains(selected)) selected: medicineCategoryLabel(selected),
+      },
+      onChanged: (value) {
+        setState(() => _selectedCategory = value);
+        _loadMedicines(sync: false);
+      },
+    );
+  }
+
 // --- 1. إضافة قائمة مذخر / رصيد افتتاحي (الطريق الوحيد لإدخال المخزون) ---
   Future<void> _openPurchaseListDialog() async {
     final warehouseId = _selectedWarehouseId ??
@@ -665,10 +719,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
                 }
                 final errorText = e.toString();
                 if (errorText.contains('FOREIGN KEY constraint failed')) {
-                  _showSnackBar(
-                    'لا يمكن حذف هذا الدواء لأن له سجل مبيعات أو إتلاف سابق. يمكنك تصفير كميته بدلاً من حذفه.',
-                    Colors.red,
-                  );
+                  _showSnackBar(medicineInUseMessage, Colors.red);
                 } else {
                   _showSnackBar('حدث خطأ أثناء الحذف: $e', Colors.red);
                 }
@@ -751,14 +802,17 @@ class _InventoryScreenState extends State<InventoryScreen> {
                         borderRadius: BorderRadius.circular(10),
                         borderSide: const BorderSide(color: Color(0xFF1ABC9C), width: 1.5),
                       ),
-                      suffixIcon: IconButton(
-                        icon: const Icon(Icons.search, color: Color(0xFF1ABC9C)),
-                        onPressed: _loadMedicines,
-                      ),
                     ),
-                    onSubmitted: (_) => _loadMedicines(),
+                    onChanged: _onSearchChanged,
+                    onSubmitted: (_) => _loadMedicines(sync: false),
                   ),
                 ),
+                const SizedBox(width: 10),
+                _buildCategoryFilter(),
+                if (_hasActiveFilters) ...[
+                  const SizedBox(width: 6),
+                  ClearFiltersButton(onPressed: _clearFilters),
+                ],
                 if (widget.isOwner) ...[
                   const SizedBox(width: 10),
                   ElevatedButton.icon(

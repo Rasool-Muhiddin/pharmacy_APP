@@ -39,6 +39,9 @@ class InvoiceApiService {
     String search = '',
     String? start,
     String? end,
+    String? seller,
+    bool? refunded,
+    bool? hasDiscount,
   }) {
     final uri = Uri.parse('$_baseUrl/invoices/').replace(queryParameters: {
       'page': '$page',
@@ -46,8 +49,18 @@ class InvoiceApiService {
       if (search.isNotEmpty) 'search': search,
       if (start != null) 'start': start,
       if (end != null) 'end': end,
+      if (seller != null) 'seller': seller,
+      if (refunded != null) 'status': refunded ? 'refunded' : 'completed',
+      if (hasDiscount != null) 'discount': hasDiscount ? 'with' : 'without',
     });
     return _get(url: uri.toString());
+  }
+
+  /// GET /api/invoices/sellers/ — {"sellers": [اسم البائع, ...]} لفلتر سجل
+  /// المبيعات، بنفس الاسم الذي يقبله ?seller=.
+  Future<List<String>> fetchSellers() async {
+    final body = await _get(url: '$_baseUrl/invoices/sellers/');
+    return (body['sellers'] as List? ?? const []).whereType<String>().toList();
   }
 
   /// GET /api/invoices/stats/ — مبيعات اليوم (صافي غير المسترجعة) وعدد
