@@ -10,6 +10,7 @@ import '../models/medicine_categories.dart';
 import '../models/purchase_list.dart';
 import '../models/subscription_plan.dart';
 import '../utils/formatters.dart';
+import 'inventory_table.dart';
 import 'purchase_list_dialog.dart';
 import '../widgets/filter_dropdown.dart';
 import '../widgets/medicine_dialogs.dart';
@@ -165,8 +166,9 @@ class _InventoryScreenState extends State<InventoryScreen> {
   }
 
   /// بحث حي: يُعاد التحميل بعد توقف الكتابة 300ms، لا مع كل حرف.
+  /// لا setState هنا: الكتابة لا تعيد بناء الشاشة ولا الجدول؛ زر المسح وحده
+  /// يتابع النص (ValueListenableBuilder)، والجدول يُبنى عند وصول النتائج فقط.
   void _onSearchChanged(String _) {
-    setState(() {}); // زر مسح الفلاتر يظهر/يختفي مع النص.
     _searchDebounce?.cancel();
     _searchDebounce = Timer(const Duration(milliseconds: 300), () => _loadMedicines(sync: false));
   }
@@ -734,19 +736,6 @@ class _InventoryScreenState extends State<InventoryScreen> {
 
 @override
   Widget build(BuildContext context) {
-    // دالة داخلية لتنسيق المبالغ المالية (إزالة الأصفار العشرية الزائدة وإضافة فواصل الآلاف)
-    String formatAmount(dynamic value) {
-      if (value == null) return '0';
-      double numVal = double.tryParse(value.toString()) ?? 0;
-      String str = numVal % 1 == 0
-          ? numVal.toInt().toString()
-          : numVal.toStringAsFixed(2);
-      return str.replaceAllMapped(
-        RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
-        (Match m) => '${m[1]},',
-      );
-    }
-
     return Scaffold(
       backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
@@ -809,10 +798,15 @@ class _InventoryScreenState extends State<InventoryScreen> {
                 ),
                 const SizedBox(width: 10),
                 _buildCategoryFilter(),
-                if (_hasActiveFilters) ...[
-                  const SizedBox(width: 6),
-                  ClearFiltersButton(onPressed: _clearFilters),
-                ],
+                ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: _searchController,
+                  builder: (context, value, _) => _hasActiveFilters
+                      ? Padding(
+                          padding: const EdgeInsetsDirectional.only(start: 6),
+                          child: ClearFiltersButton(onPressed: _clearFilters),
+                        )
+                      : const SizedBox.shrink(),
+                ),
                 if (widget.isOwner) ...[
                   const SizedBox(width: 10),
                   ElevatedButton.icon(
@@ -863,200 +857,13 @@ class _InventoryScreenState extends State<InventoryScreen> {
                             ],
                           ),
                           clipBehavior: Clip.antiAlias,
-                          child: LayoutBuilder(
-                            builder: (context, constraints) {
-                              return SingleChildScrollView(
-                                scrollDirection: Axis.vertical,
-                                child: SingleChildScrollView(
-                                  scrollDirection: Axis.horizontal,
-                                  child: ConstrainedBox(
-                                    constraints: BoxConstraints(minWidth: constraints.maxWidth),
-                                    child: DataTable(
-                                      horizontalMargin: 18,
-                                      columnSpacing: 24,
-                                      headingRowHeight: 50,
-                                      dataRowMinHeight: 68,
-                                      dataRowMaxHeight: 78,
-                                      headingRowColor: WidgetStateProperty.all(const Color(0xFF1ABC9C)),
-                                      dividerThickness: 0.8,
-                                      columns: [
-                                        const DataColumn(label: Text('اسم الدواء', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        const DataColumn(label: Text('الكمية', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        // الكلفة وسعر الشراء للمالك فقط.
-                                        if (widget.isOwner)
-                                          const DataColumn(label: Text('الكلفة (متوسط)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        const DataColumn(label: Text('سعر البيع', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        const DataColumn(label: Text('الصلاحية', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        const DataColumn(label: Text('الشكل الدوائي', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                        if (widget.isOwner)
-                                          const DataColumn(label: Text('الإجراءات', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFFF1F5F9)))),
-                                      ],
-                                      rows: _medicines.map((med) {
-                                        int qty = med['quantity'] ?? 0;
-                                        bool isLowStock = qty <= kLowStockThreshold;
-                                        String categoryLabel = medicineCategoryLabel(med['category']);
-
-                                        String tradeName = med['trade_name'] ?? '';
-                                        String scientificName = med['scientific_name'] ?? '';
-                                        String barcode = med['barcode'] ?? '';
-
-                                        final avgCost = med['avg_cost'] as num?;
-                                        String buyPriceStr = avgCost == null ? '-' : '${formatAmount(avgCost)} د.ع';
-                                        String sellPriceStr = formatAmount(med['sell_price']);
-
-                                        return DataRow(
-                                          cells: [
-                                            // اسم الدواء والتفاصيل (النقر يعرض دفعات الصلاحية)
-                                            DataCell(
-                                              onTap: () => _showBatchesDialog(med),
-                                              Padding(
-                                                padding: const EdgeInsets.symmetric(vertical: 6.0),
-                                                child: Column(
-                                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                                  mainAxisAlignment: MainAxisAlignment.center,
-                                                  children: [
-                                                    Text(
-                                                      tradeName,
-                                                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF1E293B)),
-                                                      maxLines: 1,
-                                                      overflow: TextOverflow.ellipsis,
-                                                    ),
-                                                    if (scientificName.isNotEmpty) ...[
-                                                      const SizedBox(height: 2),
-                                                      Text(
-                                                        scientificName,
-                                                        style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow.ellipsis,
-                                                      ),
-                                                    ],
-                                                    if (barcode.isNotEmpty) ...[
-                                                      const SizedBox(height: 2),
-                                                      Text(
-                                                        '║ $barcode',
-                                                        style: TextStyle(color: Colors.grey.shade500, fontSize: 11, fontFamily: 'monospace'),
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow.ellipsis,
-                                                      ),
-                                                    ],
-                                                  ],
-                                                ),
-                                              ),
-                                            ),
-                                            // شارة الكمية
-                                            DataCell(
-                                              Container(
-                                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                                                decoration: BoxDecoration(
-                                                  color: isLowStock ? const Color(0xFFFEF2F2) : const Color(0xFFF0FDF4),
-                                                  borderRadius: BorderRadius.circular(20),
-                                                  border: Border.all(
-                                                    color: isLowStock ? const Color(0xFFFCA5A5) : const Color(0xFF86EFAC),
-                                                  ),
-                                                ),
-                                                child: Text(
-                                                  '$qty قطعة',
-                                                  style: TextStyle(
-                                                    color: isLowStock ? const Color(0xFFDC2626) : const Color(0xFF166534),
-                                                    fontWeight: FontWeight.bold,
-                                                    fontSize: 12,
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
-                                            // متوسط الكلفة (المالك فقط)
-                                            if (widget.isOwner)
-                                              DataCell(
-                                                Text(
-                                                  buyPriceStr,
-                                                  style: TextStyle(fontSize: 13, color: Colors.grey.shade800),
-                                                ),
-                                              ),
-                                            // سعر البيع
-                                            DataCell(
-                                              Text(
-                                                '$sellPriceStr د.ع',
-                                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF1ABC9C)),
-                                              ),
-                                            ),
-                                            // الصلاحية: أقرب دفعة؛ النقر يعرض كل الدفعات
-                                            DataCell(
-                                              onTap: () => _showBatchesDialog(med),
-                                              Row(
-                                                mainAxisSize: MainAxisSize.min,
-                                                children: [
-                                                  Text(med['expiry_date'] ?? '-', style: const TextStyle(fontSize: 13)),
-                                                  const SizedBox(width: 4),
-                                                  Icon(Icons.layers_outlined, size: 14, color: Colors.grey.shade500),
-                                                ],
-                                              ),
-                                            ),
-                                            // الشكل الدوائي
-                                            DataCell(Text(categoryLabel, style: const TextStyle(fontSize: 13))),
-                                            // أزرار الإجراءات التفاعلية
-                                            if (widget.isOwner)
-                                              DataCell(
-                                                Row(
-                                                  mainAxisSize: MainAxisSize.min,
-                                                  children: [
-                                                    Tooltip(
-                                                      message: 'تعديل',
-                                                      child: InkWell(
-                                                        onTap: () => _openEditDialog(med),
-                                                        borderRadius: BorderRadius.circular(8),
-                                                        child: Container(
-                                                          padding: const EdgeInsets.all(6),
-                                                          decoration: BoxDecoration(
-                                                            color: const Color(0xFFEFF6FF),
-                                                            borderRadius: BorderRadius.circular(8),
-                                                          ),
-                                                          child: const Icon(Icons.edit_outlined, color: Color(0xFF2563EB), size: 18),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 6),
-                                                    Tooltip(
-                                                      message: 'إتلاف',
-                                                      child: InkWell(
-                                                        onTap: () => _openDamageDialog(med),
-                                                        borderRadius: BorderRadius.circular(8),
-                                                        child: Container(
-                                                          padding: const EdgeInsets.all(6),
-                                                          decoration: BoxDecoration(
-                                                            color: const Color(0xFFFFFBEB),
-                                                            borderRadius: BorderRadius.circular(8),
-                                                          ),
-                                                          child: const Icon(Icons.warning_amber_rounded, color: Color(0xFFD97706), size: 18),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 6),
-                                                    Tooltip(
-                                                      message: 'حذف نهائي',
-                                                      child: InkWell(
-                                                        onTap: () => _confirmDeleteMedicine(med),
-                                                        borderRadius: BorderRadius.circular(8),
-                                                        child: Container(
-                                                          padding: const EdgeInsets.all(6),
-                                                          decoration: BoxDecoration(
-                                                            color: const Color(0xFFFEF2F2),
-                                                            borderRadius: BorderRadius.circular(8),
-                                                          ),
-                                                          child: const Icon(Icons.delete_outline, color: Color(0xFFDC2626), size: 18),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-                                              ),
-                                          ],
-                                        );
-                                      }).toList(),
-                                    ),
-                                  ),
-                                ),
-                              );
-                            },
+                          child: InventoryTable(
+                            medicines: _medicines,
+                            isOwner: widget.isOwner,
+                            onShowBatches: _showBatchesDialog,
+                            onEdit: _openEditDialog,
+                            onDamage: _openDamageDialog,
+                            onDelete: _confirmDeleteMedicine,
                           ),
                         ),
             ),

@@ -6,6 +6,7 @@ import '../database/db_helper.dart';
 import '../repository/medicine_repository.dart';
 import 'add_damage_dialog.dart';
 import '../widgets/filter_dropdown.dart';
+import '../widgets/lazy_table.dart';
 import '../widgets/stat_card.dart';
 
 class DamagedScreen extends StatefulWidget {
@@ -103,8 +104,8 @@ class _DamagedScreenState extends State<DamagedScreen> {
   }
 
   /// بحث حي: يُعاد التحميل بعد توقف الكتابة 300ms، لا مع كل حرف.
+  /// لا setState هنا: زر المسح يتابع النص وحده (ValueListenableBuilder).
   void _onSearchChanged(String _) {
-    setState(() {}); // زر المسح يظهر/يختفي مع النص.
     _searchDebounce?.cancel();
     _searchDebounce =
         Timer(const Duration(milliseconds: 300), () => _loadData(sync: false));
@@ -313,140 +314,85 @@ class _DamagedScreenState extends State<DamagedScreen> {
             ),
           ),
         ),
-        if (_searchController.text.trim().isNotEmpty) ...[
-          const SizedBox(width: 6),
-          ClearFiltersButton(onPressed: _clearSearch),
-        ],
+        ValueListenableBuilder<TextEditingValue>(
+          valueListenable: _searchController,
+          builder: (context, value, _) => value.text.trim().isNotEmpty
+              ? Padding(
+                  padding: const EdgeInsetsDirectional.only(start: 6),
+                  child: ClearFiltersButton(onPressed: _clearSearch),
+                )
+              : const SizedBox.shrink(),
+        ),
       ],
     );
   }
 
+  /// صفوف تُبنى عند ظهورها فقط (سجل التالف يكبر مع الوقت).
   Widget _buildDataTable() {
-    return SizedBox(
-      width: double.infinity,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.vertical,
-        child: LayoutBuilder(
-          builder: (context, constraints) => SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: ConstrainedBox(
-              constraints: BoxConstraints(minWidth: constraints.maxWidth),
-              child: DataTable(
-                headingRowColor:
-                    WidgetStateProperty.all(const Color(0xFF1ABC9C)),
-                headingTextStyle: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 14,
-                ),
-                dataTextStyle: const TextStyle(
-                  fontSize: 13,
-                  color: Color(0xFF2D3748),
-                ),
-                columns: const [
-                  DataColumn(label: Text("اسم الدواء العلمي والتجاري")),
-                  DataColumn(label: Text("الكمية التالفة")),
-                  DataColumn(label: Text("كلفة الوحدة")),
-                  DataColumn(label: Text("خسارة العملية الإجمالية")),
-                  DataColumn(label: Text("سبب الإتلاف")),
-                  DataColumn(label: Text("تاريخ ووقت الإتلاف")),
-                  DataColumn(label: Text("ملاحظات وتفاصيل")),
-                ],
-                rows: _damagedList.map((item) {
-                  final qty = (item['quantity_damaged'] as num?)?.toInt() ?? 0;
-                  // كلفة العملية كما في التقارير؛ كلفة الوحدة مشتقة منها.
-                  final totalLoss = (item['loss'] as num?)?.toDouble() ?? 0.0;
-                  final unitCost = qty > 0 ? totalLoss / qty : 0.0;
-                  // 🟢 سجلات تصحيح الإدخال لا تُحتسب كخسارة، فتُعرض بلون محايد
-                  // بدل الأحمر مع توضيح نصي بدل الرقم لتفادي أي التباس بصري.
-                  final isCorrection = item['reason'] == 'correction';
-
-                  return DataRow(
-                    cells: [
-                      DataCell(
-                        Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              item['trade_name'] ?? "دواء محذوف",
-                              style:
-                                  const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                            Text(
-                              item['scientific_name'] ?? "-",
-                              style: const TextStyle(
-                                  fontSize: 11, color: Color(0xFF718096)),
-                            ),
-                          ],
-                        ),
-                      ),
-                      DataCell(
-                        Text(
-                          "$qty قطعة",
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFFE53E3E),
-                          ),
-                        ),
-                      ),
-                      DataCell(
-                          Text("${_currencyFormatter.format(unitCost)} د.ع")),
-                      DataCell(
-                        Text(
-                          isCorrection
-                              ? "لا تُحتسب"
-                              : "${_currencyFormatter.format(totalLoss)} د.ع",
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: isCorrection
-                                ? const Color(0xFF718096)
-                                : const Color(0xFFE53E3E),
-                            fontStyle: isCorrection
-                                ? FontStyle.italic
-                                : FontStyle.normal,
-                          ),
-                        ),
-                      ),
-                      DataCell(_buildReasonBadge(item['reason'])),
-                      DataCell(
-                        Text(
-                          item['damaged_at'] ?? "-",
-                          style: const TextStyle(color: Color(0xFF4A5568)),
-                        ),
-                      ),
-                      DataCell(
-                        SizedBox(
-                          width: 180,
-                          child: Text(
-                            (item['notes'] != null &&
-                                    item['notes'].toString().isNotEmpty)
-                                ? item['notes']
-                                : "لا توجد ملاحظات",
-                            style: TextStyle(
-                              color: (item['notes'] != null &&
-                                      item['notes'].toString().isNotEmpty)
-                                  ? const Color(0xFF718096)
-                                  : const Color(0xFFCBD5E0),
-                              fontStyle: (item['notes'] == null ||
-                                      item['notes'].toString().isEmpty)
-                                  ? FontStyle.italic
-                                  : FontStyle.normal,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 2,
-                          ),
-                        ),
-                      ),
-                    ],
-                  );
-                }).toList(),
-              ),
-            ),
-          ),
-        ),
+    return DefaultTextStyle.merge(
+      style: const TextStyle(fontSize: 13, color: Color(0xFF2D3748)),
+      child: LazyTable(
+        columns: const [
+          LazyColumn("اسم الدواء العلمي والتجاري", 230),
+          LazyColumn("الكمية التالفة", 110),
+          LazyColumn("كلفة الوحدة", 120),
+          LazyColumn("خسارة العملية الإجمالية", 150),
+          LazyColumn("سبب الإتلاف", 150),
+          LazyColumn("تاريخ ووقت الإتلاف", 140),
+          LazyColumn("ملاحظات وتفاصيل", 200),
+        ],
+        itemCount: _damagedList.length,
+        rowHeight: 60,
+        headerHeight: 56,
+        headerColor: const Color(0xFF1ABC9C),
+        headerStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
+        cellsBuilder: (context, index) => _damagedCells(_damagedList[index]),
       ),
     );
+  }
+
+  List<Widget> _damagedCells(Map<String, dynamic> item) {
+    final qty = (item['quantity_damaged'] as num?)?.toInt() ?? 0;
+    // كلفة العملية كما في التقارير؛ كلفة الوحدة مشتقة منها.
+    final totalLoss = (item['loss'] as num?)?.toDouble() ?? 0.0;
+    final unitCost = qty > 0 ? totalLoss / qty : 0.0;
+    // 🟢 سجلات تصحيح الإدخال لا تُحتسب كخسارة، فتُعرض بلون محايد
+    // بدل الأحمر مع توضيح نصي بدل الرقم لتفادي أي التباس بصري.
+    final isCorrection = item['reason'] == 'correction';
+    final notes = (item['notes'] ?? '').toString();
+    return [
+      Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(item['trade_name'] ?? "دواء محذوف",
+              style: const TextStyle(fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
+          Text(item['scientific_name'] ?? "-",
+              style: const TextStyle(fontSize: 11, color: Color(0xFF718096)), maxLines: 1, overflow: TextOverflow.ellipsis),
+        ],
+      ),
+      Text("$qty قطعة", style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFFE53E3E))),
+      Text("${_currencyFormatter.format(unitCost)} د.ع"),
+      Text(
+        isCorrection ? "لا تُحتسب" : "${_currencyFormatter.format(totalLoss)} د.ع",
+        style: TextStyle(
+          fontWeight: FontWeight.bold,
+          color: isCorrection ? const Color(0xFF718096) : const Color(0xFFE53E3E),
+          fontStyle: isCorrection ? FontStyle.italic : FontStyle.normal,
+        ),
+      ),
+      _buildReasonBadge(item['reason']),
+      Text(item['damaged_at'] ?? "-", style: const TextStyle(color: Color(0xFF4A5568))),
+      Text(
+        notes.isNotEmpty ? notes : "لا توجد ملاحظات",
+        style: TextStyle(
+          color: notes.isNotEmpty ? const Color(0xFF718096) : const Color(0xFFCBD5E0),
+          fontStyle: notes.isEmpty ? FontStyle.italic : FontStyle.normal,
+        ),
+        overflow: TextOverflow.ellipsis,
+        maxLines: 2,
+      ),
+    ];
   }
 
   Widget _buildReasonBadge(String? reason) {
@@ -501,12 +447,15 @@ class _DamagedScreenState extends State<DamagedScreen> {
         children: [
           Icon(icon, size: 12, color: textColor),
           const SizedBox(width: 4),
-          Text(
-            text,
-            style: TextStyle(
-              color: textColor,
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
+          Flexible(
+            child: Text(
+              text,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: textColor,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           ),
         ],

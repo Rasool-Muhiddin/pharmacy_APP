@@ -16,6 +16,7 @@ import '../screens/pos_screen.dart';
 import '../screens/sales_history_screen.dart';
 import '../screens/damaged_screen.dart';
 import '../screens/reports_screen.dart';
+import '../screens/reports/reports_screen.dart' show ReportTab;
 import '../screens/missing_suppliers.dart';
 import '../screens/expenses_screen.dart';
 import '../screens/offline_migration_screen.dart';
@@ -63,8 +64,21 @@ class _MainLayoutState extends State<MainLayout> {
     if (title == _currentPage) return;
     final leave = await _leaveGuard.confirmLeave();
     if (leave == false || !mounted) return;
-    setState(() => _currentPage = title);
+    setState(() {
+      _currentPage = title;
+      _reportsTab = ReportTab.overview;
+    });
   }
+
+  // تبويب التقارير المفتوح أولاً (المخزون من "عرض الكل" في الرئيسية).
+  int _reportsTab = ReportTab.overview;
+
+  bool get _canOpenReports => widget.isOwner && widget.entitlements.allows(AppFeature.reports);
+
+  void _openReportsInventory() => setState(() {
+        _currentPage = "التقارير والتحليلات";
+        _reportsTab = ReportTab.inventory;
+      });
 
   // خريطة أيقونات الأقسام
   final Map<String, IconData> _pageIcons = const {
@@ -168,7 +182,11 @@ class _MainLayoutState extends State<MainLayout> {
     }
     switch (_currentPage) {
       case "الرئيسية":
-        return DashboardScreen(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);
+        return DashboardScreen(
+          pharmacyId: widget.pharmacyId,
+          isOnlineMode: widget.isOnlineMode,
+          onShowAllStockAlerts: _canOpenReports ? _openReportsInventory : null,
+        );
       case "المخزن والأدوية":
         return InventoryScreen(
           pharmacyId: widget.pharmacyId,
@@ -215,6 +233,7 @@ class _MainLayoutState extends State<MainLayout> {
           isOnlineMode: widget.isOnlineMode,
           entitlements: widget.entitlements,
           pharmacyName: _pharmacyName,
+          initialTab: _reportsTab,
         );
       default:
         return DashboardScreen(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);

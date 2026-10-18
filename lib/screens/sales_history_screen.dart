@@ -5,6 +5,7 @@ import 'package:pharmacy_app/utils/formatters.dart';
 import '../database/db_helper.dart';
 import '../repository/invoice_repository.dart';
 import '../widgets/filter_dropdown.dart';
+import '../widgets/lazy_table.dart';
 
 class SalesHistoryScreen extends StatefulWidget {
   final int pharmacyId;
@@ -155,8 +156,8 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
   }
 
   /// بحث حي: يُعاد التحميل بعد توقف الكتابة 300ms، لا مع كل حرف.
+  /// لا setState هنا: زر المسح يتابع النص وحده (ValueListenableBuilder).
   void _onSearchChanged(String _) {
-    setState(() {}); // زر مسح الفلاتر يظهر/يختفي مع النص.
     _searchDebounce?.cancel();
     _searchDebounce = Timer(const Duration(milliseconds: 300), _loadInvoices);
   }
@@ -564,123 +565,46 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
                                 style: const TextStyle(color: Colors.grey, fontSize: 16),
                               ),
                             )
-                          : ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: SingleChildScrollView(
-                                child: Column(children: [
-                                Container(
-                                  width: double.infinity,
-                                  decoration: BoxDecoration(
-                                    border: Border.all(color: Colors.grey.shade200),
-                                  ),
-                                  child: DataTable(
-                                    headingRowColor: WidgetStateProperty.all(primaryTeal),
-                                    headingTextStyle: const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 14,
-                                    ),
-                                    dataRowMinHeight: 52,
-                                    dataRowMaxHeight: 56,
-                                    horizontalMargin: 16,
-                                    columnSpacing: 15,
-                                    columns: const [
-                                      DataColumn(label: Expanded(child: Text('رقم الفاتورة', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('البائع', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('تاريخ ووقت البيع', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('حالة الفاتورة', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('الإجمالي (قبل الخصم)', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('الخصم', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('الصافي المدفوع', textAlign: TextAlign.center))),
-                                      DataColumn(label: Expanded(child: Text('الإجراءات', textAlign: TextAlign.center))),
-                                    ],
-                                    rows: _invoices.map((inv) {
-                                      final bool isRefunded = inv['is_refunded'] == 1;
-                                      final discount = (inv['discount'] as num?)?.toDouble() ?? 0.0;
-                                      final finalAmount = (inv['final_amount'] as num?)?.toDouble() ?? 0.0;
-                                      final totalAmount = (inv['total_amount'] as num?)?.toDouble() ?? (finalAmount + discount);
-                                      final dtParts = _parseDateTime(inv['created_at']);
-                                      final cashierName = _sellerLabel((inv['cashier_name'] ?? DatabaseHelper.unknownSeller) as String);
-
-                                      return DataRow(
-                                        cells: [
-                                          DataCell(Center(
-                                            child: Text(inv['invoice_number'] ?? '-', style: const TextStyle(fontWeight: FontWeight.bold)),
-                                          )),
-                                          DataCell(Center(
-                                            child: Text(cashierName, style: const TextStyle(fontWeight: FontWeight.w600)),
-                                          )),
-                                          DataCell(Center(
-                                            child: Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                Container(
-                                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                                  decoration: BoxDecoration(
-                                                    color: const Color(0xFFE2E8F0),
-                                                    borderRadius: BorderRadius.circular(12),
-                                                  ),
-                                                  child: Text(dtParts['time']!, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+                          : Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Colors.grey.shade200),
+                              ),
+                              clipBehavior: Clip.antiAlias,
+                              // صفوف تُبنى عند ظهورها فقط: "تحميل المزيد" لا يبطئ الشاشة مهما كثرت الصفحات.
+                              child: LazyTable(
+                                columns: const [
+                                  LazyColumn('رقم الفاتورة', 130),
+                                  LazyColumn('البائع', 130),
+                                  LazyColumn('تاريخ ووقت البيع', 190),
+                                  LazyColumn('حالة الفاتورة', 130),
+                                  LazyColumn('الإجمالي (قبل الخصم)', 150),
+                                  LazyColumn('الخصم', 130),
+                                  LazyColumn('الصافي المدفوع', 150),
+                                  LazyColumn('الإجراءات', 150),
+                                ],
+                                itemCount: _invoices.length,
+                                rowHeight: 56,
+                                headerHeight: 56,
+                                headerColor: primaryTeal,
+                                headerStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
+                                cellAlignment: Alignment.center,
+                                cellPadding: const EdgeInsets.symmetric(horizontal: 6),
+                                cellsBuilder: (context, index) => _invoiceCells(_invoices[index], primaryTeal),
+                                footer: _hasMore
+                                    ? Padding(
+                                        padding: const EdgeInsets.all(12),
+                                        child: _isLoadingMore
+                                            ? const Center(child: CircularProgressIndicator())
+                                            : Center(
+                                                child: OutlinedButton.icon(
+                                                  onPressed: _loadMore,
+                                                  icon: const Icon(Icons.expand_more),
+                                                  label: const Text('تحميل المزيد'),
                                                 ),
-                                                const SizedBox(width: 4),
-                                                Container(
-                                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                                  decoration: BoxDecoration(
-                                                    color: const Color(0xFFE2E8F0),
-                                                    borderRadius: BorderRadius.circular(12),
-                                                  ),
-                                                  child: Text(dtParts['date']!, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
-                                                ),
-                                              ],
-                                            ),
-                                          )),
-                                          DataCell(Center(child: _buildStatusChip(isRefunded))),
-                                          DataCell(Center(
-                                            child: Text(AppFormatter.iqdWithCurrency(totalAmount), style: TextStyle(color: Colors.grey.shade700)),
-                                          )),
-                                          DataCell(Center(
-                                            child: Text(
-                                              discount > 0 ? '-${AppFormatter.iqdWithCurrency(discount)}' : AppFormatter.iqdWithCurrency(0),
-                                              style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
-                                            ),
-                                          )),
-                                          DataCell(Center(
-                                            child: Text(
-                                              AppFormatter.iqdWithCurrency(finalAmount),
-                                              style: const TextStyle(fontWeight: FontWeight.bold, color: primaryTeal),
-                                            ),
-                                          )),
-                                          DataCell(Center(
-                                            child: OutlinedButton.icon(
-                                              style: OutlinedButton.styleFrom(
-                                                side: BorderSide(color: Colors.grey.shade300),
-                                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                                               ),
-                                              icon: const Icon(Icons.search, size: 14, color: Colors.black87),
-                                              label: const Text('تفاصيل الفاتورة', style: TextStyle(color: Colors.black87, fontSize: 11)),
-                                              onPressed: () => _showInvoiceDetails(inv),
-                                            ),
-                                          )),
-                                        ],
-                                      );
-                                    }).toList(),
-                                  ),
-                                ),
-                                if (_hasMore)
-                                  Padding(
-                                    padding: const EdgeInsets.all(12),
-                                    child: _isLoadingMore
-                                        ? const Center(child: CircularProgressIndicator())
-                                        : Center(
-                                            child: OutlinedButton.icon(
-                                              onPressed: _loadMore,
-                                              icon: const Icon(Icons.expand_more),
-                                              label: const Text('تحميل المزيد'),
-                                            ),
-                                          ),
-                                  ),
-                                ]),
+                                      )
+                                    : null,
                               ),
                             ),
                 ),
@@ -774,10 +698,15 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
           ),
         ),
       ),
-      if (_hasActiveFilters) ...[
-        const SizedBox(width: 4),
-        ClearFiltersButton(onPressed: _clearFilters),
-      ],
+      ValueListenableBuilder<TextEditingValue>(
+        valueListenable: _searchCtrl,
+        builder: (context, value, _) => _hasActiveFilters
+            ? Padding(
+                padding: const EdgeInsetsDirectional.only(start: 4),
+                child: ClearFiltersButton(onPressed: _clearFilters),
+              )
+            : const SizedBox.shrink(),
+      ),
     ];
 
     return LayoutBuilder(
@@ -798,6 +727,45 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
     );
   }
 
+  List<Widget> _invoiceCells(Map<String, dynamic> inv, Color primaryTeal) {
+    final bool isRefunded = inv['is_refunded'] == 1;
+    final discount = (inv['discount'] as num?)?.toDouble() ?? 0.0;
+    final finalAmount = (inv['final_amount'] as num?)?.toDouble() ?? 0.0;
+    final totalAmount = (inv['total_amount'] as num?)?.toDouble() ?? (finalAmount + discount);
+    final dtParts = _parseDateTime(inv['created_at']);
+    final cashierName = _sellerLabel((inv['cashier_name'] ?? DatabaseHelper.unknownSeller) as String);
+    Widget pill(String text) => Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(color: const Color(0xFFE2E8F0), borderRadius: BorderRadius.circular(12)),
+          child: Text(text, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+        );
+    return [
+      Text(inv['invoice_number'] ?? '-', style: const TextStyle(fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
+      Text(cashierName, style: const TextStyle(fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis),
+      FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Row(mainAxisSize: MainAxisSize.min, children: [pill(dtParts['time']!), const SizedBox(width: 4), pill(dtParts['date']!)]),
+      ),
+      _buildStatusChip(isRefunded),
+      Text(AppFormatter.iqdWithCurrency(totalAmount), style: TextStyle(color: Colors.grey.shade700)),
+      Text(
+        discount > 0 ? '-${AppFormatter.iqdWithCurrency(discount)}' : AppFormatter.iqdWithCurrency(0),
+        style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+      ),
+      Text(AppFormatter.iqdWithCurrency(finalAmount), style: TextStyle(fontWeight: FontWeight.bold, color: primaryTeal)),
+      OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+          side: BorderSide(color: Colors.grey.shade300),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        ),
+        icon: const Icon(Icons.search, size: 14, color: Colors.black87),
+        label: const Text('تفاصيل الفاتورة', style: TextStyle(color: Colors.black87, fontSize: 11)),
+        onPressed: () => _showInvoiceDetails(inv),
+      ),
+    ];
+  }
+
   Widget _buildStatusChip(bool isRefunded) {
     if (isRefunded) {
       return Container(
@@ -811,7 +779,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
           children: [
             CircleAvatar(radius: 3, backgroundColor: Color(0xFFDC2626)),
             SizedBox(width: 5),
-            Text('مسترجعة', style: TextStyle(color: Color(0xFFB91C1C), fontWeight: FontWeight.bold, fontSize: 12)),
+            Flexible(child: Text('مسترجعة', overflow: TextOverflow.ellipsis, style: TextStyle(color: Color(0xFFB91C1C), fontWeight: FontWeight.bold, fontSize: 12))),
           ],
         ),
       );
@@ -828,7 +796,7 @@ class _SalesHistoryScreenState extends State<SalesHistoryScreen> {
         children: [
           CircleAvatar(radius: 3, backgroundColor: Color(0xFF16A34A)),
           SizedBox(width: 5),
-          Text('مكتملة', style: TextStyle(color: Color(0xFF15803D), fontWeight: FontWeight.bold, fontSize: 12)),
+          Flexible(child: Text('مكتملة', overflow: TextOverflow.ellipsis, style: TextStyle(color: Color(0xFF15803D), fontWeight: FontWeight.bold, fontSize: 12))),
         ],
       ),
     );

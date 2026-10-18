@@ -13,11 +13,19 @@ class DashboardScreen extends StatefulWidget {
   final int pharmacyId;
   final bool isOnlineMode;
 
+  /// "عرض الكل" تحت تحذيرات الصلاحية/الكمية: يفتح التقارير على تبويب المخزون
+  /// (القوائم كاملة). null = بلا رابط (مستخدم بلا صلاحية التقارير).
+  final VoidCallback? onShowAllStockAlerts;
+
   const DashboardScreen({
     super.key,
     this.pharmacyId = 1,
     this.isOnlineMode = false,
+    this.onShowAllStockAlerts,
   });
+
+  /// أقصى عدد صفوف في كل جدول تحذيرات (الأكثر إلحاحاً أولاً).
+  static const int alertRowsLimit = 20;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -428,9 +436,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
               message: 'لا توجد أدوية منتهية أو موشكة على الانتهاء خلال 90 يوماً',
               color: const Color(0xFF27AE60),
             )
-          : CustomTable(
+          : _limitedTable(
+              key: 'expiry',
+              total: _expiredMedicines.length,
+              table: CustomTable(
               headers: const ["اسم الدواء", "الحالة", "العدد"],
-              rows: _expiredMedicines.map<List<Widget>>((med) {
+              // مرتبة بتاريخ الانتهاء: المنتهي أولاً ثم الأقرب انتهاءً.
+              rows: _expiredMedicines.take(DashboardScreen.alertRowsLimit).map<List<Widget>>((med) {
                 final daysLeft = _daysUntilExpiry(med.expiryDate);
                 final bool isAlreadyExpired = daysLeft != null && daysLeft < 0;
 
@@ -470,6 +482,39 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ];
               }).toList(),
             ),
+            ),
+    );
+  }
+
+  /// أول [DashboardScreen.alertRowsLimit] صفاً فقط (بدل بناء مئات الصفوف) مع
+  /// "يعرض 20 من N" ورابط "عرض الكل" إلى التقارير ← المخزون.
+  Widget _limitedTable({required String key, required int total, required Widget table}) {
+    const limit = DashboardScreen.alertRowsLimit;
+    if (total <= limit) return table;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        table,
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'يعرض $limit من $total — الأكثر إلحاحاً أولاً',
+                key: Key('dashboard-shown-$key'),
+                style: GoogleFonts.tajawal(fontSize: 12, color: mutedText),
+              ),
+            ),
+            if (widget.onShowAllStockAlerts != null)
+              TextButton.icon(
+                key: Key('dashboard-show-all-$key'),
+                onPressed: widget.onShowAllStockAlerts,
+                icon: const Icon(Icons.open_in_new_rounded, size: 16),
+                label: Text('عرض الكل', style: GoogleFonts.tajawal(fontWeight: FontWeight.bold)),
+              ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -485,9 +530,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
               message: 'المخزون بحالة جيدة، لا نواقص حالياً',
               color: const Color(0xFF27AE60),
             )
-          : CustomTable(
+          : _limitedTable(
+              key: 'low-stock',
+              total: _lowStockMedicines.length,
+              table: CustomTable(
               headers: const ["اسم الدواء", "المتبقي بالمخزن"],
-              rows: _lowStockMedicines.map<List<Widget>>((med) {
+              // مرتبة بالكمية: النافد أولاً.
+              rows: _lowStockMedicines.take(DashboardScreen.alertRowsLimit).map<List<Widget>>((med) {
                 return [
                   Text(
                     med.tradeName,
@@ -510,6 +559,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 ];
               }).toList(),
+            ),
             ),
     );
   }

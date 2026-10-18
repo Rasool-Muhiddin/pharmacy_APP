@@ -18,7 +18,7 @@ abstract class ReportsDataSource {
   Future<Map<String, dynamic>> items(ReportPeriod period, {String sort = 'qty'});
   /// [pageSize] null = الحجم الافتراضي للشاشة؛ التصدير يطلب صفحات أكبر.
   Future<Map<String, dynamic>> stagnant(ReportPeriod period, {int page = 1, int? pageSize});
-  Future<Map<String, dynamic>> inventory({int days = 30});
+  Future<Map<String, dynamic>> inventory({int days = 90});
   Future<Map<String, dynamic>> purchases(ReportPeriod period);
   Future<Map<String, dynamic>> losses(ReportPeriod period);
   Future<Map<String, dynamic>> invoices(
@@ -88,7 +88,7 @@ class ReportsRepository implements ReportsDataSource {
       );
 
   @override
-  Future<Map<String, dynamic>> inventory({int days = 30}) =>
+  Future<Map<String, dynamic>> inventory({int days = 90}) =>
       _section('inventory', null, () => _local.inventory(pharmacyId, days: days), {'days': '$days'});
 
   @override

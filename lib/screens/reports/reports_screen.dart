@@ -48,7 +48,11 @@ class ReportsScreen extends StatefulWidget {
     this.repository,
     this.clock,
     this.exportSaver,
+    this.initialTab = ReportTab.overview,
   });
+
+  /// التبويب المفتوح أولاً ([ReportTab])، مثلاً المخزون من "عرض الكل" في الرئيسية.
+  final int initialTab;
 
   @override
   State<ReportsScreen> createState() => _ReportsScreenState();
@@ -78,7 +82,8 @@ class _ReportsScreenState extends State<ReportsScreen> with SingleTickerProvider
       widget.repository ?? ReportsRepository(pharmacyId: widget.pharmacyId, isOnlineMode: widget.isOnlineMode);
   late ReportPeriod _period = ReportPeriod.sessionPeriod(now: _now());
   final ReportsCache _cache = ReportsCache();
-  late final TabController _tabs = TabController(length: ReportTab.labels.length, vsync: this);
+  late final TabController _tabs =
+      TabController(length: ReportTab.labels.length, vsync: this, initialIndex: widget.initialTab);
   DateTime _updatedAt = DateTime.now();
   int _generation = 0;
 

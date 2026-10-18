@@ -2672,22 +2672,25 @@ Future<double> totalSalesToday(int pharmacyId) async {
   /// كان يُشتق من MAX(id)، وهذا لم يعد صالحاً: المعرّفات المحلية تبدأ من
   /// localIdBase (كانت ستنتج INV-1000000000001)، كما أن فواتير كاش الخادم لا
   /// تخص ترقيم هذا الجهاز. نفس منطق _next_invoice_number على الخادم.
+  ///
+  /// أكبر رقم يُحسب داخل SQLite (MAX) بدل قراءة كل الفواتير إلى الذاكرة مع كل
+  /// عملية بيع؛ اللاحقة أرقام فقط (نفس int.tryParse السابق).
   Future<String> generateInvoiceNumber() async {
     final db = await database;
-    final rows = await db.rawQuery(
-      "SELECT invoice_number FROM invoice WHERE ${localOnly()} AND invoice_number GLOB 'INV-[0-9]*'",
-    );
-    var last = 0;
-    for (final row in rows) {
-      final n = int.tryParse((row['invoice_number'] as String).substring(4));
-      if (n != null && n > last) last = n;
-    }
-    final used = rows.map((r) => r['invoice_number'] as String).toSet();
-    var candidate = last + 1;
-    while (used.contains('INV-${candidate.toString().padLeft(6, '0')}')) {
+    final rows = await db.rawQuery('''
+      SELECT MAX(CAST(substr(invoice_number, 5) AS INTEGER)) AS last FROM invoice
+      WHERE ${localOnly()} AND invoice_number GLOB 'INV-[0-9]*' AND substr(invoice_number, 5) NOT GLOB '*[^0-9]*'
+    ''');
+    var candidate = ((rows.first['last'] as num?)?.toInt() ?? 0) + 1;
+    String number(int n) => 'INV-${n.toString().padLeft(6, '0')}';
+    // احتياط (نفس السلوك السابق): رقم مستخدم يُتخطّى — بحث بالفهرس idx_invoice_number.
+    while ((await db.rawQuery(
+      'SELECT 1 FROM invoice WHERE invoice_number = ? AND ${localOnly()} LIMIT 1',
+      [number(candidate)],
+    )).isNotEmpty) {
       candidate++;
     }
-    return 'INV-${candidate.toString().padLeft(6, '0')}';
+    return number(candidate);
   }
 
   //====================================================

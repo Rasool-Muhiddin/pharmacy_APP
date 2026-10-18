@@ -87,6 +87,35 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
   /// فترة كشف الحساب (افتراضياً: الكل).
   StatementPeriod _statementPeriod = const StatementPeriod.all();
 
+  // صفوف تبويبات تفاصيل المذخر تُعرض على دفعات (الأحدث أولاً) بدل بناء مئات
+  // الصفوف دفعة واحدة؛ "عرض المزيد" يضيف [_pageRows] صفاً.
+  static const int _pageRows = 100;
+  int _invoicesShown = _pageRows;
+  int _itemsShown = _pageRows;
+  bool _statementShowAll = false;
+
+  void _resetPaging() {
+    _invoicesShown = _pageRows;
+    _itemsShown = _pageRows;
+    _statementShowAll = false;
+  }
+
+  /// "عرض المزيد" أسفل جدول مقطوع: [shown] من [total].
+  Widget _showMoreButton({required String key, required int shown, required int total, required VoidCallback onMore}) {
+    if (shown >= total) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Center(
+        child: OutlinedButton.icon(
+          key: Key(key),
+          onPressed: onMore,
+          icon: const Icon(Icons.expand_more_rounded, size: 18),
+          label: Text('عرض المزيد (يُعرض $shown من $total)'),
+        ),
+      ),
+    );
+  }
+
   /// كشف الحساب + الفواتير (للأعمار وفتح الفاتورة) لنفس طلبات التبويبات.
   Future<List<List<Map<String, dynamic>>>>? _statementBundle;
   Future<List<Map<String, dynamic>>>? _bundleStatementSource;
@@ -129,6 +158,7 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
       if (_selectedId != id) {
         _tab = _DetailsTab.invoices;
         _expandedReturns.clear();
+        _resetPaging();
       }
       _selectedId = id;
       _detailFutures.clear();
@@ -783,7 +813,10 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
           _DetailsTab.invoices,
           supplierId,
           emptyText: 'لا توجد فواتير لهذا المذخر.',
-          builder: (invoices) => _Grid(
+          builder: (invoices) => Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+          _Grid(
             columns: const [
               RCol('رقم الفاتورة', width: 100),
               RCol('التاريخ', width: 92),
@@ -796,7 +829,15 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
             // النقر على الفاتورة يفتح أصنافها، ومنها الدفع والاسترجاع.
             onTap: (i) => _showInvoiceItemsDialog(context, invoices[i], supplierId, supplierName),
             rows: [
-              for (final invoice in invoices) _invoiceRow(invoice),
+              for (final invoice in invoices.take(_invoicesShown)) _invoiceRow(invoice),
+            ],
+          ),
+          _showMoreButton(
+            key: 'supplier-invoices-more',
+            shown: _invoicesShown < invoices.length ? _invoicesShown : invoices.length,
+            total: invoices.length,
+            onMore: () => setState(() => _invoicesShown += _pageRows),
+          ),
             ],
           ),
         ),
@@ -958,7 +999,10 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
                 selectedColor: primaryDark,
                 backgroundColor: RC.faint,
                 side: const BorderSide(color: borderCol),
-                onSelected: (_) => setState(() => _statementPeriod = StatementPeriod.fromPreset(preset)),
+                onSelected: (_) => setState(() {
+                  _statementPeriod = StatementPeriod.fromPreset(preset);
+                  _statementShowAll = false;
+                }),
               ),
             ActionChip(
               key: const Key('statement-period-custom'),
@@ -1013,7 +1057,10 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
       builder: (context, child) => Directionality(textDirection: TextDirection.rtl, child: child!),
     );
     if (range == null || !mounted) return;
-    setState(() => _statementPeriod = StatementPeriod.custom(range.start, range.end));
+    setState(() {
+      _statementPeriod = StatementPeriod.custom(range.start, range.end);
+      _statementShowAll = false;
+    });
   }
 
   Color _balanceColor(double balance) => balance > 0.001 ? danger : (balance < -0.001 ? success : textSecondary);
@@ -1083,7 +1130,38 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
       ));
     }
 
-    for (final e in statement.entries) {
+    // أكثر من [_pageRows] حركة: آخرها فقط، مسبوقة برصيد ما قبلها كي يبقى عمود
+    // الرصيد مقروءاً؛ المجاميع والرصيد الختامي للفترة كاملة كما هي.
+    final hidden = _statementShowAll ? 0 : (statement.entries.length - _pageRows).clamp(0, statement.entries.length);
+    if (hidden > 0) {
+      rows.add(TableRow(
+        key: const ValueKey('statement-carried'),
+        decoration: const BoxDecoration(color: RC.faint, border: Border(bottom: BorderSide(color: Color(0xFFEDF2F7)))),
+        children: [
+          cell(const SizedBox()),
+          cell(const SizedBox()),
+          cell(const SizedBox()),
+          cell(Wrap(
+            spacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              small('رصيد ما قبل الحركات المعروضة ($hidden حركة أقدم)', bold: true),
+              InkWell(
+                key: const Key('statement-show-all'),
+                onTap: () => setState(() => _statementShowAll = true),
+                child: const Text('عرض كل الحركات',
+                    style: TextStyle(fontSize: 11.5, color: primaryDark, fontWeight: FontWeight.bold, decoration: TextDecoration.underline)),
+              ),
+            ],
+          )),
+          cell(const SizedBox()),
+          cell(const SizedBox()),
+          cell(balance(statement.entries[hidden - 1].balance)),
+        ],
+      ));
+    }
+
+    for (final e in statement.entries.skip(hidden)) {
       final key = '${e.type.name}-${e.id}-${e.synthetic}';
       final expanded = _expandedReturns.contains(key);
       final invoice = e.type == StatementEntryType.invoice
@@ -1217,8 +1295,15 @@ class _MissingSuppliersScreenState extends State<MissingSuppliersScreen> {
       builder: (items) => Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _purchaseItemsGrid(items, true),
+          _purchaseItemsGrid(items.take(_itemsShown).toList(), true),
+          _showMoreButton(
+            key: 'supplier-items-more',
+            shown: _itemsShown < items.length ? _itemsShown : items.length,
+            total: items.length,
+            onMore: () => setState(() => _itemsShown += _pageRows),
+          ),
           const SizedBox(height: 12),
+          // المجاميع لكل الأصناف (لا للمعروض فقط).
           _purchaseItemsTotals(items),
         ],
       ),
