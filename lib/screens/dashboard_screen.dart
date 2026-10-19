@@ -286,9 +286,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
         final stats = [
           _StatData(
-            title: 'عدد الأدوية بالمخزن',
+            title: 'عدد العناصر بالمخزن',
             value: '$_totalMedicines',
-            subTitle: 'دواء مسجل',
+            subTitle: 'عنصر مسجل',
             icon: Icons.medication_liquid_rounded,
             color: const Color(0xFF3498DB),
           ),
@@ -441,6 +441,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               total: _expiredMedicines.length,
               table: CustomTable(
               headers: const ["اسم الدواء", "الحالة", "العدد"],
+              flex: const [3, 2, 1],
               // مرتبة بتاريخ الانتهاء: المنتهي أولاً ثم الأقرب انتهاءً.
               rows: _expiredMedicines.take(DashboardScreen.alertRowsLimit).map<List<Widget>>((med) {
                 final daysLeft = _daysUntilExpiry(med.expiryDate);
@@ -460,10 +461,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             : 'باقي $daysLeft يوم';
 
                 return [
-                  Text(
-                    med.tradeName,
-                    style: GoogleFonts.tajawal(fontWeight: FontWeight.bold, fontSize: 13, color: darkText),
-                  ),
+                  _medicineName(med.tradeName),
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
@@ -483,6 +481,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
               }).toList(),
             ),
             ),
+    );
+  }
+
+  /// اسم الدواء كاملاً: الأسماء إنجليزية داخل واجهة RTL، لذا نفرض LTR حتى لا
+  /// ينقلب ترتيب الأرقام والرموز (0.2% / +) أو يُقصّ أول/آخر الاسم، ويلتف لعدة أسطر.
+  Widget _medicineName(String name) {
+    return Tooltip(
+      message: name,
+      waitDuration: const Duration(milliseconds: 400),
+      child: Text(
+        name,
+        textDirection: TextDirection.ltr,
+        textAlign: TextAlign.center,
+        softWrap: true,
+        style: GoogleFonts.tajawal(fontWeight: FontWeight.bold, fontSize: 13, color: darkText),
+      ),
     );
   }
 
@@ -535,13 +549,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
               total: _lowStockMedicines.length,
               table: CustomTable(
               headers: const ["اسم الدواء", "المتبقي بالمخزن"],
+              flex: const [3, 2],
               // مرتبة بالكمية: النافد أولاً.
               rows: _lowStockMedicines.take(DashboardScreen.alertRowsLimit).map<List<Widget>>((med) {
                 return [
-                  Text(
-                    med.tradeName,
-                    style: GoogleFonts.tajawal(fontWeight: FontWeight.bold, fontSize: 13, color: darkText),
-                  ),
+                  _medicineName(med.tradeName),
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                     decoration: BoxDecoration(

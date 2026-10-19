@@ -5,11 +5,17 @@ class CustomTable extends StatelessWidget {
   final List<String> headers;
   final List<List<Widget>> rows;
 
+  /// نسبة عرض كل عمود (افتراضياً متساوية)، مثلاً [3, 2, 1] يعطي العمود الأول مساحة أكبر.
+  final List<int>? flex;
+
   const CustomTable({
     super.key,
     required this.headers,
     required this.rows,
+    this.flex,
   });
+
+  int _flexAt(int i) => (flex != null && i < flex!.length) ? flex![i] : 1;
 
   @override
   Widget build(BuildContext context) {
@@ -30,8 +36,10 @@ class CustomTable extends StatelessWidget {
               color: const Color(0xffF7FAFC),
               padding: const EdgeInsets.symmetric(vertical: 12),
               child: Row(
-                children: headers.map((header) {
+                children: headers.asMap().entries.map((e) {
+                  final header = e.value;
                   return Expanded(
+                    flex: _flexAt(e.key),
                     child: Text(
                       header,
                       textAlign: TextAlign.center,
@@ -74,9 +82,13 @@ class CustomTable extends StatelessWidget {
                       vertical: 12,
                     ),
                     child: Row(
-                      children: row.map((cell) {
+                      children: row.asMap().entries.map((e) {
                         return Expanded(
-                          child: Center(child: cell),
+                          flex: _flexAt(e.key),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            child: Center(child: e.value),
+                          ),
                         );
                       }).toList(),
                     ),

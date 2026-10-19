@@ -32,7 +32,7 @@ class FilterDropdown<T> extends StatelessWidget {
     return Container(
       width: width,
       height: height,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
+      padding: const EdgeInsetsDirectional.only(start: 12, end: 6),
       decoration: BoxDecoration(
         color: active ? _accent.withValues(alpha: 0.06) : Colors.white,
         borderRadius: BorderRadius.circular(10),
@@ -42,8 +42,19 @@ class FilterDropdown<T> extends StatelessWidget {
         child: DropdownButton<T?>(
           value: value,
           isExpanded: true,
-          icon: Icon(icon, size: 18, color: _accent),
-          style: const TextStyle(fontSize: 13, color: Color(0xFF1E293B)),
+          // أيقونة الفلتر في البداية وسهم القائمة في النهاية (بدل أن تحل الأيقونة محل السهم).
+          icon: Icon(Icons.keyboard_arrow_down_rounded, color: active ? _accent : Colors.grey.shade600),
+          // style يستبدل نمط الثيم كاملاً، فندمجه معه كي يبقى خط Tajawal كحقل البحث.
+          style: (Theme.of(context).textTheme.bodyMedium ?? const TextStyle())
+              .copyWith(fontSize: 13.5, color: const Color(0xFF1E293B)),
+          alignment: AlignmentDirectional.centerStart,
+          borderRadius: BorderRadius.circular(10),
+          dropdownColor: Colors.white,
+          menuMaxHeight: 360,
+          selectedItemBuilder: (context) => [
+            _selected(allLabel, active: false),
+            for (final label in options.values) _selected(label, active: true),
+          ],
           items: [
             DropdownMenuItem<T?>(value: null, child: Text(allLabel, overflow: TextOverflow.ellipsis)),
             for (final entry in options.entries)
@@ -55,6 +66,24 @@ class FilterDropdown<T> extends StatelessWidget {
           onChanged: onChanged,
         ),
       ),
+    );
+  }
+
+  /// النص الظاهر في الحقل المغلق: أيقونة الفلتر + الاختيار، بمحاذاة البداية (يمين في RTL).
+  Widget _selected(String label, {required bool active}) {
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: active ? _accent : Colors.grey.shade500),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontWeight: active ? FontWeight.bold : FontWeight.normal),
+          ),
+        ),
+      ],
     );
   }
 }
